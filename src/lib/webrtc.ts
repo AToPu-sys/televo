@@ -1,11 +1,7 @@
 // Free public TURN service (Open Relay Project) for NAT traversal, plus
 // Google's public STUN server. This is fine for development and light usage;
-// swap in dedicated TURN credentials for production load.
-//
-// Left untyped (as plain objects) rather than annotated with RTCIceServer:
-// that name resolves to the ambient DOM lib's type here, not
-// react-native-webrtc's own (structurally identical) type, and mixing the two
-// is what caused the EventTarget/MediaStream type conflicts elsewhere.
+// swap in dedicated TURN credentials for production load. Passed straight
+// through to the WebView bridge's RTCPeerConnection config as JSON.
 export const ICE_SERVERS = [
   { urls: "stun:stun.l.google.com:19302" },
   {

@@ -9,11 +9,7 @@
     "userInterfaceStyle": "automatic",
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.tgclone.app",
-      "infoPlist": {
-        "NSCameraUsageDescription": "Used for video calls.",
-        "NSMicrophoneUsageDescription": "Used for voice and video calls."
-      }
+      "bundleIdentifier": "com.tgclone.app"
     },
     "android": {
       "package": "com.tgclone.app",
@@ -23,8 +19,7 @@
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
       },
-      "predictiveBackGestureEnabled": false,
-      "permissions": ["CAMERA", "RECORD_AUDIO"]
+      "predictiveBackGestureEnabled": false
     },
     "web": {
       "favicon": "./assets/favicon.png",
@@ -42,6 +37,12 @@
     ],
     "experiments": {
       "typedRoutes": true
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "328fc95c-6a04-4d2e-af72-b03ebb42f52b"
+      }
     }
   }
 }

@@ -1,22 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import {
-  mediaDevices,
-  MediaStream,
-  RTCIceCandidate,
-  RTCPeerConnection,
-  RTCSessionDescription,
-} from "react-native-webrtc";
 
+import type { BridgeEvent, WebRtcBridgeHandle } from "../components/WebRtcBridge";
 import { supabase } from "../lib/supabase";
 import { ICE_SERVERS } from "../lib/webrtc";
 import type { Database } from "../types/database";
-
-// react-native-webrtc doesn't export event-payload or candidate-init types
-// from its package root (RTCIceCandidateEvent, RTCTrackEvent), even though it
-// uses them internally — these are the minimal local shapes we actually read.
-type IceCandidateInit = ReturnType<RTCIceCandidate["toJSON"]>;
-type IceCandidateEvent = { candidate: RTCIceCandidate | null };
-type TrackEvent = { streams: MediaStream[] };
 
 type CallKind = Database["public"]["Enums"]["call_kind"];
 type CallRow = Database["public"]["Tables"]["calls"]["Row"];
@@ -36,77 +23,50 @@ export type CallState =
 type Signal =
   | { type: "offer"; sdp: string; kind: CallKind }
   | { type: "answer"; sdp: string }
-  | { type: "ice-candidate"; candidate: IceCandidateInit }
+  | { type: "ice-candidate"; candidate: RTCIceCandidateInit }
   | { type: "hangup" }
   | { type: "decline" };
 
+/**
+ * The actual media engine lives inside a hidden WebView (see WebRtcBridge +
+ * webrtcBridgeHtml) — plain browser getUserMedia/RTCPeerConnection, which
+ * Expo Go's WebView already supports without a custom native module. This
+ * hook owns the call state machine and signaling; it talks to the bridge only
+ * through JSON commands/events, never touching WebRTC types directly.
+ */
 export function useCall(userId: string | undefined) {
   const [state, setState] = useState<CallState>({ phase: "idle" });
-  const [localStream, setLocalStream] = useState<MediaStream | null>(null);
-  const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
   const [muted, setMuted] = useState(false);
   const [cameraOff, setCameraOff] = useState(false);
+  const [bridgeReady, setBridgeReady] = useState(false);
 
-  const peerRef = useRef<RTCPeerConnection | null>(null);
+  const bridgeRef = useRef<WebRtcBridgeHandle | null>(null);
   const signalChannelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
-  const pendingCandidatesRef = useRef<IceCandidateInit[]>([]);
+  const pendingOfferRef = useRef<{ sdp: string; kind: CallKind } | null>(null);
+  const roleRef = useRef<"caller" | "callee" | null>(null);
+
+  const setBridgeRef = useCallback((handle: WebRtcBridgeHandle | null) => {
+    bridgeRef.current = handle;
+  }, []);
+
+  const sendCommand = useCallback((command: object) => {
+    bridgeRef.current?.send(command);
+  }, []);
 
   const cleanup = useCallback(() => {
-    peerRef.current?.close();
-    peerRef.current = null;
-
-    localStream?.getTracks().forEach((track) => track.stop());
-    setLocalStream(null);
-    setRemoteStream(null);
-    pendingCandidatesRef.current = [];
+    sendCommand({ type: "hangup" });
+    roleRef.current = null;
+    pendingOfferRef.current = null;
 
     if (signalChannelRef.current) {
       void supabase.removeChannel(signalChannelRef.current);
       signalChannelRef.current = null;
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [localStream]);
+  }, [sendCommand]);
 
   const sendSignal = useCallback((signal: Signal) => {
     if (!signalChannelRef.current) return;
     void signalChannelRef.current.send({ type: "broadcast", event: "signal", payload: signal });
-  }, []);
-
-  const setupPeerConnection = useCallback(
-    (stream: MediaStream) => {
-      const peer = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-      peerRef.current = peer;
-
-      stream.getTracks().forEach((track) => peer.addTrack(track, stream));
-
-      // Assigned as on{event} properties rather than addEventListener(): the
-      // library's EventTarget overloads resolve more reliably this way, and
-      // it sidesteps any ambiguity with the ambient DOM RTCPeerConnection
-      // types pulled in by tsconfig's "dom" lib.
-      peer.onicecandidate = (event: IceCandidateEvent) => {
-        if (event.candidate) {
-          sendSignal({ type: "ice-candidate", candidate: event.candidate.toJSON() });
-        }
-      };
-
-      peer.ontrack = (event: TrackEvent) => {
-        if (event.streams[0]) {
-          setRemoteStream(event.streams[0]);
-        }
-      };
-
-      return peer;
-    },
-    [sendSignal]
-  );
-
-  const getLocalStream = useCallback(async (kind: CallKind) => {
-    const stream = await mediaDevices.getUserMedia({
-      audio: true,
-      video: kind === "video" ? { facingMode: "user" } : false,
-    });
-    setLocalStream(stream);
-    return stream;
   }, []);
 
   const joinSignalChannel = useCallback(
@@ -140,25 +100,15 @@ export function useCall(userId: string | undefined) {
         return;
       }
 
+      roleRef.current = "caller";
       setState({ phase: "outgoing", call });
-
-      const stream = await getLocalStream(kind);
-      const peer = setupPeerConnection(stream);
 
       joinSignalChannel(call.id, async (signal) => {
         if (signal.type === "answer") {
-          await peer.setRemoteDescription(new RTCSessionDescription(signal));
-          for (const candidate of pendingCandidatesRef.current) {
-            await peer.addIceCandidate(new RTCIceCandidate(candidate));
-          }
-          pendingCandidatesRef.current = [];
+          sendCommand({ type: "accept-answer", sdp: signal.sdp });
           setState({ phase: "active", call });
         } else if (signal.type === "ice-candidate") {
-          if (peer.remoteDescription) {
-            await peer.addIceCandidate(new RTCIceCandidate(signal.candidate));
-          } else {
-            pendingCandidatesRef.current.push(signal.candidate);
-          }
+          sendCommand({ type: "ice-candidate", candidate: signal.candidate });
         } else if (signal.type === "decline") {
           await supabase.from("calls").update({ status: "declined" }).eq("id", call.id);
           setState({ phase: "ended", reason: "declined" });
@@ -169,32 +119,25 @@ export function useCall(userId: string | undefined) {
         }
       });
 
-      const offer = await peer.createOffer({});
-      await peer.setLocalDescription(offer);
-      sendSignal({ type: "offer", sdp: offer.sdp!, kind });
+      sendCommand({ type: "create-offer", iceServers: ICE_SERVERS, video: kind === "video" });
+      // The bridge replies with a "offer" BridgeEvent once ready; see
+      // handleBridgeEvent below, which forwards it as the signal.
+      pendingOfferRef.current = { sdp: "", kind };
     },
-    [userId, getLocalStream, setupPeerConnection, joinSignalChannel, sendSignal, cleanup]
+    [userId, joinSignalChannel, sendCommand, cleanup]
   );
 
   /** Callee side: accept an incoming call, answer with local SDP. */
   const answerCall = useCallback(
     async (call: CallRow, offerSdp: string, kind: CallKind) => {
       setState({ phase: "connecting", call });
-
-      const stream = await getLocalStream(kind);
-      const peer = setupPeerConnection(stream);
-
-      await peer.setRemoteDescription(
-        new RTCSessionDescription({ type: "offer", sdp: offerSdp })
-      );
-      for (const candidate of pendingCandidatesRef.current) {
-        await peer.addIceCandidate(new RTCIceCandidate(candidate));
-      }
-      pendingCandidatesRef.current = [];
-
-      const answer = await peer.createAnswer();
-      await peer.setLocalDescription(answer);
-      sendSignal({ type: "answer", sdp: answer.sdp! });
+      roleRef.current = "callee";
+      sendCommand({
+        type: "create-answer",
+        iceServers: ICE_SERVERS,
+        sdp: offerSdp,
+        video: kind === "video",
+      });
 
       await supabase
         .from("calls")
@@ -203,7 +146,7 @@ export function useCall(userId: string | undefined) {
 
       setState({ phase: "active", call });
     },
-    [getLocalStream, setupPeerConnection, sendSignal]
+    [sendCommand]
   );
 
   /** Listens for an incoming offer on a call id the app already knows about
@@ -220,19 +163,13 @@ export function useCall(userId: string | undefined) {
         } else if (signal.type === "hangup") {
           setState({ phase: "ended", reason: "hangup" });
           cleanup();
-        } else if (signal.type === "ice-candidate" && peerRef.current) {
-          if (peerRef.current.remoteDescription) {
-            void peerRef.current.addIceCandidate(new RTCIceCandidate(signal.candidate));
-          } else {
-            pendingCandidatesRef.current.push(signal.candidate);
-          }
+        } else if (signal.type === "ice-candidate") {
+          sendCommand({ type: "ice-candidate", candidate: signal.candidate });
         }
       });
     },
-    [joinSignalChannel, cleanup]
+    [joinSignalChannel, cleanup, sendCommand]
   );
-
-  const pendingOfferRef = useRef<{ sdp: string; kind: CallKind } | null>(null);
 
   const accept = useCallback(async () => {
     if (state.phase !== "incoming" || !pendingOfferRef.current) return;
@@ -260,36 +197,51 @@ export function useCall(userId: string | undefined) {
   }, [state, sendSignal, cleanup]);
 
   const toggleMute = useCallback(() => {
-    if (!localStream) return;
     const next = !muted;
-    localStream.getAudioTracks().forEach((track) => {
-      track.enabled = !next;
-    });
+    sendCommand({ type: "set-mic", enabled: !next });
     setMuted(next);
-  }, [localStream, muted]);
+  }, [muted, sendCommand]);
 
   const toggleCamera = useCallback(() => {
-    if (!localStream) return;
     const next = !cameraOff;
-    localStream.getVideoTracks().forEach((track) => {
-      track.enabled = !next;
-    });
+    sendCommand({ type: "set-camera", enabled: !next });
     setCameraOff(next);
-  }, [localStream, cameraOff]);
+  }, [cameraOff, sendCommand]);
 
   const reset = useCallback(() => {
     setState({ phase: "idle" });
     cleanup();
   }, [cleanup]);
 
+  /** Wired to WebRtcBridge's onEvent prop by the component that renders it. */
+  const handleBridgeEvent = useCallback(
+    (event: BridgeEvent) => {
+      if (event.type === "ready") {
+        setBridgeReady(true);
+      } else if (event.type === "offer" && roleRef.current === "caller") {
+        sendSignal({ type: "offer", sdp: event.sdp, kind: pendingOfferRef.current?.kind ?? "audio" });
+      } else if (event.type === "answer" && roleRef.current === "callee") {
+        sendSignal({ type: "answer", sdp: event.sdp });
+      } else if (event.type === "ice-candidate") {
+        sendSignal({ type: "ice-candidate", candidate: event.candidate });
+      }
+      // "log" / "error" / "local-ready" / "connection-state" are diagnostic
+      // only in this app; surface them via console rather than call state.
+      if (event.type === "error") {
+        // eslint-disable-next-line no-console
+        console.warn("[call bridge]", event.message);
+      }
+    },
+    [sendSignal]
+  );
+
   useEffect(() => cleanup, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   return {
     state,
-    localStream,
-    remoteStream,
     muted,
     cameraOff,
+    bridgeReady,
     startCall,
     listenForOffer,
     accept,
@@ -298,5 +250,7 @@ export function useCall(userId: string | undefined) {
     toggleMute,
     toggleCamera,
     reset,
+    setBridgeRef,
+    handleBridgeEvent,
   };
 }

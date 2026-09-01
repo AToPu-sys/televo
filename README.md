@@ -3,11 +3,9 @@
 A Telegram-style messenger built with Expo (React Native) and a Supabase backend:
 real accounts, real chats, and messages that sync live between devices.
 
-Built on **Expo SDK 54** (React Native 0.81, React 19.1).
-
-**Voice/video calling requires a custom dev build — this app no longer runs in
-Expo Go.** `react-native-webrtc` needs native code Expo Go doesn't ship. See
-"Running the app" below.
+Built on **Expo SDK 54** (React Native 0.81, React 19.1). **Runs entirely in
+Expo Go** — `npx expo start`, scan the QR code, done. No custom dev build,
+no native modules.
 
 ## Features
 
@@ -22,9 +20,10 @@ Expo Go.** `react-native-webrtc` needs native code Expo Go doesn't ship. See
 - **Group chats** — create a group, name it, pick members; the creator is admin.
 - **Delete** — long-press your own message to delete it for everyone.
 - **Typing indicators** — live over Realtime broadcast (no DB writes).
-- **Voice & video calls** — real WebRTC peer connections. Signaling (offer/
-  answer/ICE) over Realtime broadcast; a free public TURN relay handles NAT
-  traversal. Ringing/incoming-call UI works from anywhere in the app.
+- **Voice & video calls** — real WebRTC peer connections (real audio/video,
+  not a stub), running inside Expo Go. Signaling (offer/answer/ICE) over
+  Realtime broadcast; a free public TURN relay handles NAT traversal.
+  Ringing/incoming-call UI works from anywhere in the app.
 - **Multi-device sync** — the same account on two devices shares chats,
   messages, and read state live; marking a chat read on one device clears its
   badge on the other in real time.
@@ -35,47 +34,54 @@ Expo Go.** `react-native-webrtc` needs native code Expo Go doesn't ship. See
 
 ## Running the app
 
-WebRTC needs native code, so this is a **custom dev build**, not Expo Go.
-
 ```bash
 npm install
 cp .env.example .env   # then fill in your Supabase values
-
-# Android (needs Android Studio / an emulator or a plugged-in device)
-npx expo run:android
-
-# iOS — requires a Mac with Xcode; on Windows/Linux use an EAS cloud build
-# instead (see below)
-npx expo run:ios
+npx expo start
 ```
 
-The first run does a native `prebuild` (creates `android/` and `ios/`,
-gitignored) and installs the app on the emulator/device/simulator. After that,
-`npx expo start --dev-client` reconnects to the already-installed build for
-fast JS-only reloads — no need to rebuild natively every time.
+Scan the QR code with Expo Go (Android) or the Camera app (iOS, opens Expo
+Go). That's it — no native build step, no `expo run:*`, no Xcode/Android
+Studio required.
 
-### Building iOS without a Mac (EAS)
+### How calling works in Expo Go without a native WebRTC module
 
-```bash
-npm install -g eas-cli
-eas login
-eas build:configure
-eas build --profile development --platform ios
-```
+`react-native-webrtc` requires native code Expo Go doesn't ship, so it isn't
+used. Instead, `src/components/WebRtcBridge.tsx` renders a hidden
+`react-native-webview` — which Expo Go *does* ship — hosting a tiny local HTML
+page (`src/lib/webrtcBridgeHtml.ts`) that runs plain browser
+`getUserMedia`/`RTCPeerConnection`. That's the WebView engine's own built-in
+WebRTC (WKWebView on iOS, Chromium WebView on Android), not a React Native
+native module, so no linking or dev build is needed.
 
-This builds in the cloud and gives you an install link (or a simulator build).
-Install `expo-dev-client` on the resulting build, then run
-`npx expo start --dev-client` and scan/open to connect. See
-https://docs.expo.dev/develop/development-builds/create-a-build/ for the full
-walkthrough — an Apple Developer account is needed for a physical device,
-not for a simulator build.
+React Native and the WebView talk over `postMessage`/`injectJavaScript`, JSON
+only — `src/hooks/useCall.ts` owns the call state machine and forwards
+offer/answer/ICE between the WebView and the Realtime signaling channel; it
+never touches a WebRTC type directly. The video `<video>` elements live inside
+the WebView too; `CallOverlay` just decides whether that WebView renders
+full-bleed (video calls) or stays off-screen (audio-only).
+
+Camera/mic permission prompting differs by platform inside a WebView:
+`mediaCapturePermissionGrantType="grant"` handles iOS; on Android, Expo Go's
+own WebView host auto-grants `getUserMedia` without any extra code (this is
+Expo Go–specific behavior — a standalone/bare build would need to add
+`onPermissionRequest` once that's available on this webview version).
 
 ### Voice/video calls need a real device (or two)
 
-The iOS Simulator and most Android emulators don't expose a real camera/mic to
-apps in a way WebRTC can use reliably. Test calling on physical devices — you
-can call between an iOS build and an Android build, or two of the same
-platform, since it's standard WebRTC either way.
+Simulators/emulators don't reliably expose a camera/mic. Test on physical
+devices — an iOS phone can call an Android phone or another iOS phone, since
+it's standard WebRTC underneath either way.
+
+### Moving to real native WebRTC later
+
+If this app ever needs features the WebView bridge can't do (background audio
+during a call, PiP, hardware codecs), the swap path is: `npx expo install
+expo-dev-client react-native-webrtc`, build with `npx expo run:ios` /
+`eas build --profile development`, then replace the bridge calls in
+`useCall.ts` with `react-native-webrtc`'s `mediaDevices`/`RTCPeerConnection`
+directly. The signaling layer (Realtime broadcast, the `calls` table, RLS)
+needs no changes either way.
 
 ### Environment
 
@@ -174,9 +180,9 @@ SUPABASE_SERVICE_ROLE_KEY=<service-role-key> node scripts/verify-sync.mjs
   (including that a non-participant is blocked from both uploading and
   reading), image messages, delete permissions, typing broadcast.
 - `verify-calls.mjs` — the `calls` table's RLS (participants only, both ways),
-  incoming-call realtime notification, and the signaling broadcast channel
-  carrying an offer + ICE candidate. Doesn't exercise actual audio/video —
-  that needs a physical device with a camera/mic.
+  incoming-call realtime notification, and the full offer/answer/ICE signal
+  round trip over the per-call broadcast channel. Doesn't exercise the
+  WebView's actual getUserMedia/media stream — that needs a physical device.
 - `verify-sync.mjs` — two clients signed into the same account, confirming a
   chat marked read on one is reflected live on the other, and that another
   user's channel isn't notified by it.
@@ -202,14 +208,22 @@ the environment and never written to `.env` or committed.
 app/                      Expo Router routes
   (auth)/                 welcome, email sign-in/up, phone OTP
   (tabs)/                 chats, contacts, settings
-  chat/[id].tsx           conversation screen
+  chat/[id].tsx           conversation screen (messages + calling)
+  new-group.tsx           group chat creation
+  _layout.tsx             providers + the global call overlay
 src/
-  components/             Avatar, Button, TextField, MessageBubble
+  components/             Avatar, Button, TextField, MessageBubble,
+                          CallButton, CallOverlay, WebRtcBridge
   hooks/                  useAuth, useChats, useMessages, useConversation,
-                          useContacts, useTheme
-  lib/                    supabase client, uuid
+                          useContacts, useTheme, useTyping,
+                          useCall, useCallManager, useIncomingCalls
+  lib/                    supabase client, uuid, media (Storage uploads),
+                          webrtc (ICE/TURN config), webrtcBridgeHtml
   theme/                  light/dark palettes, spacing, radii
   types/database.ts       generated from the live schema
+scripts/
+  sql/                    raw SQL applied directly to the shared project
+  verify-*.mjs            live end-to-end checks against the real database
 ```
 
 Regenerate types after a schema change:

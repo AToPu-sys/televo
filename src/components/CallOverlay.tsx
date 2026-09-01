@@ -1,8 +1,8 @@
-import { Ionicons } from "@expo/vector-icons";
 import { StyleSheet, Text, View } from "react-native";
-import { type MediaStream, RTCView } from "react-native-webrtc";
 import { SafeAreaView } from "react-native-safe-area-context";
 
+import type { BridgeEvent, WebRtcBridgeHandle } from "./WebRtcBridge";
+import { WebRtcBridge } from "./WebRtcBridge";
 import type { CallState } from "../hooks/useCall";
 import { useTheme } from "../hooks/useTheme";
 import { spacing } from "../theme";
@@ -13,11 +13,11 @@ type CallOverlayProps = {
   state: CallState;
   peerName: string;
   peerAvatarUrl?: string | null;
-  localStream: MediaStream | null;
-  remoteStream: MediaStream | null;
   muted: boolean;
   cameraOff: boolean;
   isVideo: boolean;
+  onBridgeReady: (handle: WebRtcBridgeHandle | null) => void;
+  onBridgeEvent: (event: BridgeEvent) => void;
   onAccept: () => void;
   onDecline: () => void;
   onHangup: () => void;
@@ -30,11 +30,11 @@ export function CallOverlay({
   state,
   peerName,
   peerAvatarUrl,
-  localStream,
-  remoteStream,
   muted,
   cameraOff,
   isVideo,
+  onBridgeReady,
+  onBridgeEvent,
   onAccept,
   onDecline,
   onHangup,
@@ -52,31 +52,19 @@ export function CallOverlay({
     setTimeout(onDismissEnded, 1500);
   }
 
-  const showVideo = isVideo && remoteStream && state.phase === "active";
+  const showVideo = isVideo && state.phase === "active";
 
   return (
     <View style={[StyleSheet.absoluteFill, styles.container, { backgroundColor: theme.background }]}>
-      {showVideo ? (
-        <RTCView
-          streamURL={remoteStream!.toURL()}
-          style={StyleSheet.absoluteFill}
-          objectFit="cover"
-        />
-      ) : null}
+      {/* The WebView IS the WebRTC engine — real getUserMedia/RTCPeerConnection
+          run inside its browser context, which Expo Go already supports. It's
+          always mounted while a call is active so the peer connection and
+          media tracks survive; `visible` only toggles whether its <video>
+          surfaces render full-bleed (for video calls) or stay off-screen
+          (audio-only). */}
+      <WebRtcBridge ref={onBridgeReady} onEvent={onBridgeEvent} visible={!!showVideo} />
 
-      {isVideo && localStream && state.phase === "active" && !cameraOff ? (
-        <View style={styles.selfPreview}>
-          <RTCView
-            streamURL={localStream.toURL()}
-            style={StyleSheet.absoluteFill}
-            objectFit="cover"
-            zOrder={1}
-            mirror
-          />
-        </View>
-      ) : null}
-
-      <SafeAreaView style={styles.content}>
+      <SafeAreaView style={styles.content} pointerEvents="box-none">
         <View style={styles.header}>
           {!showVideo ? <Avatar name={peerName} uri={peerAvatarUrl} size={120} /> : null}
           <Text style={[styles.name, { color: showVideo ? "#FFFFFF" : theme.text }]}>
@@ -151,16 +139,6 @@ const styles = StyleSheet.create({
   header: { alignItems: "center", gap: spacing.sm, marginTop: spacing.xxl },
   name: { fontSize: 24, fontWeight: "700" },
   status: { fontSize: 15 },
-  selfPreview: {
-    position: "absolute",
-    top: 60,
-    right: spacing.lg,
-    width: 100,
-    height: 140,
-    borderRadius: 12,
-    overflow: "hidden",
-    backgroundColor: "#000",
-  },
   controls: { paddingHorizontal: spacing.xl, paddingBottom: spacing.xl },
   incomingRow: { flexDirection: "row", justifyContent: "space-around" },
   activeRow: { flexDirection: "row", justifyContent: "center", gap: spacing.xl },

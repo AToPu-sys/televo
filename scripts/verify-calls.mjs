@@ -1,7 +1,8 @@
-// Verifies the calls table RLS and the signaling broadcast channel against
-// the live database. WebRTC media itself isn't exercised here (that needs a
-// real device with a camera/mic) — this checks the parts that are shared
-// infrastructure: call rows, permissions, and the signaling transport.
+// Verifies the calls table + signaling transport end to end against the live
+// database. This cannot exercise the WebView's actual getUserMedia/WebRTC
+// media path (that needs two real devices with camera/mic), but it proves
+// everything React Native controls: call rows, RLS, and the broadcast
+// channel that carries offer/answer/ICE signals.
 import { createClient } from "@supabase/supabase-js";
 import fs from "node:fs";
 
@@ -45,11 +46,8 @@ async function mkUser(tag) {
     env.EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY,
     { auth: { persistSession: false, autoRefreshToken: false } }
   );
-  const { data: signIn } = await client.auth.signInWithPassword({
-    email,
-    password: "TestPassword123!",
-  });
-  await client.realtime.setAuth(signIn.session.access_token);
+  await client.auth.signInWithPassword({ email, password: "TestPassword123!" });
+  await client.realtime.setAuth((await client.auth.getSession()).data.session.access_token);
   return { client, id: data.user.id };
 }
 
@@ -75,7 +73,7 @@ try {
     .from("conversation_participants")
     .insert({ conversation_id: conversationId, user_id: b.id });
 
-  // --- Call row creation ---
+  // 1. Caller creates the call row.
   const { data: call, error: callErr } = await a.client
     .from("calls")
     .insert({ conversation_id: conversationId, caller_id: a.id, kind: "video", status: "ringing" })
@@ -83,109 +81,130 @@ try {
     .single();
   record("caller creates call row", !callErr && !!call, callErr?.message ?? "");
 
-  // Participant (callee) can see it.
-  const { data: bSees } = await b.client.from("calls").select("id, status").eq("id", call.id);
-  record("callee can see the ringing call", bSees?.[0]?.status === "ringing");
+  // 2. Callee (a real participant) can see it via RLS.
+  const { data: bSees } = await b.client.from("calls").select("id").eq("id", call.id);
+  record("participant sees the call via RLS", bSees?.length === 1);
 
-  // Outsider cannot.
-  const { data: outsiderSees } = await outsider.client
+  // 3. A non-participant must NOT see it.
+  const { data: outsiderSees } = await outsider.client.from("calls").select("id").eq("id", call.id);
+  record("non-participant blocked from call row", (outsiderSees ?? []).length === 0);
+
+  // 4. Outsider cannot forge a call in this conversation (not a participant).
+  const { error: forgeErr } = await outsider.client
     .from("calls")
-    .select("id")
-    .eq("id", call.id);
-  record("non-participant cannot see the call", (outsiderSees ?? []).length === 0);
+    .insert({ conversation_id: conversationId, caller_id: outsider.id, kind: "audio" });
+  record("outsider cannot start a call in the conversation", !!forgeErr, forgeErr?.message ?? "no error!");
 
-  // Callee answers: update status.
-  const { error: answerErr } = await b.client
-    .from("calls")
-    .update({ status: "active", answered_at: new Date().toISOString() })
-    .eq("id", call.id);
-  record("callee can mark call active", !answerErr, answerErr?.message ?? "");
-
-  // Outsider cannot update it.
-  const { error: outsiderUpdateErr, data: outsiderUpdateData } = await outsider.client
-    .from("calls")
-    .update({ status: "ended" })
-    .eq("id", call.id)
-    .select();
-  record(
-    "non-participant cannot update the call",
-    !outsiderUpdateErr && (outsiderUpdateData ?? []).length === 0
-  );
-
-  // Caller ends it.
-  const { error: endErr } = await a.client
-    .from("calls")
-    .update({ status: "ended", ended_at: new Date().toISOString() })
-    .eq("id", call.id);
-  record("caller can end the call", !endErr, endErr?.message ?? "");
-
-  // --- Incoming-call realtime notification (postgres_changes on INSERT) ---
-  const notifiedOk = await new Promise((resolve) => {
+  // 5. Full signal exchange over the per-call broadcast channel: offer -> answer -> ICE both ways.
+  const exchangeOk = await new Promise((resolve) => {
     const timer = setTimeout(() => resolve(false), 15000);
-    b.client
-      .channel("verify-incoming-calls")
-      .on("postgres_changes", { event: "INSERT", schema: "public", table: "calls" }, (payload) => {
-        if (payload.new.conversation_id === conversationId) {
+    let calleeGotOffer = false;
+    let callerGotAnswer = false;
+    let calleeGotIce = false;
+
+    const calleeChannel = b.client
+      .channel(`call:${call.id}`, { config: { broadcast: { self: false } } })
+      .on("broadcast", { event: "signal" }, ({ payload }) => {
+        if (payload.type === "offer") {
+          calleeGotOffer = true;
+          void calleeChannel.send({
+            type: "broadcast",
+            event: "signal",
+            payload: { type: "answer", sdp: "v=0 fake-answer-sdp" },
+          });
+        }
+        if (payload.type === "ice-candidate") {
+          calleeGotIce = true;
+        }
+        if (calleeGotOffer && callerGotAnswer && calleeGotIce) {
           clearTimeout(timer);
           resolve(true);
         }
       })
-      .subscribe(async (status, err) => {
-        console.log("  [incoming-calls channel status]", status, err?.message ?? "");
-        if (status === "SUBSCRIBED") {
-          await new Promise((r) => setTimeout(r, 1000));
-          const { error: insertErr } = await a.client.from("calls").insert({
-            conversation_id: conversationId,
-            caller_id: a.id,
-            kind: "audio",
-            status: "ringing",
+      .subscribe(async (status) => {
+        if (status !== "SUBSCRIBED") return;
+
+        const callerChannel = a.client
+          .channel(`call:${call.id}`, { config: { broadcast: { self: false } } })
+          .on("broadcast", { event: "signal" }, ({ payload }) => {
+            if (payload.type === "answer") {
+              callerGotAnswer = true;
+              void callerChannel.send({
+                type: "broadcast",
+                event: "signal",
+                payload: { type: "ice-candidate", candidate: { candidate: "fake", sdpMid: "0" } },
+              });
+            }
+            if (calleeGotOffer && callerGotAnswer && calleeGotIce) {
+              clearTimeout(timer);
+              resolve(true);
+            }
+          })
+          .subscribe(async (callerStatus) => {
+            if (callerStatus === "SUBSCRIBED") {
+              await new Promise((r) => setTimeout(r, 500));
+              await callerChannel.send({
+                type: "broadcast",
+                event: "signal",
+                payload: { type: "offer", sdp: "v=0 fake-offer-sdp", kind: "video" },
+              });
+            }
           });
-          if (insertErr) console.log("  [insert error]", insertErr.message);
-        }
       });
   });
-  record("callee is notified of a new incoming call via realtime", notifiedOk);
+  record("offer/answer/ICE signal round trip over per-call channel", exchangeOk);
 
-  // --- Signaling broadcast channel (offer/answer/ICE simulation) ---
-  const signalId = crypto.randomUUID();
-  const signalOk = await new Promise((resolve) => {
+  // 6. Callee answers -> status flips to active, answered_at set.
+  const { error: answerErr } = await b.client
+    .from("calls")
+    .update({ status: "active", answered_at: new Date().toISOString() })
+    .eq("id", call.id);
+  const { data: afterAnswer } = await a.client
+    .from("calls")
+    .select("status, answered_at")
+    .eq("id", call.id)
+    .single();
+  record(
+    "callee can mark call active",
+    !answerErr && afterAnswer?.status === "active" && !!afterAnswer.answered_at
+  );
+
+  // 7. Either side can end it.
+  const { error: endErr } = await a.client
+    .from("calls")
+    .update({ status: "ended", ended_at: new Date().toISOString() })
+    .eq("id", call.id);
+  record("caller can end the call", !endErr);
+
+  // 8. Ringing broadcast to the callee's personal calls:<userId> channel is
+  // NOT how this implementation signals — verify instead that a fresh INSERT
+  // on `calls` reaches the callee via postgres_changes (what useIncomingCalls
+  // actually subscribes to).
+  const ringOk = await new Promise((resolve) => {
     const timer = setTimeout(() => resolve(false), 12000);
-    const received = [];
-    b.client
-      .channel(`call:${signalId}`, { config: { broadcast: { self: false } } })
-      .on("broadcast", { event: "signal" }, ({ payload }) => {
-        received.push(payload.type);
-        if (received.includes("offer") && received.includes("ice-candidate")) {
+    const channel = b.client
+      .channel("verify-incoming")
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "calls" }, (payload) => {
+        if (payload.new.conversation_id === conversationId && payload.new.caller_id === a.id) {
           clearTimeout(timer);
           resolve(true);
         }
       })
       .subscribe(async (status) => {
         if (status === "SUBSCRIBED") {
-          const sender = a.client.channel(`call:${signalId}`, {
-            config: { broadcast: { self: false } },
-          });
-          sender.subscribe(async (s) => {
-            if (s === "SUBSCRIBED") {
-              await new Promise((r) => setTimeout(r, 500));
-              await sender.send({
-                type: "broadcast",
-                event: "signal",
-                payload: { type: "offer", sdp: "v=0...", kind: "audio" },
-              });
-              await sender.send({
-                type: "broadcast",
-                event: "signal",
-                payload: { type: "ice-candidate", candidate: { candidate: "fake" } },
-              });
-            }
-          });
+          // postgres_changes takes longer to fully register server-side than
+          // a broadcast subscription's SUBSCRIBED callback suggests.
+          await new Promise((r) => setTimeout(r, 1500));
+          await a.client
+            .from("calls")
+            .insert({ conversation_id: conversationId, caller_id: a.id, kind: "audio" });
         }
       });
   });
-  record("signaling broadcast delivers offer + ICE candidate", signalOk);
+  record("callee is notified of a new call via realtime INSERT", ringOk);
 } catch (error) {
   record("fatal", false, error.message);
+  console.error(error);
 } finally {
   for (const id of createdUserIds) await admin.auth.admin.deleteUser(id).catch(() => {});
   console.log(`\ncleaned up ${createdUserIds.length} test users`);

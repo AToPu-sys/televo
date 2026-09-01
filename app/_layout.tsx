@@ -63,8 +63,6 @@ function GlobalCallOverlay() {
   const {
     state,
     peer,
-    localStream,
-    remoteStream,
     muted,
     cameraOff,
     accept,
@@ -73,6 +71,8 @@ function GlobalCallOverlay() {
     toggleMute,
     toggleCamera,
     reset,
+    setBridgeRef,
+    handleBridgeEvent,
   } = useCallManager();
 
   if (state.phase === "idle" || !peer) return null;
@@ -85,11 +85,11 @@ function GlobalCallOverlay() {
       state={state}
       peerName={peer.name}
       peerAvatarUrl={peer.avatarUrl}
-      localStream={localStream}
-      remoteStream={remoteStream}
       muted={muted}
       cameraOff={cameraOff}
       isVideo={isVideo}
+      onBridgeReady={setBridgeRef}
+      onBridgeEvent={handleBridgeEvent}
       onAccept={accept}
       onDecline={decline}
       onHangup={hangup}

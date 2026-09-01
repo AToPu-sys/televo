@@ -107,14 +107,23 @@ try {
         console.log("  [device B channel]", status, err?.message ?? "");
         if (status === "SUBSCRIBED") {
           await new Promise((r) => setTimeout(r, 1000));
+          // Sanity check right before the update: is the row even there from
+          // device A's point of view at this moment?
+          const { data: check } = await deviceA
+            .from("conversation_participants")
+            .select("*")
+            .eq("conversation_id", conversationId)
+            .eq("user_id", alice.id);
+          console.log("  [device A pre-update check]", JSON.stringify(check));
+
           // Device A marks the chat read.
-          const { error: updErr, data: updData } = await deviceA
+          const { error: updErr, data: updData, status } = await deviceA
             .from("conversation_participants")
             .update({ last_read_at: new Date().toISOString() })
             .eq("conversation_id", conversationId)
             .eq("user_id", alice.id)
             .select();
-          console.log("  [device A update]", updErr?.message ?? "ok", JSON.stringify(updData));
+          console.log("  [device A update]", status, updErr?.message ?? "ok", JSON.stringify(updData));
         }
       });
   });
