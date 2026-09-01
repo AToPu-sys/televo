@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { uploadChatMedia } from "../lib/media";
 import { supabase } from "../lib/supabase";
 import type { Database } from "../types/database";
 
@@ -147,6 +148,54 @@ export function useMessages(conversationId: string | undefined, userId: string |
     [conversationId, userId]
   );
 
+  const sendImage = useCallback(
+    async (localUri: string) => {
+      if (!conversationId || !userId) return;
+
+      const optimisticId = `optimistic-${Date.now()}`;
+      const optimistic: ChatMessage = {
+        id: optimisticId,
+        conversation_id: conversationId,
+        sender_id: userId,
+        kind: "image",
+        body: null,
+        // Show the local file while the upload is in flight.
+        media_url: localUri,
+        shared_activity_id: null,
+        shared_profile_id: null,
+        created_at: new Date().toISOString(),
+        pending: true,
+      };
+      setMessages((current) => [optimistic, ...current]);
+
+      try {
+        const path = await uploadChatMedia(conversationId, localUri);
+        const { error: insertError } = await supabase.from("messages").insert({
+          conversation_id: conversationId,
+          sender_id: userId,
+          kind: "image",
+          media_url: path,
+        });
+        if (insertError) throw insertError;
+      } catch (error) {
+        setMessages((current) =>
+          current.map((message) =>
+            message.id === optimisticId ? { ...message, pending: false, failed: true } : message
+          )
+        );
+        throw error;
+      }
+    },
+    [conversationId, userId]
+  );
+
+  const deleteMessage = useCallback(async (messageId: string) => {
+    // Optimistically remove; the realtime DELETE event is a no-op afterwards.
+    setMessages((current) => current.filter((message) => message.id !== messageId));
+    const { error } = await supabase.from("messages").delete().eq("id", messageId);
+    if (error) throw error;
+  }, []);
+
   const markRead = useCallback(async () => {
     if (!conversationId || !userId) return;
     await supabase
@@ -156,5 +205,14 @@ export function useMessages(conversationId: string | undefined, userId: string |
       .eq("user_id", userId);
   }, [conversationId, userId]);
 
-  return { messages, loading, error, sendMessage, markRead, refresh: load };
+  return {
+    messages,
+    loading,
+    error,
+    sendMessage,
+    sendImage,
+    deleteMessage,
+    markRead,
+    refresh: load,
+  };
 }

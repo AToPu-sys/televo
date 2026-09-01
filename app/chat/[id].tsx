@@ -1,8 +1,10 @@
 import { Ionicons } from "@expo/vector-icons";
+import * as ImagePicker from "expo-image-picker";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { useEffect, useState } from "react";
 import {
   ActivityIndicator,
+  Alert,
   FlatList,
   KeyboardAvoidingView,
   Platform,
@@ -18,8 +20,9 @@ import { Avatar } from "../../src/components/Avatar";
 import { MessageBubble } from "../../src/components/MessageBubble";
 import { useAuth } from "../../src/hooks/useAuth";
 import { useConversation } from "../../src/hooks/useConversation";
-import { useMessages } from "../../src/hooks/useMessages";
+import { useMessages, type ChatMessage } from "../../src/hooks/useMessages";
 import { useTheme } from "../../src/hooks/useTheme";
+import { useTyping } from "../../src/hooks/useTyping";
 import { radius, spacing } from "../../src/theme";
 
 export default function ConversationScreen() {
@@ -29,9 +32,18 @@ export default function ConversationScreen() {
   const router = useRouter();
 
   const { conversation, loading: loadingConversation } = useConversation(id, user?.id);
-  const { messages, loading, sendMessage, markRead } = useMessages(id, user?.id);
+  const { messages, loading, sendMessage, sendImage, deleteMessage, markRead } = useMessages(
+    id,
+    user?.id
+  );
+  const { typingLabel, notifyTyping } = useTyping(
+    id,
+    user?.id,
+    user?.user_metadata?.display_name as string | undefined
+  );
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
+  const [attaching, setAttaching] = useState(false);
 
   // Clear the unread badge once the thread is on screen.
   useEffect(() => {
@@ -54,6 +66,56 @@ export default function ConversationScreen() {
     } finally {
       setSending(false);
     }
+  }
+
+  async function handleAttachImage() {
+    if (attaching) return;
+
+    const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (!permission.granted) {
+      Alert.alert(
+        "Photo access needed",
+        "Allow photo library access to send images, or enable it in Settings."
+      );
+      return;
+    }
+
+    const picked = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ["images"],
+      quality: 0.7,
+    });
+    if (picked.canceled || !picked.assets?.[0]) return;
+
+    setAttaching(true);
+    try {
+      await sendImage(picked.assets[0].uri);
+    } catch (caught) {
+      Alert.alert("Upload failed", caught instanceof Error ? caught.message : "Please try again.");
+    } finally {
+      setAttaching(false);
+    }
+  }
+
+  function handleMessageLongPress(message: ChatMessage) {
+    // Deleting is only offered for your own messages — the RLS policy allows
+    // exactly that, so showing it for others' would just produce an error.
+    if (message.sender_id !== user?.id) return;
+
+    Alert.alert("Delete message", "This removes it for everyone in the chat.", [
+      { text: "Cancel", style: "cancel" },
+      {
+        text: "Delete",
+        style: "destructive",
+        onPress: () => {
+          deleteMessage(message.id).catch((caught: unknown) => {
+            Alert.alert(
+              "Couldn't delete",
+              caught instanceof Error ? caught.message : "Please try again."
+            );
+          });
+        },
+      },
+    ]);
   }
 
   const title = conversation?.title ?? "Chat";
@@ -79,7 +141,11 @@ export default function ConversationScreen() {
           <Text style={[styles.headerTitle, { color: theme.text }]} numberOfLines={1}>
             {loadingConversation ? "…" : title}
           </Text>
-          {conversation?.subtitle ? (
+          {typingLabel ? (
+            <Text style={[styles.headerSubtitle, { color: theme.accent }]} numberOfLines={1}>
+              {typingLabel}
+            </Text>
+          ) : conversation?.subtitle ? (
             <Text style={[styles.headerSubtitle, { color: theme.textSecondary }]} numberOfLines={1}>
               {conversation.subtitle}
             </Text>
@@ -112,7 +178,11 @@ export default function ConversationScreen() {
               </View>
             }
             renderItem={({ item }) => (
-              <MessageBubble message={item} isOwn={item.sender_id === user?.id} />
+              <MessageBubble
+                message={item}
+                isOwn={item.sender_id === user?.id}
+                onLongPress={handleMessageLongPress}
+              />
             )}
           />
         )}
@@ -123,9 +193,27 @@ export default function ConversationScreen() {
             { backgroundColor: theme.surface, borderTopColor: theme.border },
           ]}
         >
+          <Pressable
+            onPress={handleAttachImage}
+            disabled={attaching}
+            accessibilityRole="button"
+            accessibilityLabel="Attach a photo"
+            accessibilityState={{ disabled: attaching }}
+            hitSlop={8}
+            style={styles.attach}
+          >
+            {attaching ? (
+              <ActivityIndicator color={theme.accent} />
+            ) : (
+              <Ionicons name="image-outline" size={24} color={theme.accent} />
+            )}
+          </Pressable>
           <TextInput
             value={draft}
-            onChangeText={setDraft}
+            onChangeText={(text) => {
+              setDraft(text);
+              notifyTyping();
+            }}
             placeholder="Message"
             placeholderTextColor={theme.textSecondary}
             style={[
@@ -204,4 +292,5 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
+  attach: { width: 40, height: 40, alignItems: "center", justifyContent: "center" },
 });

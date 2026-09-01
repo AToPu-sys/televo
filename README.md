@@ -3,6 +3,9 @@
 A Telegram-style messenger built with Expo (React Native) and a Supabase backend:
 real accounts, real chats, and messages that sync live between devices.
 
+Built on **Expo SDK 54** (React Native 0.81, React 19.1). Runs on iOS via Expo Go
+or an EAS build — no Mac required for development.
+
 ## Features
 
 - **Auth** — email + password (works out of the box) and phone/SMS OTP (needs an
@@ -11,6 +14,11 @@ real accounts, real chats, and messages that sync live between devices.
   pull-to-refresh.
 - **Conversations** — Telegram-style bubbles, optimistic send with pending /
   failed states, and live delivery over Supabase Realtime.
+- **Photos** — send images from the library; uploads go to a private Storage
+  bucket and render through signed URLs.
+- **Group chats** — create a group, name it, pick members; the creator is admin.
+- **Delete** — long-press your own message to delete it for everyone.
+- **Typing indicators** — live over Realtime broadcast (no DB writes).
 - **Contacts** — user directory; tap anyone to open (or create) a direct chat.
 - **Settings** — profile card, dark mode toggle with a "match system" option,
   sign out.
@@ -79,6 +87,12 @@ These cost real debugging time; they are not obvious from the code:
    `profiles`**, so PostgREST cannot embed profiles in that query. Profiles are
    fetched in a follow-up query (see `useChats` / `useConversation`).
 
+6. **Storage paths are dictated by policy, not preference.** Chat media must be
+   uploaded to `chat-media/<conversation_id>/<file>` — the policy reads the
+   first folder segment and checks you participate in that conversation.
+   Avatars must be `avatars/<user_id>/<file>`. Any other path fails RLS.
+   `chat-media` is private, so reading requires a signed URL.
+
 ### Phone / SMS sign-in
 
 The phone flow is fully wired but inert until an SMS provider (Twilio, etc.) is
@@ -100,7 +114,13 @@ correctly blocked. It creates test users and deletes them afterwards.
 
 ```bash
 SUPABASE_SERVICE_ROLE_KEY=<service-role-key> node scripts/verify-backend.mjs
+SUPABASE_SERVICE_ROLE_KEY=<service-role-key> node scripts/verify-features.mjs
 ```
+
+`verify-features.mjs` covers the later additions: group creation and group
+messaging, media upload (including that a non-participant is blocked from both
+uploading and reading), image messages, delete permissions, and the typing
+broadcast.
 
 The admin key is only needed to create pre-confirmed test users; it is read from
 the environment and never written to `.env` or committed.

@@ -47,14 +47,24 @@ export default function ChatsScreen() {
     <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]} edges={["top"]}>
       <View style={[styles.header, { borderBottomColor: theme.border }]}>
         <Text style={[styles.headerTitle, { color: theme.text }]}>Chats</Text>
-        <Pressable
-          accessibilityRole="button"
-          accessibilityLabel="New chat"
-          onPress={() => router.push("/(tabs)/contacts")}
-          hitSlop={10}
-        >
-          <Ionicons name="create-outline" size={26} color={theme.accent} />
-        </Pressable>
+        <View style={styles.headerActions}>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="New group"
+            onPress={() => router.push("/new-group")}
+            hitSlop={10}
+          >
+            <Ionicons name="people-outline" size={25} color={theme.accent} />
+          </Pressable>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="New chat"
+            onPress={() => router.push("/(tabs)/contacts")}
+            hitSlop={10}
+          >
+            <Ionicons name="create-outline" size={26} color={theme.accent} />
+          </Pressable>
+        </View>
       </View>
 
       <View style={styles.searchWrapper}>
@@ -195,6 +205,7 @@ const styles = StyleSheet.create({
     borderBottomWidth: StyleSheet.hairlineWidth,
   },
   headerTitle: { fontSize: 24, fontWeight: "700" },
+  headerActions: { flexDirection: "row", alignItems: "center", gap: spacing.lg },
   searchWrapper: { paddingHorizontal: spacing.lg, paddingVertical: spacing.sm },
   search: {
     flexDirection: "row",

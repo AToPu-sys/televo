@@ -1,11 +1,19 @@
 import { Ionicons } from "@expo/vector-icons";
-import { Image, StyleSheet, Text, View } from "react-native";
+import { useEffect, useState } from "react";
+import { ActivityIndicator, Image, Pressable, StyleSheet, Text, View } from "react-native";
 
 import { useTheme } from "../hooks/useTheme";
 import type { ChatMessage } from "../hooks/useMessages";
+import { signedChatMediaUrl } from "../lib/media";
 import { radius, spacing } from "../theme";
 
-export function MessageBubble({ message, isOwn }: { message: ChatMessage; isOwn: boolean }) {
+type MessageBubbleProps = {
+  message: ChatMessage;
+  isOwn: boolean;
+  onLongPress?: (message: ChatMessage) => void;
+};
+
+export function MessageBubble({ message, isOwn, onLongPress }: MessageBubbleProps) {
   const { theme } = useTheme();
 
   const backgroundColor = isOwn ? theme.bubbleOut : theme.bubbleIn;
@@ -14,7 +22,11 @@ export function MessageBubble({ message, isOwn }: { message: ChatMessage; isOwn:
   return (
     // The list is inverted, so each row is flipped back upright here.
     <View style={[styles.row, styles.unflip, isOwn ? styles.alignEnd : styles.alignStart]}>
-      <View
+      <Pressable
+        onLongPress={onLongPress ? () => onLongPress(message) : undefined}
+        delayLongPress={350}
+        accessibilityRole={onLongPress ? "button" : undefined}
+        accessibilityLabel={onLongPress ? "Message options" : undefined}
         style={[
           styles.bubble,
           { backgroundColor },
@@ -23,11 +35,7 @@ export function MessageBubble({ message, isOwn }: { message: ChatMessage; isOwn:
         ]}
       >
         {message.kind === "image" && message.media_url ? (
-          <Image
-            source={{ uri: message.media_url }}
-            style={styles.media}
-            accessibilityIgnoresInvertColors
-          />
+          <ChatImage path={message.media_url} pending={message.pending} />
         ) : null}
 
         {message.body ? (
@@ -40,7 +48,67 @@ export function MessageBubble({ message, isOwn }: { message: ChatMessage; isOwn:
           </Text>
           {isOwn ? <DeliveryState message={message} /> : null}
         </View>
+      </Pressable>
+    </View>
+  );
+}
+
+/**
+ * chat-media is a private bucket, so a stored path has to be exchanged for a
+ * signed URL before it can render. While a message is still uploading, the
+ * optimistic copy already holds a local file:// URI — use it directly.
+ */
+function ChatImage({ path, pending }: { path: string; pending?: boolean }) {
+  const { theme } = useTheme();
+  const isLocal = path.startsWith("file:") || path.startsWith("content:");
+  const [uri, setUri] = useState<string | null>(isLocal ? path : null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    if (isLocal) {
+      setUri(path);
+      return;
+    }
+
+    let active = true;
+    signedChatMediaUrl(path)
+      .then((signed) => {
+        if (active) setUri(signed);
+      })
+      .catch(() => {
+        if (active) setFailed(true);
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [path, isLocal]);
+
+  if (failed) {
+    return (
+      <View style={[styles.media, styles.mediaPlaceholder, { backgroundColor: theme.surfaceElevated }]}>
+        <Ionicons name="image-outline" size={28} color={theme.textSecondary} />
+        <Text style={[styles.mediaError, { color: theme.textSecondary }]}>Image unavailable</Text>
       </View>
+    );
+  }
+
+  if (!uri) {
+    return (
+      <View style={[styles.media, styles.mediaPlaceholder, { backgroundColor: theme.surfaceElevated }]}>
+        <ActivityIndicator color={theme.accent} />
+      </View>
+    );
+  }
+
+  return (
+    <View>
+      <Image source={{ uri }} style={styles.media} accessibilityIgnoresInvertColors />
+      {pending ? (
+        <View style={styles.uploadOverlay}>
+          <ActivityIndicator color="#FFFFFF" />
+        </View>
+      ) : null}
     </View>
   );
 }
@@ -77,6 +145,19 @@ const styles = StyleSheet.create({
   bubbleIn: { borderBottomLeftRadius: radius.xs },
   text: { fontSize: 16, lineHeight: 21 },
   media: { width: 220, height: 160, borderRadius: radius.md },
+  mediaPlaceholder: { alignItems: "center", justifyContent: "center", gap: spacing.xs },
+  mediaError: { fontSize: 12 },
+  uploadOverlay: {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "rgba(0,0,0,0.35)",
+    borderRadius: radius.md,
+  },
   meta: { flexDirection: "row", alignItems: "center", gap: 4, alignSelf: "flex-end" },
   time: { fontSize: 11 },
 });

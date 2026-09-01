@@ -48,6 +48,7 @@ function RootNavigator() {
         <Stack.Screen name="(auth)" />
         <Stack.Screen name="(tabs)" />
         <Stack.Screen name="chat/[id]" options={{ headerShown: false }} />
+        <Stack.Screen name="new-group" options={{ presentation: "modal" }} />
       </Stack>
     </>
   );

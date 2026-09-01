@@ -114,3 +114,35 @@ export async function findOrCreateDirectChat(userId: string, otherUserId: string
 
   return conversationId;
 }
+
+/** Creates a group conversation with the given title and members. */
+export async function createGroupChat(userId: string, title: string, memberIds: string[]) {
+  const conversationId = randomUUID();
+
+  const { error: createError } = await supabase
+    .from("conversations")
+    .insert({ id: conversationId, kind: "group", title: title.trim(), created_by: userId });
+
+  if (createError) throw createError;
+
+  // Creator first — the participant policy only lets you add others once you
+  // are a member yourself. The creator is also the group admin.
+  const { error: selfError } = await supabase
+    .from("conversation_participants")
+    .insert({ conversation_id: conversationId, user_id: userId, is_admin: true });
+
+  if (selfError) throw selfError;
+
+  const others = memberIds.filter((id) => id !== userId);
+  if (others.length > 0) {
+    const { error: membersError } = await supabase.from("conversation_participants").insert(
+      others.map((id) => ({
+        conversation_id: conversationId,
+        user_id: id,
+      }))
+    );
+    if (membersError) throw membersError;
+  }
+
+  return conversationId;
+}

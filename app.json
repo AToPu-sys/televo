@@ -27,9 +27,13 @@
     },
     "plugins": [
       "expo-router",
-      "expo-status-bar",
       "expo-secure-store",
-      "expo-image-picker"
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Allow $(PRODUCT_NAME) to access your photos so you can send them in chats."
+        }
+      ]
     ],
     "experiments": {
       "typedRoutes": true
