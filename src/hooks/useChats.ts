@@ -165,7 +165,10 @@ export function useChats(userId: string | undefined) {
   }, [load]);
 
   // Any new message anywhere can change ordering, previews, or unread counts,
-  // so refresh the summary list when one lands.
+  // so refresh the summary list when one lands. Also listen for
+  // conversation_participants updates: that's how last_read_at changes, which
+  // is what lets a chat marked read on one device clear its badge live on
+  // another device signed into the same account.
   useEffect(() => {
     if (!userId) return;
 
@@ -174,6 +177,18 @@ export function useChats(userId: string | undefined) {
       .on(
         "postgres_changes",
         { event: "INSERT", schema: "public", table: "messages" },
+        () => {
+          void load();
+        }
+      )
+      .on(
+        "postgres_changes",
+        {
+          event: "UPDATE",
+          schema: "public",
+          table: "conversation_participants",
+          filter: `user_id=eq.${userId}`,
+        },
         () => {
           void load();
         }

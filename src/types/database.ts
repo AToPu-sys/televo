@@ -184,6 +184,47 @@ export type Database = {
           },
         ]
       }
+      calls: {
+        Row: {
+          answered_at: string | null
+          caller_id: string
+          conversation_id: string
+          ended_at: string | null
+          id: string
+          kind: Database["public"]["Enums"]["call_kind"]
+          started_at: string
+          status: Database["public"]["Enums"]["call_status"]
+        }
+        Insert: {
+          answered_at?: string | null
+          caller_id: string
+          conversation_id: string
+          ended_at?: string | null
+          id?: string
+          kind: Database["public"]["Enums"]["call_kind"]
+          started_at?: string
+          status?: Database["public"]["Enums"]["call_status"]
+        }
+        Update: {
+          answered_at?: string | null
+          caller_id?: string
+          conversation_id?: string
+          ended_at?: string | null
+          id?: string
+          kind?: Database["public"]["Enums"]["call_kind"]
+          started_at?: string
+          status?: Database["public"]["Enums"]["call_status"]
+        }
+        Relationships: [
+          {
+            foreignKeyName: "calls_conversation_id_fkey"
+            columns: ["conversation_id"]
+            isOneToOne: false
+            referencedRelation: "conversations"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       challenge_participants: {
         Row: {
           challenge_id: string
@@ -724,6 +765,8 @@ export type Database = {
         | "wheelchair"
         | "inline_skating"
       activity_visibility: "public" | "friends" | "private" | "custom"
+      call_kind: "audio" | "video"
+      call_status: "ringing" | "active" | "ended" | "missed" | "declined"
       challenge_metric: "distance" | "duration" | "activity_count"
       conversation_kind: "direct" | "group"
       friendship_status: "pending" | "accepted" | "declined" | "blocked"
@@ -895,6 +938,8 @@ export const Constants = {
         "inline_skating",
       ],
       activity_visibility: ["public", "friends", "private", "custom"],
+      call_kind: ["audio", "video"],
+      call_status: ["ringing", "active", "ended", "missed", "declined"],
       challenge_metric: ["distance", "duration", "activity_count"],
       conversation_kind: ["direct", "group"],
       friendship_status: ["pending", "accepted", "declined", "blocked"],

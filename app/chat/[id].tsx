@@ -19,6 +19,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { Avatar } from "../../src/components/Avatar";
 import { MessageBubble } from "../../src/components/MessageBubble";
 import { useAuth } from "../../src/hooks/useAuth";
+import { useCallManager } from "../../src/hooks/useCallManager";
 import { useConversation } from "../../src/hooks/useConversation";
 import { useMessages, type ChatMessage } from "../../src/hooks/useMessages";
 import { useTheme } from "../../src/hooks/useTheme";
@@ -41,9 +42,15 @@ export default function ConversationScreen() {
     user?.id,
     user?.user_metadata?.display_name as string | undefined
   );
+  const { placeCall, state: callState } = useCallManager();
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
   const [attaching, setAttaching] = useState(false);
+
+  function handleCall(kind: "audio" | "video") {
+    if (!id || callState.phase !== "idle") return;
+    void placeCall(id, kind);
+  }
 
   // Clear the unread badge once the thread is on screen.
   useEffect(() => {
@@ -151,6 +158,24 @@ export default function ConversationScreen() {
             </Text>
           ) : null}
         </View>
+        <Pressable
+          onPress={() => handleCall("audio")}
+          accessibilityRole="button"
+          accessibilityLabel="Voice call"
+          hitSlop={10}
+          style={styles.headerAction}
+        >
+          <Ionicons name="call-outline" size={23} color={theme.accent} />
+        </Pressable>
+        <Pressable
+          onPress={() => handleCall("video")}
+          accessibilityRole="button"
+          accessibilityLabel="Video call"
+          hitSlop={10}
+          style={styles.headerAction}
+        >
+          <Ionicons name="videocam-outline" size={25} color={theme.accent} />
+        </Pressable>
       </View>
 
       <KeyboardAvoidingView
@@ -293,4 +318,5 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   attach: { width: 40, height: 40, alignItems: "center", justifyContent: "center" },
+  headerAction: { marginLeft: spacing.md },
 });

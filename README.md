@@ -3,8 +3,11 @@
 A Telegram-style messenger built with Expo (React Native) and a Supabase backend:
 real accounts, real chats, and messages that sync live between devices.
 
-Built on **Expo SDK 54** (React Native 0.81, React 19.1). Runs on iOS via Expo Go
-or an EAS build — no Mac required for development.
+Built on **Expo SDK 54** (React Native 0.81, React 19.1).
+
+**Voice/video calling requires a custom dev build — this app no longer runs in
+Expo Go.** `react-native-webrtc` needs native code Expo Go doesn't ship. See
+"Running the app" below.
 
 ## Features
 
@@ -19,20 +22,60 @@ or an EAS build — no Mac required for development.
 - **Group chats** — create a group, name it, pick members; the creator is admin.
 - **Delete** — long-press your own message to delete it for everyone.
 - **Typing indicators** — live over Realtime broadcast (no DB writes).
+- **Voice & video calls** — real WebRTC peer connections. Signaling (offer/
+  answer/ICE) over Realtime broadcast; a free public TURN relay handles NAT
+  traversal. Ringing/incoming-call UI works from anywhere in the app.
+- **Multi-device sync** — the same account on two devices shares chats,
+  messages, and read state live; marking a chat read on one device clears its
+  badge on the other in real time.
 - **Contacts** — user directory; tap anyone to open (or create) a direct chat.
 - **Settings** — profile card, dark mode toggle with a "match system" option,
   sign out.
 - **Theming** — light and dark palettes throughout, persisted between launches.
 
-## Setup
+## Running the app
+
+WebRTC needs native code, so this is a **custom dev build**, not Expo Go.
 
 ```bash
 npm install
 cp .env.example .env   # then fill in your Supabase values
-npm start
+
+# Android (needs Android Studio / an emulator or a plugged-in device)
+npx expo run:android
+
+# iOS — requires a Mac with Xcode; on Windows/Linux use an EAS cloud build
+# instead (see below)
+npx expo run:ios
 ```
 
-Press `a` for Android, `i` for iOS, or `w` for web.
+The first run does a native `prebuild` (creates `android/` and `ios/`,
+gitignored) and installs the app on the emulator/device/simulator. After that,
+`npx expo start --dev-client` reconnects to the already-installed build for
+fast JS-only reloads — no need to rebuild natively every time.
+
+### Building iOS without a Mac (EAS)
+
+```bash
+npm install -g eas-cli
+eas login
+eas build:configure
+eas build --profile development --platform ios
+```
+
+This builds in the cloud and gives you an install link (or a simulator build).
+Install `expo-dev-client` on the resulting build, then run
+`npx expo start --dev-client` and scan/open to connect. See
+https://docs.expo.dev/develop/development-builds/create-a-build/ for the full
+walkthrough — an Apple Developer account is needed for a physical device,
+not for a simulator build.
+
+### Voice/video calls need a real device (or two)
+
+The iOS Simulator and most Android emulators don't expose a real camera/mic to
+apps in a way WebRTC can use reliably. Test calling on physical devices — you
+can call between an iOS build and an Android build, or two of the same
+platform, since it's standard WebRTC either way.
 
 ### Environment
 
@@ -93,6 +136,14 @@ These cost real debugging time; they are not obvious from the code:
    Avatars must be `avatars/<user_id>/<file>`. Any other path fails RLS.
    `chat-media` is private, so reading requires a signed URL.
 
+7. **A table has to be added to the `supabase_realtime` publication before any
+   `postgres_changes` subscription on it can fire — RLS being correct is not
+   enough.** `conversation_participants` was missing from the publication,
+   which silently broke live read-state sync across devices even though the
+   client code and RLS policies were both correct; found by writing a script
+   that actually exercised two clients on the same account rather than
+   trusting that "messages sync, so this probably does too."
+
 ### Phone / SMS sign-in
 
 The phone flow is fully wired but inert until an SMS provider (Twilio, etc.) is
@@ -115,12 +166,32 @@ correctly blocked. It creates test users and deletes them afterwards.
 ```bash
 SUPABASE_SERVICE_ROLE_KEY=<service-role-key> node scripts/verify-backend.mjs
 SUPABASE_SERVICE_ROLE_KEY=<service-role-key> node scripts/verify-features.mjs
+SUPABASE_SERVICE_ROLE_KEY=<service-role-key> node scripts/verify-calls.mjs
+SUPABASE_SERVICE_ROLE_KEY=<service-role-key> node scripts/verify-sync.mjs
 ```
 
-`verify-features.mjs` covers the later additions: group creation and group
-messaging, media upload (including that a non-participant is blocked from both
-uploading and reading), image messages, delete permissions, and the typing
-broadcast.
+- `verify-features.mjs` — group creation and messaging, media upload
+  (including that a non-participant is blocked from both uploading and
+  reading), image messages, delete permissions, typing broadcast.
+- `verify-calls.mjs` — the `calls` table's RLS (participants only, both ways),
+  incoming-call realtime notification, and the signaling broadcast channel
+  carrying an offer + ICE candidate. Doesn't exercise actual audio/video —
+  that needs a physical device with a camera/mic.
+- `verify-sync.mjs` — two clients signed into the same account, confirming a
+  chat marked read on one is reflected live on the other, and that another
+  user's channel isn't notified by it.
+
+## Database changes made in this project
+
+Applied directly against the shared project (via `supabase db query --linked`)
+and kept as plain SQL under `scripts/sql/` rather than forced into the fitness
+app's own migration history, which this project never pulled locally:
+
+- `001_calls.sql` — the `calls` table (kind, status, timestamps), RLS scoped
+  to conversation participants via the existing
+  `is_conversation_participant()` function, added to `supabase_realtime`.
+- `002_realtime_participants.sql` — adds `conversation_participants` to the
+  `supabase_realtime` publication (see gotcha #7 above).
 
 The admin key is only needed to create pre-confirmed test users; it is read from
 the environment and never written to `.env` or committed.
