@@ -1,12 +1,26 @@
 {
   "name": "metarayban",
   "version": "1.0.0",
-  "main": "index.ts",
+  "main": "expo-router/entry",
   "dependencies": {
+    "@expo/vector-icons": "^15.0.2",
+    "@react-native-async-storage/async-storage": "2.2.0",
+    "@supabase/supabase-js": "^2.112.4",
     "expo": "~57.0.18",
+    "expo-constants": "~57.0.16",
+    "expo-crypto": "~57.0.2",
+    "expo-image-picker": "~57.0.14",
+    "expo-linking": "~57.0.8",
+    "expo-router": "~57.0.17",
+    "expo-secure-store": "~57.0.2",
     "expo-status-bar": "~57.0.1",
     "react": "19.2.3",
-    "react-native": "0.86.3"
+    "react-native": "0.86.3",
+    "react-native-gesture-handler": "~2.32.0",
+    "react-native-reanimated": "4.5.1",
+    "react-native-safe-area-context": "~5.7.0",
+    "react-native-screens": "~4.26.0",
+    "react-native-url-polyfill": "^4.0.0"
   },
   "devDependencies": {
     "@types/react": "~19.2.2",

@@ -1,15 +1,18 @@
 {
   "expo": {
-    "name": "MetaRayban",
-    "slug": "MetaRayban",
+    "name": "Telegram Clone",
+    "slug": "telegram-clone",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
-    "userInterfaceStyle": "light",
+    "scheme": "tgclone",
+    "userInterfaceStyle": "automatic",
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.tgclone.app"
     },
     "android": {
+      "package": "com.tgclone.app",
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/android-icon-foreground.png",
@@ -19,7 +22,17 @@
       "predictiveBackGestureEnabled": false
     },
     "web": {
-      "favicon": "./assets/favicon.png"
+      "favicon": "./assets/favicon.png",
+      "bundler": "metro"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-status-bar",
+      "expo-secure-store",
+      "expo-image-picker"
+    ],
+    "experiments": {
+      "typedRoutes": true
     }
   }
 }

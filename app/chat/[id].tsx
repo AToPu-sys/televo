@@ -1,0 +1,207 @@
+import { Ionicons } from "@expo/vector-icons";
+import { useLocalSearchParams, useRouter } from "expo-router";
+import { useEffect, useState } from "react";
+import {
+  ActivityIndicator,
+  FlatList,
+  KeyboardAvoidingView,
+  Platform,
+  Pressable,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
+} from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
+
+import { Avatar } from "../../src/components/Avatar";
+import { MessageBubble } from "../../src/components/MessageBubble";
+import { useAuth } from "../../src/hooks/useAuth";
+import { useConversation } from "../../src/hooks/useConversation";
+import { useMessages } from "../../src/hooks/useMessages";
+import { useTheme } from "../../src/hooks/useTheme";
+import { radius, spacing } from "../../src/theme";
+
+export default function ConversationScreen() {
+  const { id } = useLocalSearchParams<{ id: string }>();
+  const { theme } = useTheme();
+  const { user } = useAuth();
+  const router = useRouter();
+
+  const { conversation, loading: loadingConversation } = useConversation(id, user?.id);
+  const { messages, loading, sendMessage, markRead } = useMessages(id, user?.id);
+  const [draft, setDraft] = useState("");
+  const [sending, setSending] = useState(false);
+
+  // Clear the unread badge once the thread is on screen.
+  useEffect(() => {
+    if (!loading) {
+      void markRead();
+    }
+  }, [loading, markRead, messages.length]);
+
+  async function handleSend() {
+    const body = draft.trim();
+    if (!body || sending) return;
+    setDraft("");
+    setSending(true);
+    try {
+      await sendMessage(body);
+    } catch {
+      // useMessages marks the bubble as failed; restore the text so the user
+      // can retry without retyping.
+      setDraft(body);
+    } finally {
+      setSending(false);
+    }
+  }
+
+  const title = conversation?.title ?? "Chat";
+
+  return (
+    <SafeAreaView style={[styles.container, { backgroundColor: theme.chatBackground }]}>
+      <View
+        style={[
+          styles.header,
+          { backgroundColor: theme.surface, borderBottomColor: theme.border },
+        ]}
+      >
+        <Pressable
+          onPress={() => router.back()}
+          accessibilityRole="button"
+          accessibilityLabel="Back to chats"
+          hitSlop={12}
+        >
+          <Ionicons name="chevron-back" size={28} color={theme.accent} />
+        </Pressable>
+        <Avatar name={title} uri={conversation?.avatarUrl ?? null} size={38} />
+        <View style={styles.headerText}>
+          <Text style={[styles.headerTitle, { color: theme.text }]} numberOfLines={1}>
+            {loadingConversation ? "…" : title}
+          </Text>
+          {conversation?.subtitle ? (
+            <Text style={[styles.headerSubtitle, { color: theme.textSecondary }]} numberOfLines={1}>
+              {conversation.subtitle}
+            </Text>
+          ) : null}
+        </View>
+      </View>
+
+      <KeyboardAvoidingView
+        style={styles.flex}
+        behavior={Platform.OS === "ios" ? "padding" : undefined}
+        keyboardVerticalOffset={Platform.OS === "ios" ? 0 : 0}
+      >
+        {loading ? (
+          <View style={styles.center}>
+            <ActivityIndicator size="large" color={theme.accent} />
+          </View>
+        ) : (
+          <FlatList
+            // Newest-first data rendered bottom-up, so new messages appear at
+            // the bottom without manual scrolling.
+            inverted
+            data={messages}
+            keyExtractor={(item) => item.id}
+            contentContainerStyle={styles.list}
+            ListEmptyComponent={
+              <View style={[styles.center, styles.emptyInverted]}>
+                <Text style={[styles.emptyText, { color: theme.textSecondary }]}>
+                  No messages yet. Say hello.
+                </Text>
+              </View>
+            }
+            renderItem={({ item }) => (
+              <MessageBubble message={item} isOwn={item.sender_id === user?.id} />
+            )}
+          />
+        )}
+
+        <View
+          style={[
+            styles.composer,
+            { backgroundColor: theme.surface, borderTopColor: theme.border },
+          ]}
+        >
+          <TextInput
+            value={draft}
+            onChangeText={setDraft}
+            placeholder="Message"
+            placeholderTextColor={theme.textSecondary}
+            style={[
+              styles.input,
+              { backgroundColor: theme.surfaceElevated, color: theme.text },
+            ]}
+            multiline
+            accessibilityLabel="Message text"
+          />
+          <Pressable
+            onPress={handleSend}
+            disabled={!draft.trim() || sending}
+            accessibilityRole="button"
+            accessibilityLabel="Send message"
+            accessibilityState={{ disabled: !draft.trim() || sending }}
+            style={({ pressed }) => [
+              styles.send,
+              {
+                backgroundColor: draft.trim() ? theme.accent : theme.surfaceElevated,
+                opacity: pressed ? 0.8 : 1,
+              },
+            ]}
+          >
+            <Ionicons
+              name="send"
+              size={18}
+              color={draft.trim() ? "#FFFFFF" : theme.textSecondary}
+            />
+          </Pressable>
+        </View>
+      </KeyboardAvoidingView>
+    </SafeAreaView>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1 },
+  flex: { flex: 1 },
+  header: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+  },
+  headerText: { flex: 1 },
+  headerTitle: { fontSize: 17, fontWeight: "600" },
+  headerSubtitle: { fontSize: 12 },
+  list: { paddingHorizontal: spacing.md, paddingVertical: spacing.md, gap: 2 },
+  center: { flex: 1, alignItems: "center", justifyContent: "center", padding: spacing.xl },
+  emptyInverted: { transform: [{ scaleY: -1 }] },
+  emptyText: { fontSize: 15 },
+  composer: {
+    flexDirection: "row",
+    alignItems: "flex-end",
+    gap: spacing.sm,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+    borderTopWidth: StyleSheet.hairlineWidth,
+  },
+  input: {
+    flex: 1,
+    minHeight: 40,
+    maxHeight: 120,
+    borderRadius: radius.lg,
+    paddingHorizontal: spacing.lg,
+    paddingTop: 10,
+    paddingBottom: 10,
+    fontSize: 16,
+  },
+  send: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+});
