@@ -40,19 +40,43 @@ function contentTypeFor(extension: string) {
   }
 }
 
-/** Uploads a picked image to a conversation and returns its storage path. */
-export async function uploadChatMedia(conversationId: string, localUri: string) {
+/** Uploads a picked image to a conversation and returns its storage path.
+ *
+ * `encryptor` is supplied for Secret Chats: the bytes are encrypted with the
+ * conversation's session key BEFORE upload, so the server stores ciphertext
+ * it cannot read. Without it, media in a "Secret Chat" was uploaded in the
+ * clear while the UI showed a lock — the encryption applied to text only. */
+export async function uploadChatMedia(
+  conversationId: string,
+  localUri: string,
+  encryptor?: (data: Uint8Array) => Promise<{ ciphertext: Uint8Array; nonce: string } | null>
+) {
   const extension = extensionFor(localUri, "jpg");
   const path = `${conversationId}/${randomUUID()}.${extension}`;
-  const bytes = await readAsArrayBuffer(localUri);
+  const raw = new Uint8Array(await readAsArrayBuffer(localUri));
 
-  const { error } = await supabase.storage.from("chat-media").upload(path, bytes, {
-    contentType: contentTypeFor(extension),
+  let payload: Uint8Array = raw;
+  let nonce: string | null = null;
+
+  if (encryptor) {
+    const encrypted = await encryptor(raw);
+    if (!encrypted) {
+      // Refuse rather than silently fall back to an unencrypted upload.
+      throw new Error("This Secret Chat has no encryption key yet, so the file wasn't sent.");
+    }
+    payload = encrypted.ciphertext;
+    nonce = encrypted.nonce;
+  }
+
+  const { error } = await supabase.storage.from("chat-media").upload(path, payload, {
+    contentType: encryptor ? "application/octet-stream" : contentTypeFor(extension),
     upsert: false,
   });
 
   if (error) throw error;
-  return path;
+  // The nonce is needed to decrypt and is not secret, so it rides along in
+  // the stored path reference.
+  return nonce ? `${path}#${nonce}` : path;
 }
 
 /**
@@ -61,25 +85,72 @@ export async function uploadChatMedia(conversationId: string, localUri: string) 
  * since the access rule is identical; the original filename is kept in the
  * storage path so a downloaded file doesn't end up named after a UUID.
  */
-export async function uploadChatDocument(conversationId: string, localUri: string, fileName: string) {
+export async function uploadChatDocument(
+  conversationId: string,
+  localUri: string,
+  fileName: string,
+  encryptor?: (data: Uint8Array) => Promise<{ ciphertext: Uint8Array; nonce: string } | null>
+) {
   const safeName = fileName.replace(/[^a-zA-Z0-9._-]/g, "_");
   const path = `${conversationId}/documents/${randomUUID()}-${safeName}`;
-  const bytes = await readAsArrayBuffer(localUri);
+  const raw = new Uint8Array(await readAsArrayBuffer(localUri));
 
-  const { error } = await supabase.storage.from("chat-media").upload(path, bytes, {
+  let payload: Uint8Array = raw;
+  let nonce: string | null = null;
+
+  if (encryptor) {
+    const encrypted = await encryptor(raw);
+    if (!encrypted) {
+      throw new Error("This Secret Chat has no encryption key yet, so the file wasn't sent.");
+    }
+    payload = encrypted.ciphertext;
+    nonce = encrypted.nonce;
+  }
+
+  const { error } = await supabase.storage.from("chat-media").upload(path, payload, {
     contentType: "application/octet-stream",
     upsert: false,
   });
 
   if (error) throw error;
-  return path;
+  return nonce ? `${path}#${nonce}` : path;
+}
+
+/** Splits a stored reference into its path and (optional) encryption nonce. */
+export function parseMediaRef(ref: string): { path: string; nonce: string | null } {
+  const hash = ref.indexOf("#");
+  return hash === -1
+    ? { path: ref, nonce: null }
+    : { path: ref.slice(0, hash), nonce: ref.slice(hash + 1) };
+}
+
+/** Downloads encrypted media and returns a data URI the app can render. */
+export async function fetchDecryptedMedia(
+  ref: string,
+  decryptor: (ciphertext: Uint8Array, nonce: string) => Promise<Uint8Array | null>
+): Promise<string | null> {
+  const { path, nonce } = parseMediaRef(ref);
+  if (!nonce) return null;
+
+  const { data, error } = await supabase.storage.from("chat-media").download(path);
+  if (error || !data) return null;
+
+  const plain = await decryptor(new Uint8Array(await data.arrayBuffer()), nonce);
+  if (!plain) return null;
+
+  let binary = "";
+  for (let index = 0; index < plain.length; index += 1) {
+    binary += String.fromCharCode(plain[index]);
+  }
+  return `data:image/jpeg;base64,${btoa(binary)}`;
 }
 
 /**
  * chat-media is a private bucket, so rendering needs a signed URL rather than a
  * public one. An hour is plenty for a message being viewed now.
  */
-export async function signedChatMediaUrl(path: string, expiresInSeconds = 3600) {
+export async function signedChatMediaUrl(ref: string, expiresInSeconds = 3600) {
+  const { path } = parseMediaRef(ref);
   const { data, error } = await supabase.storage
     .from("chat-media")
     .createSignedUrl(path, expiresInSeconds);

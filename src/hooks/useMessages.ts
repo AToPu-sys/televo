@@ -49,7 +49,7 @@ export function useMessages(
   // checkmark unconditionally, which simply lied to the user.
   const [peerLastReadAt, setPeerLastReadAt] = useState<string | null>(null);
   const loadingOlderRef = useRef(false);
-  const { encryptForConversation, decryptForConversation } = useE2ee();
+  const { encryptForConversation, decryptForConversation, encryptBytesForConversation } = useE2ee();
 
   const decorateWithDecryption = useCallback(
     async (rows: ChatMessage[]): Promise<ChatMessage[]> => {
@@ -348,7 +348,11 @@ export function useMessages(
       setMessages((current) => [optimistic, ...current]);
 
       try {
-        const path = await uploadChatMedia(conversationId, localUri);
+        const path = await uploadChatMedia(
+          conversationId,
+          localUri,
+          isEncrypted ? (data) => encryptBytesForConversation(conversationId, data) : undefined
+        );
         const { error: insertError } = await supabase.from("messages").insert({
           conversation_id: conversationId,
           sender_id: userId,
@@ -365,7 +369,7 @@ export function useMessages(
         throw error;
       }
     },
-    [conversationId, userId]
+    [conversationId, userId, isEncrypted, encryptBytesForConversation]
   );
 
   const sendDocument = useCallback(
@@ -395,7 +399,12 @@ export function useMessages(
       setMessages((current) => [optimistic, ...current]);
 
       try {
-        const path = await uploadChatDocument(conversationId, localUri, name);
+        const path = await uploadChatDocument(
+          conversationId,
+          localUri,
+          name,
+          isEncrypted ? (data) => encryptBytesForConversation(conversationId, data) : undefined
+        );
         const { error: insertError } = await supabase.from("messages").insert({
           conversation_id: conversationId,
           sender_id: userId,
@@ -414,7 +423,7 @@ export function useMessages(
         throw error;
       }
     },
-    [conversationId, userId]
+    [conversationId, userId, isEncrypted, encryptBytesForConversation]
   );
 
   const deleteMessage = useCallback(async (messageId: string) => {

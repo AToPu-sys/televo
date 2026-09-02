@@ -9,7 +9,9 @@ import {
 } from "react";
 
 import {
+  decryptBytes,
   decryptMessage,
+  encryptBytes,
   encryptMessage,
   generateSessionKey,
   getOrCreateDeviceKeyPair,
@@ -26,10 +28,21 @@ type E2eeContextValue = {
   publicKey: string | null;
   /** Marks a direct conversation as encrypted and deposits a wrapped session
    * key for the other participant. Call once, when starting a Secret Chat. */
-  startEncryptedChat: (conversationId: string, otherUserId: string) => Promise<void>;
+  startEncryptedChat: (conversationId: string, otherUserId?: string) => Promise<void>;
   /** Encrypts a plaintext body for a conversation; throws if no session key
    * is available yet (the other side hasn't set one up, or it's still loading). */
   encryptForConversation: (conversationId: string, plaintext: string) => Promise<string>;
+  /** Encrypts raw file bytes for a Secret Chat. Returns null when the chat
+   * has no session key, so callers can refuse rather than upload in clear. */
+  encryptBytesForConversation: (
+    conversationId: string,
+    data: Uint8Array
+  ) => Promise<{ ciphertext: Uint8Array; nonce: string } | null>;
+  decryptBytesForConversation: (
+    conversationId: string,
+    ciphertext: Uint8Array,
+    nonce: string
+  ) => Promise<Uint8Array | null>;
   /** Decrypts a stored body for a conversation; returns null if it can't be
    * decrypted (wrong/missing key, or the body isn't actually encrypted). */
   decryptForConversation: (conversationId: string, body: string) => Promise<string | null>;
@@ -108,26 +121,40 @@ export function E2eeProvider({
     [userId, keyPair]
   );
 
+  /**
+   * Turns on encryption for a conversation. Works for groups as well as
+   * direct chats: one random session key is generated and wrapped separately
+   * to EVERY participant's public key, so each member can unwrap their own
+   * copy and nobody else's. Previously groups had no encryption at all.
+   */
   const startEncryptedChat = useCallback(
-    async (conversationId: string, otherUserId: string) => {
+    async (conversationId: string, _otherUserId?: string) => {
       if (!userId || !keyPair) throw new Error("Encryption isn't ready yet.");
 
-      const { data: otherProfile, error: profileError } = await supabase
+      const { data: participants, error: participantsError } = await supabase
+        .from("conversation_participants")
+        .select("user_id")
+        .eq("conversation_id", conversationId);
+      if (participantsError) throw participantsError;
+
+      const memberIds = (participants ?? []).map((row) => row.user_id);
+      if (memberIds.length === 0) throw new Error("This conversation has no members.");
+
+      const { data: profiles, error: profilesError } = await supabase
         .from("profiles")
-        .select("e2e_public_key")
-        .eq("id", otherUserId)
-        .single();
-      if (profileError) throw profileError;
-      if (!otherProfile?.e2e_public_key) {
-        throw new Error("The other person hasn't opened the app on this version yet.");
+        .select("id, display_name, e2e_public_key")
+        .in("id", memberIds);
+      if (profilesError) throw profilesError;
+
+      const withoutKeys = (profiles ?? []).filter((profile) => !profile.e2e_public_key);
+      if (withoutKeys.length > 0) {
+        // Naming them makes this actionable instead of a dead end.
+        throw new Error(
+          `${withoutKeys.map((p) => p.display_name).join(", ")} hasn't opened the app on a version that supports encryption yet.`
+        );
       }
 
       const sessionKey = generateSessionKey();
-
-      // Wrap one copy for the other participant, and one for this device —
-      // so this device can also decrypt its own sent messages later.
-      const wrappedForOther = wrapSessionKey(sessionKey, otherProfile.e2e_public_key, keyPair.secretKey);
-      const wrappedForSelf = wrapSessionKey(sessionKey, keyPair.publicKey, keyPair.secretKey);
 
       const { error: markError } = await supabase
         .from("conversations")
@@ -135,27 +162,41 @@ export function E2eeProvider({
         .eq("id", conversationId);
       if (markError) throw markError;
 
-      const { error: keysError } = await supabase.from("encrypted_session_keys").insert([
-        {
-          conversation_id: conversationId,
-          recipient_id: otherUserId,
-          sender_public_key: keyPair.publicKey,
-          encrypted_key: wrappedForOther.encryptedKey,
-          nonce: wrappedForOther.nonce,
-        },
-        {
-          conversation_id: conversationId,
-          recipient_id: userId,
-          sender_public_key: keyPair.publicKey,
-          encrypted_key: wrappedForSelf.encryptedKey,
-          nonce: wrappedForSelf.nonce,
-        },
-      ]);
+      const { error: keysError } = await supabase.from("encrypted_session_keys").insert(
+        (profiles ?? []).map((profile) => {
+          const wrapped = wrapSessionKey(sessionKey, profile.e2e_public_key!, keyPair.secretKey);
+          return {
+            conversation_id: conversationId,
+            recipient_id: profile.id,
+            sender_public_key: keyPair.publicKey,
+            encrypted_key: wrapped.encryptedKey,
+            nonce: wrapped.nonce,
+          };
+        })
+      );
       if (keysError) throw keysError;
 
       sessionKeys.current.set(conversationId, sessionKey);
     },
     [userId, keyPair]
+  );
+
+  const encryptBytesForConversation = useCallback(
+    async (conversationId: string, data: Uint8Array) => {
+      const sessionKey = await loadSessionKey(conversationId);
+      if (!sessionKey) return null;
+      return encryptBytes(data, sessionKey);
+    },
+    [loadSessionKey]
+  );
+
+  const decryptBytesForConversation = useCallback(
+    async (conversationId: string, ciphertext: Uint8Array, nonce: string) => {
+      const sessionKey = await loadSessionKey(conversationId);
+      if (!sessionKey) return null;
+      return decryptBytes(ciphertext, nonce, sessionKey);
+    },
+    [loadSessionKey]
   );
 
   const encryptForConversation = useCallback(
@@ -189,6 +230,8 @@ export function E2eeProvider({
         publicKey: keyPair?.publicKey ?? null,
         startEncryptedChat,
         encryptForConversation,
+        encryptBytesForConversation,
+        decryptBytesForConversation,
         decryptForConversation,
       }}
     >

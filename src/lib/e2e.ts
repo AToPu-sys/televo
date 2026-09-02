@@ -161,3 +161,24 @@ export async function computeSafetyNumber(
 
   return (digits.match(/.{1,5}/g) ?? []).join(" ");
 }
+
+/** Encrypts raw bytes (a photo or file) with the conversation's session key.
+ * Media in Secret Chats used to be uploaded in the clear despite the lock
+ * icon, so the server could read every photo and document. */
+export function encryptBytes(
+  data: Uint8Array,
+  sessionKey: Uint8Array
+): { ciphertext: Uint8Array; nonce: string } {
+  const nonce = nacl.randomBytes(nacl.secretbox.nonceLength);
+  return { ciphertext: nacl.secretbox(data, nonce, sessionKey), nonce: encodeBase64(nonce) };
+}
+
+/** Reverses encryptBytes. Returns null if the key is wrong or the data was
+ * tampered with (secretbox is authenticated). */
+export function decryptBytes(
+  ciphertext: Uint8Array,
+  nonceB64: string,
+  sessionKey: Uint8Array
+): Uint8Array | null {
+  return nacl.secretbox.open(ciphertext, decodeBase64(nonceB64), sessionKey);
+}

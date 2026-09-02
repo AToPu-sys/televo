@@ -4,7 +4,8 @@ import { ActivityIndicator, Image, Pressable, StyleSheet, Text, View } from "rea
 
 import { useTheme } from "../hooks/useTheme";
 import type { ChatMessage } from "../hooks/useMessages";
-import { signedChatMediaUrl } from "../lib/media";
+import { fetchDecryptedMedia, parseMediaRef, signedChatMediaUrl } from "../lib/media";
+import { useE2ee } from "../hooks/useE2ee";
 import { radius, spacing } from "../theme";
 
 type ReplyPreview = { senderName: string; text: string };
@@ -69,7 +70,11 @@ export function MessageBubble({
         ) : null}
 
         {message.kind === "image" && message.media_url ? (
-          <ChatImage path={message.media_url} pending={message.pending} />
+          <ChatImage
+            path={message.media_url}
+            pending={message.pending}
+            conversationId={message.conversation_id}
+          />
         ) : null}
 
         {message.kind === "document" && message.media_url ? (
@@ -115,8 +120,17 @@ export function MessageBubble({
  * signed URL before it can render. While a message is still uploading, the
  * optimistic copy already holds a local file:// URI — use it directly.
  */
-function ChatImage({ path, pending }: { path: string; pending?: boolean }) {
+function ChatImage({
+  path,
+  pending,
+  conversationId,
+}: {
+  path: string;
+  pending?: boolean;
+  conversationId?: string;
+}) {
   const { theme } = useTheme();
+  const { decryptBytesForConversation } = useE2ee();
   const isLocal = path.startsWith("file:") || path.startsWith("content:");
   const [uri, setUri] = useState<string | null>(isLocal ? path : null);
   const [failed, setFailed] = useState(false);
@@ -128,9 +142,23 @@ function ChatImage({ path, pending }: { path: string; pending?: boolean }) {
     }
 
     let active = true;
-    signedChatMediaUrl(path)
-      .then((signed) => {
-        if (active) setUri(signed);
+
+    // A "#nonce" suffix marks media that was encrypted with the chat's
+    // session key — a signed URL alone would just render ciphertext, so it
+    // has to be downloaded and decrypted on-device first.
+    const { nonce } = parseMediaRef(path);
+
+    const load = nonce
+      ? fetchDecryptedMedia(path, (ciphertext, mediaNonce) =>
+          decryptBytesForConversation(conversationId ?? "", ciphertext, mediaNonce)
+        )
+      : signedChatMediaUrl(path);
+
+    Promise.resolve(load)
+      .then((resolved) => {
+        if (!active) return;
+        if (resolved) setUri(resolved);
+        else setFailed(true);
       })
       .catch(() => {
         if (active) setFailed(true);
@@ -139,7 +167,7 @@ function ChatImage({ path, pending }: { path: string; pending?: boolean }) {
     return () => {
       active = false;
     };
-  }, [path, isLocal]);
+  }, [path, isLocal, conversationId, decryptBytesForConversation]);
 
   if (failed) {
     return (

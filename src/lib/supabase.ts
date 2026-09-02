@@ -1,7 +1,7 @@
 import "react-native-url-polyfill/auto";
 
-import AsyncStorage from "@react-native-async-storage/async-storage";
 import { createClient } from "@supabase/supabase-js";
+import * as SecureStore from "expo-secure-store";
 import { AppState } from "react-native";
 
 import type { Database } from "../types/database";
@@ -15,9 +15,56 @@ if (!supabaseUrl || !supabasePublishableKey) {
   );
 }
 
+/**
+ * The session token lives in the OS keystore (Keychain / Android Keystore),
+ * not AsyncStorage. AsyncStorage is plaintext on disk, so anyone with
+ * filesystem or backup access to the device could lift the token and take
+ * over the account outright — the passcode lock only hid the UI, it never
+ * protected this.
+ *
+ * SecureStore caps a value at ~2KB, and a Supabase session (JWT + refresh
+ * token + user object) can exceed that, so values are split across numbered
+ * chunks and reassembled on read.
+ */
+const CHUNK_SIZE = 1536;
+
+const secureStorage = {
+  getItem: async (key: string) => {
+    const head = await SecureStore.getItemAsync(`${key}.0`);
+    if (head === null) return null;
+
+    let value = head;
+    for (let index = 1; ; index += 1) {
+      const chunk = await SecureStore.getItemAsync(`${key}.${index}`);
+      if (chunk === null) break;
+      value += chunk;
+    }
+    return value;
+  },
+  setItem: async (key: string, value: string) => {
+    // Clear any longer previous value first, or stale chunks would be
+    // appended to the new one on read.
+    await secureStorage.removeItem(key);
+    for (let index = 0; index * CHUNK_SIZE < value.length; index += 1) {
+      await SecureStore.setItemAsync(
+        `${key}.${index}`,
+        value.slice(index * CHUNK_SIZE, (index + 1) * CHUNK_SIZE)
+      );
+    }
+  },
+  removeItem: async (key: string) => {
+    for (let index = 0; ; index += 1) {
+      const chunkKey = `${key}.${index}`;
+      const chunk = await SecureStore.getItemAsync(chunkKey);
+      if (chunk === null) break;
+      await SecureStore.deleteItemAsync(chunkKey);
+    }
+  },
+};
+
 export const supabase = createClient<Database>(supabaseUrl, supabasePublishableKey, {
   auth: {
-    storage: AsyncStorage,
+    storage: secureStorage,
     autoRefreshToken: true,
     persistSession: true,
     // No URL-based session detection on native.

@@ -89,10 +89,12 @@ export default function ConversationScreen() {
   const isAssistantChat = conversation?.otherUserId === ASSISTANT_USER_ID;
 
   async function handleEnableEncryption() {
-    if (!id || !conversation || conversation.kind !== "direct" || !conversation.otherUserId) return;
+    // Groups are supported now too — the session key is wrapped to every
+    // member's public key, not just one other person's.
+    if (!id || !conversation) return;
     setEnablingEncryption(true);
     try {
-      await startEncryptedChat(id, conversation.otherUserId);
+      await startEncryptedChat(id, conversation.otherUserId ?? undefined);
       await refreshConversation();
     } catch (caught) {
       Alert.alert(
@@ -472,7 +474,7 @@ export default function ConversationScreen() {
             </Text>
           ) : null}
         </View>
-        {conversation?.kind === "direct" && !isEncrypted && !isAssistantChat ? (
+        {conversation && !isEncrypted && !isAssistantChat ? (
           <Pressable
             onPress={handleEnableEncryption}
             disabled={enablingEncryption}
