@@ -36,8 +36,15 @@ function previewFor(kind: string, body: string | null, isEncrypted: boolean): st
 }
 
 Deno.serve(async (req) => {
+  // FAIL CLOSED: a missing secret must reject, not skip the check. This
+  // function can send arbitrary push notification text to any user's
+  // devices, so an unauthenticated caller is a phishing primitive.
   const webhookSecret = Deno.env.get("WEBHOOK_SHARED_SECRET");
-  if (webhookSecret && req.headers.get("x-webhook-secret") !== webhookSecret) {
+  if (!webhookSecret) {
+    console.error("WEBHOOK_SHARED_SECRET is not configured — refusing to serve.");
+    return new Response("server not configured", { status: 500 });
+  }
+  if (req.headers.get("x-webhook-secret") !== webhookSecret) {
     return new Response("unauthorized", { status: 401 });
   }
 

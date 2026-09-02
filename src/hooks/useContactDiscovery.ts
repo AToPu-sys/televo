@@ -1,4 +1,5 @@
 import * as Contacts from "expo-contacts";
+import * as Crypto from "expo-crypto";
 import { useCallback, useState } from "react";
 
 import { supabase } from "../lib/supabase";
@@ -11,18 +12,20 @@ export type DiscoveredFriend = {
   contactName: string;
 };
 
-/** Keeps only digits, with a leading + if the original had one — good enough
- * to compare numbers that may be formatted differently on each side. */
+/**
+ * Normalizes to digits with a leading + so both sides hash the same string.
+ * Numbers stored without a country code can't be matched this way, which is
+ * the deliberate tradeoff for not shipping every user's phone number to
+ * every client (see below).
+ */
 function normalizePhone(raw: string): string {
-  const digits = raw.replace(/[^\d+]/g, "");
-  return digits.startsWith("+") ? digits : digits;
+  const digits = raw.replace(/[^\d]/g, "");
+  if (!digits) return "";
+  return `+${digits}`;
 }
 
-/** Last 9 digits, ignoring country code formatting differences, as a looser
- * fallback match for numbers stored without a leading + or country code. */
-function last9Digits(raw: string): string {
-  const digits = raw.replace(/[^\d]/g, "");
-  return digits.slice(-9);
+async function sha256Hex(value: string): Promise<string> {
+  return Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, value);
 }
 
 export function useContactDiscovery(userId: string | undefined) {
@@ -46,50 +49,49 @@ export function useContactDiscovery(userId: string | undefined) {
         fields: [Contacts.Fields.PhoneNumbers],
       });
 
-      const numberToContactName = new Map<string, string>();
+      // Hash every number in the address book, keeping a map back to the
+      // contact's name so a match can be labeled "in your contacts as X".
+      const hashToContactName = new Map<string, string>();
       for (const contact of contacts) {
         for (const phoneEntry of contact.phoneNumbers ?? []) {
           if (!phoneEntry.number) continue;
-          const exact = normalizePhone(phoneEntry.number);
-          const loose = last9Digits(phoneEntry.number);
-          if (exact) numberToContactName.set(exact, contact.name ?? "Contact");
-          if (loose) numberToContactName.set(`~${loose}`, contact.name ?? "Contact");
+          const normalized = normalizePhone(phoneEntry.number);
+          if (!normalized) continue;
+          hashToContactName.set(await sha256Hex(normalized), contact.name ?? "Contact");
         }
       }
 
-      if (numberToContactName.size === 0) {
+      if (hashToContactName.size === 0) {
         setMatches([]);
         setStatus("done");
         return;
       }
 
-      const { data: profiles, error: queryError } = await supabase
-        .from("profiles")
-        .select("id, display_name, username, avatar_url, phone")
-        .not("phone", "is", null)
-        .neq("id", userId);
+      // Only hashes leave the device, and the RPC only ever returns profiles
+      // whose number the caller ALREADY had. Previously this downloaded
+      // every registered phone number to the client, which was a full
+      // reverse-lookup dump of the user base (phone -> name -> username).
+      const { data: found, error: rpcError } = await supabase.rpc("match_contact_phones", {
+        phone_hashes: Array.from(hashToContactName.keys()),
+      });
 
-      if (queryError) throw queryError;
+      if (rpcError) throw rpcError;
 
-      const found: DiscoveredFriend[] = [];
-      for (const profile of profiles ?? []) {
-        if (!profile.phone) continue;
-        const exact = normalizePhone(profile.phone);
-        const loose = last9Digits(profile.phone);
-        const contactName =
-          numberToContactName.get(exact) ?? numberToContactName.get(`~${loose}`);
-        if (contactName) {
-          found.push({
-            id: profile.id,
-            displayName: profile.display_name,
-            username: String(profile.username),
-            avatarUrl: profile.avatar_url,
-            contactName,
-          });
-        }
-      }
-
-      setMatches(found);
+      setMatches(
+        (found ?? []).map((row: {
+          id: string;
+          username: string;
+          display_name: string;
+          avatar_url: string | null;
+          matched_hash: string;
+        }) => ({
+          id: row.id,
+          displayName: row.display_name,
+          username: String(row.username),
+          avatarUrl: row.avatar_url,
+          contactName: hashToContactName.get(row.matched_hash) ?? "Contact",
+        }))
+      );
       setStatus("done");
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Something went wrong.");

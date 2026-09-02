@@ -787,6 +787,7 @@ export type Database = {
           progress: number
         }[]
       }
+      get_my_phone: { Args: never; Returns: string }
       get_personal_records: {
         Args: {
           for_activity_type: Database["public"]["Enums"]["activity_type"]
@@ -850,6 +851,16 @@ export type Database = {
         Args: { check_username: string }
         Returns: boolean
       }
+      match_contact_phones: {
+        Args: { phone_hashes: string[] }
+        Returns: {
+          avatar_url: string
+          display_name: string
+          id: string
+          matched_hash: string
+          username: string
+        }[]
+      }
       match_segment_efforts: {
         Args: { activity_id_input: string }
         Returns: {
@@ -868,6 +879,7 @@ export type Database = {
           isSetofReturn: true
         }
       }
+      set_my_phone: { Args: { new_phone?: string }; Returns: undefined }
     }
     Enums: {
       activity_type:

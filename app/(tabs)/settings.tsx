@@ -33,23 +33,32 @@ export default function SettingsScreen() {
     if (!user?.id) return;
     let active = true;
 
-    supabase
-      .from("profiles")
-      .select("display_name, username, bio, avatar_url, phone")
-      .eq("id", user.id)
-      .single()
-      .then(({ data }) => {
-        if (active && data) {
-          setProfile({
-            display_name: data.display_name,
-            username: String(data.username),
-            bio: data.bio,
-            avatar_url: data.avatar_url,
-            phone: data.phone,
-          });
-          setPhoneDraft(data.phone ?? "");
-        }
+    // `phone` is not directly selectable — the column-level grant was
+    // removed so nobody can enumerate other users' numbers (see
+    // scripts/sql/013). Your own number comes from a scoped RPC instead.
+    (async () => {
+      const [{ data }, { data: ownPhone }] = await Promise.all([
+        supabase
+          .from("profiles")
+          .select("display_name, username, bio, avatar_url")
+          .eq("id", user.id)
+          .single(),
+        supabase.rpc("get_my_phone"),
+      ]);
+
+      if (!active || !data) return;
+
+      setProfile({
+        display_name: data.display_name,
+        username: String(data.username),
+        bio: data.bio,
+        avatar_url: data.avatar_url,
+        phone: ownPhone ?? null,
       });
+      // Only seed the draft if the user hasn't started typing — otherwise a
+      // slow profile fetch overwrites what they've already entered.
+      setPhoneDraft((current) => (current === "" ? (ownPhone ?? "") : current));
+    })();
 
     return () => {
       active = false;
@@ -68,10 +77,11 @@ export default function SettingsScreen() {
 
     setSavingPhone(true);
     try {
-      const { error } = await supabase
-        .from("profiles")
-        .update({ phone: trimmed || null })
-        .eq("id", user.id);
+      // Omitting new_phone (undefined) hits the function's `default null`,
+      // which is how the number gets cleared.
+      const { error } = await supabase.rpc("set_my_phone", {
+        new_phone: trimmed || undefined,
+      });
       if (error) throw error;
       setProfile((current) => (current ? { ...current, phone: trimmed || null } : current));
     } catch (caught) {

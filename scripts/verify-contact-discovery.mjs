@@ -2,6 +2,7 @@
 // phone-based lookup query (the same shape useContactDiscovery runs) finds
 // the right people and nobody else.
 import { createClient } from "@supabase/supabase-js";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 
 const env = Object.fromEntries(
@@ -64,24 +65,45 @@ try {
   const { error: dupErr } = await admin.from("profiles").update({ phone: "+15550001111" }).eq("id", noPhone.id);
   record("duplicate phone number rejected", !!dupErr, dupErr?.message ?? "no error!");
 
-  // Simulate Alice's device contact list containing Bob's number (as the
-  // hook would collect from expo-contacts), then run the same lookup query
-  // useContactDiscovery.scan() runs.
-  const { data: candidates, error: queryErr } = await alice.client
+  // SECURITY: the phone column must NOT be directly selectable — that was a
+  // full reverse-lookup dump of every user's number to any client.
+  const { error: directPhoneErr } = await alice.client
     .from("profiles")
-    .select("id, display_name, username, avatar_url, phone")
-    .not("phone", "is", null)
-    .neq("id", alice.id);
+    .select("id, phone")
+    .not("phone", "is", null);
+  record(
+    "phone column is NOT directly selectable (no bulk enumeration)",
+    !!directPhoneErr,
+    directPhoneErr?.message ?? "LEAK: phone column still readable!"
+  );
 
-  if (queryErr) throw queryErr;
+  // The supported path: hash the numbers already in your address book and
+  // ask the server which of them are registered.
+  const hashOf = (value) => createHash("sha256").update(value).digest("hex");
 
-  const bobFound = candidates?.some((p) => p.id === bob.id && p.phone === "+15550002222");
-  const selfExcluded = !candidates?.some((p) => p.id === alice.id);
-  const noPhoneUserExcluded = !candidates?.some((p) => p.id === noPhone.id);
+  const { data: matched, error: rpcErr } = await alice.client.rpc("match_contact_phones", {
+    phone_hashes: [hashOf("+15550002222")],
+  });
+  if (rpcErr) throw rpcErr;
 
-  record("contact-having user is discoverable by phone", !!bobFound);
-  record("caller's own profile excluded from results", selfExcluded);
-  record("user with no phone set is excluded", noPhoneUserExcluded);
+  record(
+    "a contact you already have is discoverable via the hash RPC",
+    matched?.some((row) => row.id === bob.id),
+    JSON.stringify(matched?.map((r) => r.display_name))
+  );
+  record("caller's own profile excluded from results", !matched?.some((r) => r.id === alice.id));
+  record("user with no phone set is excluded", !matched?.some((r) => r.id === noPhone.id));
+
+  // A number you DON'T have in your contacts must return nothing — otherwise
+  // the RPC would just be a slower way to enumerate the user base.
+  const { data: unknownMatch } = await alice.client.rpc("match_contact_phones", {
+    phone_hashes: [hashOf("+15559999999")],
+  });
+  record(
+    "a number you don't already have returns no match",
+    (unknownMatch ?? []).length === 0,
+    JSON.stringify(unknownMatch)
+  );
 } catch (error) {
   record("fatal", false, error.message);
 } finally {

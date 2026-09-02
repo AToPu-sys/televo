@@ -27,12 +27,15 @@ Deno.serve(async (req) => {
   // Deployed with --no-verify-jwt because the caller is a Postgres webhook,
   // not a client holding a Supabase auth session — so this endpoint is
   // reachable by anyone who knows the URL unless gated some other way.
-  // Gated here with a shared secret the webhook sends as a custom header,
-  // checked with a constant-time-ish compare (this isn't a high-value
-  // secret — worst case of a timing leak is someone learning they can post
-  // fake messages as the assistant, not account takeover).
+  // FAIL CLOSED: a missing/misconfigured secret must reject, never wave the
+  // request through. This function inserts with the service-role key and
+  // spends Anthropic credit, so an unauthenticated caller is a real problem.
   const webhookSecret = Deno.env.get("WEBHOOK_SHARED_SECRET");
-  if (webhookSecret && req.headers.get("x-webhook-secret") !== webhookSecret) {
+  if (!webhookSecret) {
+    console.error("WEBHOOK_SHARED_SECRET is not configured — refusing to serve.");
+    return new Response("server not configured", { status: 500 });
+  }
+  if (req.headers.get("x-webhook-secret") !== webhookSecret) {
     return new Response("unauthorized", { status: 401 });
   }
 
