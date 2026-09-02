@@ -152,7 +152,12 @@ export default function SettingsScreen() {
       </View>
 
       <ScrollView contentContainerStyle={styles.content}>
-        <View style={[styles.profileCard, { backgroundColor: theme.surfaceElevated }]}>
+        <Pressable
+          onPress={() => router.push("/edit-profile" as never)}
+          accessibilityRole="button"
+          accessibilityLabel="Edit profile"
+          style={[styles.profileCard, { backgroundColor: theme.surfaceElevated }]}
+        >
           <Avatar
             name={profile?.display_name ?? "You"}
             uri={profile?.avatar_url}
@@ -172,7 +177,8 @@ export default function SettingsScreen() {
               {user?.email ?? user?.phone ?? ""}
             </Text>
           </View>
-        </View>
+          <Ionicons name="chevron-forward" size={18} color={theme.textSecondary} />
+        </Pressable>
 
         {profile?.bio ? (
           <View style={[styles.section, { backgroundColor: theme.surfaceElevated }]}>

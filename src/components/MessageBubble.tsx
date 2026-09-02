@@ -18,6 +18,8 @@ type MessageBubbleProps = {
    * message.reply_to_id — avoids a query per bubble for the common case. */
   replyPreview?: ReplyPreview | null;
   forwardedFrom?: ForwardAttribution | null;
+  /** The other participant's last_read_at, for real read receipts. */
+  peerLastReadAt?: string | null;
 };
 
 export function MessageBubble({
@@ -26,6 +28,7 @@ export function MessageBubble({
   onLongPress,
   replyPreview,
   forwardedFrom,
+  peerLastReadAt,
 }: MessageBubbleProps) {
   const { theme } = useTheme();
 
@@ -100,7 +103,7 @@ export function MessageBubble({
           <Text style={[styles.time, { color: theme.textSecondary }]}>
             {formatTime(message.created_at)}
           </Text>
-          {isOwn ? <DeliveryState message={message} /> : null}
+          {isOwn ? <DeliveryState message={message} peerLastReadAt={peerLastReadAt} /> : null}
         </View>
       </Pressable>
     </View>
@@ -202,7 +205,13 @@ function DocumentAttachment({
   );
 }
 
-function DeliveryState({ message }: { message: ChatMessage }) {
+function DeliveryState({
+  message,
+  peerLastReadAt,
+}: {
+  message: ChatMessage;
+  peerLastReadAt?: string | null;
+}) {
   const { theme } = useTheme();
 
   if (message.failed) {
@@ -211,7 +220,20 @@ function DeliveryState({ message }: { message: ChatMessage }) {
   if (message.pending) {
     return <Ionicons name="time-outline" size={14} color={theme.textSecondary} />;
   }
-  return <Ionicons name="checkmark-done" size={14} color={theme.accent} />;
+
+  // A single tick means delivered; the double tick is only shown once the
+  // other person's last_read_at is actually at or past this message. It used
+  // to show "read" for everything, regardless of whether it had been.
+  const wasRead =
+    !!peerLastReadAt && new Date(peerLastReadAt).getTime() >= new Date(message.created_at).getTime();
+
+  return (
+    <Ionicons
+      name={wasRead ? "checkmark-done" : "checkmark"}
+      size={14}
+      color={wasRead ? theme.accent : theme.textSecondary}
+    />
+  );
 }
 
 function formatTime(iso: string) {

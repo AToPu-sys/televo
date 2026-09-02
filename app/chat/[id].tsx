@@ -56,6 +56,7 @@ export default function ConversationScreen() {
   const {
     messages,
     loading,
+    peerLastReadAt,
     hasMore,
     loadOlder,
     sendMessage,
@@ -196,6 +197,20 @@ export default function ConversationScreen() {
 
   function buildHeaderSheetOptions(): ActionSheetOption[] {
     const options: ActionSheetOption[] = [];
+
+    if (isEncrypted && conversation?.otherUserId) {
+      options.push({
+        key: "verify",
+        label: "Verify encryption",
+        icon: "shield-checkmark-outline",
+        onPress: () => {
+          router.push({
+            pathname: "/verify-safety-number" as never,
+            params: { peerId: conversation.otherUserId!, peerName: conversation.title },
+          });
+        },
+      });
+    }
 
     if (isEncrypted) {
       options.push({
@@ -570,6 +585,7 @@ export default function ConversationScreen() {
                   onLongPress={handleMessageLongPress}
                   replyPreview={replyPreview}
                   forwardedFrom={forwardedFrom}
+                  peerLastReadAt={peerLastReadAt}
                 />
               );
             }}

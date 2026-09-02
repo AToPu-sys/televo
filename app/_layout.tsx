@@ -79,6 +79,8 @@ function RootNavigator() {
         <Stack.Screen name="privacy-last-seen" options={{ presentation: "modal" }} />
         <Stack.Screen name="blocked-users" options={{ presentation: "modal" }} />
         <Stack.Screen name="forward-message" options={{ presentation: "modal" }} />
+        <Stack.Screen name="verify-safety-number" options={{ presentation: "modal" }} />
+        <Stack.Screen name="edit-profile" options={{ presentation: "modal" }} />
       </Stack>
       {session ? <GlobalCallOverlay /> : null}
       {/* MFA gate takes priority: at AAL1 every RLS-checked query fails

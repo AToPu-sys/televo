@@ -44,6 +44,10 @@ export function useMessages(
   // appending a duplicate when our own message echoes back.
   const optimisticIds = useRef(new Set<string>());
   const [hasMore, setHasMore] = useState(false);
+  // The other participant's last_read_at, so a sent message can show whether
+  // it was actually read. Previously every sent message showed a double
+  // checkmark unconditionally, which simply lied to the user.
+  const [peerLastReadAt, setPeerLastReadAt] = useState<string | null>(null);
   const loadingOlderRef = useRef(false);
   const { encryptForConversation, decryptForConversation } = useE2ee();
 
@@ -459,9 +463,50 @@ export function useMessages(
     return () => clearInterval(interval);
   }, [conversationId]);
 
+  // Track when the other side reads, so checkmarks reflect reality.
+  useEffect(() => {
+    if (!conversationId || !userId) return;
+
+    const readPeerState = async () => {
+      const { data } = await supabase
+        .from("conversation_participants")
+        .select("user_id, last_read_at")
+        .eq("conversation_id", conversationId)
+        .neq("user_id", userId);
+
+      const newest = (data ?? [])
+        .map((row) => row.last_read_at)
+        .filter((value): value is string => !!value)
+        .sort()
+        .pop();
+      setPeerLastReadAt(newest ?? null);
+    };
+
+    void readPeerState();
+
+    const channel = supabase
+      .channel(`read-state:${conversationId}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "UPDATE",
+          schema: "public",
+          table: "conversation_participants",
+          filter: `conversation_id=eq.${conversationId}`,
+        },
+        () => void readPeerState()
+      )
+      .subscribe();
+
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, [conversationId, userId]);
+
   return {
     messages,
     loading,
+    peerLastReadAt,
     error,
     hasMore,
     loadOlder,

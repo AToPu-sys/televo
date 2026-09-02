@@ -9,7 +9,12 @@
     "userInterfaceStyle": "automatic",
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.tgclone.app"
+      "bundleIdentifier": "com.tgclone.app",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false,
+        "NSMicrophoneUsageDescription": "Televo uses your microphone for voice and video calls.",
+        "NSCameraUsageDescription": "Televo uses your camera for video calls."
+      }
     },
     "android": {
       "package": "com.tgclone.app",

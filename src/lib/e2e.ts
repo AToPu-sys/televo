@@ -1,5 +1,6 @@
 import "react-native-get-random-values";
 
+import * as Crypto from "expo-crypto";
 import * as SecureStore from "expo-secure-store";
 import nacl from "tweetnacl";
 import naclUtil from "tweetnacl-util";
@@ -129,4 +130,34 @@ export function parseEnvelope(body: string): EncryptedEnvelope | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * A safety number for a conversation, in the style of Signal/WhatsApp.
+ *
+ * Both participants' public keys are sorted and hashed together, so both
+ * devices independently derive the SAME digits. If they match when compared
+ * out of band (read aloud, or over another channel), no one is sitting in
+ * the middle swapping keys — which is the one attack the app was otherwise
+ * completely open to, since the client trusts whatever public key the
+ * server hands it.
+ */
+export async function computeSafetyNumber(
+  publicKeyA: string,
+  publicKeyB: string
+): Promise<string> {
+  const [first, second] = [publicKeyA, publicKeyB].sort();
+  const digest = await Crypto.digestStringAsync(
+    Crypto.CryptoDigestAlgorithm.SHA256,
+    `televo-safety-number:${first}:${second}`
+  );
+
+  // 60 digits in 12 groups of 5 — same shape as Signal's safety number.
+  const digits = digest
+    .split("")
+    .map((character) => (parseInt(character, 16) % 10).toString())
+    .join("")
+    .slice(0, 60);
+
+  return (digits.match(/.{1,5}/g) ?? []).join(" ");
 }
