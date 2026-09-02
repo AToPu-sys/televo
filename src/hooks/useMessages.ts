@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { uploadChatMedia } from "../lib/media";
+import { uploadChatDocument, uploadChatMedia } from "../lib/media";
 import { supabase } from "../lib/supabase";
 import type { Database } from "../types/database";
 import { useE2ee } from "./useE2ee";
@@ -21,7 +21,8 @@ const PAGE_SIZE = 50;
 export function useMessages(
   conversationId: string | undefined,
   userId: string | undefined,
-  isEncrypted: boolean = false
+  isEncrypted: boolean = false,
+  selfDestructSeconds: number | null = null
 ) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [loading, setLoading] = useState(true);
@@ -120,6 +121,24 @@ export function useMessages(
       .on(
         "postgres_changes",
         {
+          event: "UPDATE",
+          schema: "public",
+          table: "messages",
+          filter: `conversation_id=eq.${conversationId}`,
+        },
+        (payload) => {
+          const updated = payload.new as MessageRow;
+          void (async () => {
+            const [decorated] = await decorateWithDecryption([updated]);
+            setMessages((current) =>
+              current.map((message) => (message.id === decorated.id ? decorated : message))
+            );
+          })();
+        }
+      )
+      .on(
+        "postgres_changes",
+        {
           event: "DELETE",
           schema: "public",
           table: "messages",
@@ -138,12 +157,16 @@ export function useMessages(
   }, [conversationId, isEncrypted, decorateWithDecryption]);
 
   const sendMessage = useCallback(
-    async (body: string) => {
+    async (body: string, replyToId?: string | null) => {
       const trimmed = body.trim();
       if (!trimmed || !conversationId || !userId) return;
 
       const optimisticId = `optimistic-${Date.now()}`;
       optimisticIds.current.add(optimisticId);
+
+      const expiresAt = selfDestructSeconds
+        ? new Date(Date.now() + selfDestructSeconds * 1000).toISOString()
+        : null;
 
       const optimistic: ChatMessage = {
         id: optimisticId,
@@ -155,6 +178,13 @@ export function useMessages(
         media_url: null,
         shared_activity_id: null,
         shared_profile_id: null,
+        reply_to_id: replyToId ?? null,
+        edited_at: null,
+        forwarded_from_message_id: null,
+        forwarded_from_sender_id: null,
+        expires_at: expiresAt,
+        document_name: null,
+        document_size_bytes: null,
         created_at: new Date().toISOString(),
         pending: true,
       };
@@ -170,6 +200,8 @@ export function useMessages(
           sender_id: userId,
           kind: "text",
           body: storedBody,
+          reply_to_id: replyToId ?? null,
+          expires_at: expiresAt,
         });
         if (insertError) throw insertError;
       } catch (error) {
@@ -183,8 +215,32 @@ export function useMessages(
         throw error;
       }
     },
-    [conversationId, userId, isEncrypted, encryptForConversation]
+    [conversationId, userId, isEncrypted, encryptForConversation, selfDestructSeconds]
   );
+
+  const editMessage = useCallback(async (messageId: string, newBody: string) => {
+    const trimmed = newBody.trim();
+    if (!trimmed) return;
+
+    // Optimistic edit.
+    setMessages((current) =>
+      current.map((message) =>
+        message.id === messageId
+          ? { ...message, body: trimmed, decryptedBody: trimmed, edited_at: new Date().toISOString() }
+          : message
+      )
+    );
+
+    const { error } = await supabase
+      .from("messages")
+      .update({ body: trimmed, edited_at: new Date().toISOString() })
+      .eq("id", messageId);
+    if (error) throw error;
+  }, []);
+
+  // Forwarding is handled by app/forward-message.tsx, which inserts directly
+  // into the CHOSEN destination conversation (not necessarily this one) —
+  // there's no per-conversation "forward" action that belongs on this hook.
 
   const sendImage = useCallback(
     async (localUri: string) => {
@@ -201,6 +257,13 @@ export function useMessages(
         media_url: localUri,
         shared_activity_id: null,
         shared_profile_id: null,
+        reply_to_id: null,
+        edited_at: null,
+        forwarded_from_message_id: null,
+        forwarded_from_sender_id: null,
+        expires_at: null,
+        document_name: null,
+        document_size_bytes: null,
         created_at: new Date().toISOString(),
         pending: true,
       };
@@ -213,6 +276,55 @@ export function useMessages(
           sender_id: userId,
           kind: "image",
           media_url: path,
+        });
+        if (insertError) throw insertError;
+      } catch (error) {
+        setMessages((current) =>
+          current.map((message) =>
+            message.id === optimisticId ? { ...message, pending: false, failed: true } : message
+          )
+        );
+        throw error;
+      }
+    },
+    [conversationId, userId]
+  );
+
+  const sendDocument = useCallback(
+    async (localUri: string, name: string, sizeBytes: number) => {
+      if (!conversationId || !userId) return;
+
+      const optimisticId = `optimistic-${Date.now()}`;
+      const optimistic: ChatMessage = {
+        id: optimisticId,
+        conversation_id: conversationId,
+        sender_id: userId,
+        kind: "document",
+        body: null,
+        media_url: localUri,
+        shared_activity_id: null,
+        shared_profile_id: null,
+        reply_to_id: null,
+        edited_at: null,
+        forwarded_from_message_id: null,
+        forwarded_from_sender_id: null,
+        expires_at: null,
+        document_name: name,
+        document_size_bytes: sizeBytes,
+        created_at: new Date().toISOString(),
+        pending: true,
+      };
+      setMessages((current) => [optimistic, ...current]);
+
+      try {
+        const path = await uploadChatDocument(conversationId, localUri, name);
+        const { error: insertError } = await supabase.from("messages").insert({
+          conversation_id: conversationId,
+          sender_id: userId,
+          kind: "document",
+          media_url: path,
+          document_name: name,
+          document_size_bytes: sizeBytes,
         });
         if (insertError) throw insertError;
       } catch (error) {
@@ -243,12 +355,44 @@ export function useMessages(
       .eq("user_id", userId);
   }, [conversationId, userId]);
 
+  // Self-destruct sweep: while this chat is open, periodically hide (client)
+  // and delete (server, via the "expired messages" DELETE policy — any
+  // participant, not just the sender, may delete a message once it's past
+  // its expires_at) any message whose timer has elapsed.
+  useEffect(() => {
+    if (!conversationId) return;
+
+    const sweep = () => {
+      const now = Date.now();
+      setMessages((current) => {
+        const expired = current.filter(
+          (message) => message.expires_at && new Date(message.expires_at).getTime() <= now
+        );
+        if (expired.length === 0) return current;
+
+        for (const message of expired) {
+          if (!message.pending) {
+            void supabase.from("messages").delete().eq("id", message.id);
+          }
+        }
+        const expiredIds = new Set(expired.map((message) => message.id));
+        return current.filter((message) => !expiredIds.has(message.id));
+      });
+    };
+
+    const interval = setInterval(sweep, 1000);
+    sweep();
+    return () => clearInterval(interval);
+  }, [conversationId]);
+
   return {
     messages,
     loading,
     error,
     sendMessage,
+    editMessage,
     sendImage,
+    sendDocument,
     deleteMessage,
     markRead,
     refresh: load,

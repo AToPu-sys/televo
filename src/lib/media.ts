@@ -56,6 +56,26 @@ export async function uploadChatMedia(conversationId: string, localUri: string) 
 }
 
 /**
+ * Uploads any file as a document message. Reuses the chat-media bucket (its
+ * RLS already scopes uploads by conversation) rather than a separate bucket,
+ * since the access rule is identical; the original filename is kept in the
+ * storage path so a downloaded file doesn't end up named after a UUID.
+ */
+export async function uploadChatDocument(conversationId: string, localUri: string, fileName: string) {
+  const safeName = fileName.replace(/[^a-zA-Z0-9._-]/g, "_");
+  const path = `${conversationId}/documents/${randomUUID()}-${safeName}`;
+  const bytes = await readAsArrayBuffer(localUri);
+
+  const { error } = await supabase.storage.from("chat-media").upload(path, bytes, {
+    contentType: "application/octet-stream",
+    upsert: false,
+  });
+
+  if (error) throw error;
+  return path;
+}
+
+/**
  * chat-media is a private bucket, so rendering needs a signed URL rather than a
  * public one. An hour is plenty for a message being viewed now.
  */

@@ -184,6 +184,24 @@ export type Database = {
           },
         ]
       }
+      blocked_users: {
+        Row: {
+          blocked_id: string
+          blocker_id: string
+          created_at: string
+        }
+        Insert: {
+          blocked_id: string
+          blocker_id: string
+          created_at?: string
+        }
+        Update: {
+          blocked_id?: string
+          blocker_id?: string
+          created_at?: string
+        }
+        Relationships: []
+      }
       calls: {
         Row: {
           answered_at: string | null
@@ -332,6 +350,7 @@ export type Database = {
           id: string
           is_encrypted: boolean
           kind: Database["public"]["Enums"]["conversation_kind"]
+          self_destruct_seconds: number | null
           title: string | null
           updated_at: string
         }
@@ -341,6 +360,7 @@ export type Database = {
           id?: string
           is_encrypted?: boolean
           kind: Database["public"]["Enums"]["conversation_kind"]
+          self_destruct_seconds?: number | null
           title?: string | null
           updated_at?: string
         }
@@ -350,6 +370,7 @@ export type Database = {
           id?: string
           is_encrypted?: boolean
           kind?: Database["public"]["Enums"]["conversation_kind"]
+          self_destruct_seconds?: number | null
           title?: string | null
           updated_at?: string
         }
@@ -452,9 +473,16 @@ export type Database = {
           body: string | null
           conversation_id: string
           created_at: string
+          document_name: string | null
+          document_size_bytes: number | null
+          edited_at: string | null
+          expires_at: string | null
+          forwarded_from_message_id: string | null
+          forwarded_from_sender_id: string | null
           id: string
           kind: Database["public"]["Enums"]["message_kind"]
           media_url: string | null
+          reply_to_id: string | null
           sender_id: string
           shared_activity_id: string | null
           shared_profile_id: string | null
@@ -463,9 +491,16 @@ export type Database = {
           body?: string | null
           conversation_id: string
           created_at?: string
+          document_name?: string | null
+          document_size_bytes?: number | null
+          edited_at?: string | null
+          expires_at?: string | null
+          forwarded_from_message_id?: string | null
+          forwarded_from_sender_id?: string | null
           id?: string
           kind?: Database["public"]["Enums"]["message_kind"]
           media_url?: string | null
+          reply_to_id?: string | null
           sender_id: string
           shared_activity_id?: string | null
           shared_profile_id?: string | null
@@ -474,9 +509,16 @@ export type Database = {
           body?: string | null
           conversation_id?: string
           created_at?: string
+          document_name?: string | null
+          document_size_bytes?: number | null
+          edited_at?: string | null
+          expires_at?: string | null
+          forwarded_from_message_id?: string | null
+          forwarded_from_sender_id?: string | null
           id?: string
           kind?: Database["public"]["Enums"]["message_kind"]
           media_url?: string | null
+          reply_to_id?: string | null
           sender_id?: string
           shared_activity_id?: string | null
           shared_profile_id?: string | null
@@ -487,6 +529,20 @@ export type Database = {
             columns: ["conversation_id"]
             isOneToOne: false
             referencedRelation: "conversations"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "messages_forwarded_from_message_id_fkey"
+            columns: ["forwarded_from_message_id"]
+            isOneToOne: false
+            referencedRelation: "messages"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "messages_reply_to_id_fkey"
+            columns: ["reply_to_id"]
+            isOneToOne: false
+            referencedRelation: "messages"
             referencedColumns: ["id"]
           },
           {
@@ -542,8 +598,11 @@ export type Database = {
           e2e_public_key: string | null
           id: string
           language: string
+          last_seen_at: string | null
           onboarding_completed_at: string | null
           phone: string | null
+          show_last_seen: boolean
+          show_read_receipts: boolean
           sports: string[]
           units: string
           updated_at: string
@@ -558,8 +617,11 @@ export type Database = {
           e2e_public_key?: string | null
           id: string
           language?: string
+          last_seen_at?: string | null
           onboarding_completed_at?: string | null
           phone?: string | null
+          show_last_seen?: boolean
+          show_read_receipts?: boolean
           sports?: string[]
           units?: string
           updated_at?: string
@@ -574,8 +636,11 @@ export type Database = {
           e2e_public_key?: string | null
           id?: string
           language?: string
+          last_seen_at?: string | null
           onboarding_completed_at?: string | null
           phone?: string | null
+          show_last_seen?: boolean
+          show_read_receipts?: boolean
           sports?: string[]
           units?: string
           updated_at?: string
@@ -749,6 +814,10 @@ export type Database = {
         Args: { lat1: number; lat2: number; lng1: number; lng2: number }
         Returns: number
       }
+      is_blocked_between: {
+        Args: { user_a: string; user_b: string }
+        Returns: boolean
+      }
       is_conversation_participant: {
         Args: { conversation: string; member: string }
         Returns: boolean
@@ -822,6 +891,7 @@ export type Database = {
         | "video"
         | "activity_share"
         | "contact_share"
+        | "document"
     }
     CompositeTypes: {
       [_ in never]: never
@@ -837,12 +907,12 @@ export type Tables<
   DefaultSchemaTableNameOrOptions extends
     | keyof (DefaultSchema["Tables"] & DefaultSchema["Views"])
     | { schema: keyof DatabaseWithoutInternals },
-  TableName extends DefaultSchemaTableNameOrOptions extends {
+  TableName extends (DefaultSchemaTableNameOrOptions extends {
     schema: keyof DatabaseWithoutInternals
   }
     ? keyof (DatabaseWithoutInternals[DefaultSchemaTableNameOrOptions["schema"]]["Tables"] &
         DatabaseWithoutInternals[DefaultSchemaTableNameOrOptions["schema"]]["Views"])
-    : never = never,
+    : never) = never,
 > = DefaultSchemaTableNameOrOptions extends {
   schema: keyof DatabaseWithoutInternals
 }
@@ -866,11 +936,11 @@ export type TablesInsert<
   DefaultSchemaTableNameOrOptions extends
     | keyof DefaultSchema["Tables"]
     | { schema: keyof DatabaseWithoutInternals },
-  TableName extends DefaultSchemaTableNameOrOptions extends {
+  TableName extends (DefaultSchemaTableNameOrOptions extends {
     schema: keyof DatabaseWithoutInternals
   }
     ? keyof DatabaseWithoutInternals[DefaultSchemaTableNameOrOptions["schema"]]["Tables"]
-    : never = never,
+    : never) = never,
 > = DefaultSchemaTableNameOrOptions extends {
   schema: keyof DatabaseWithoutInternals
 }
@@ -891,11 +961,11 @@ export type TablesUpdate<
   DefaultSchemaTableNameOrOptions extends
     | keyof DefaultSchema["Tables"]
     | { schema: keyof DatabaseWithoutInternals },
-  TableName extends DefaultSchemaTableNameOrOptions extends {
+  TableName extends (DefaultSchemaTableNameOrOptions extends {
     schema: keyof DatabaseWithoutInternals
   }
     ? keyof DatabaseWithoutInternals[DefaultSchemaTableNameOrOptions["schema"]]["Tables"]
-    : never = never,
+    : never) = never,
 > = DefaultSchemaTableNameOrOptions extends {
   schema: keyof DatabaseWithoutInternals
 }
@@ -916,11 +986,11 @@ export type Enums<
   DefaultSchemaEnumNameOrOptions extends
     | keyof DefaultSchema["Enums"]
     | { schema: keyof DatabaseWithoutInternals },
-  EnumName extends DefaultSchemaEnumNameOrOptions extends {
+  EnumName extends (DefaultSchemaEnumNameOrOptions extends {
     schema: keyof DatabaseWithoutInternals
   }
     ? keyof DatabaseWithoutInternals[DefaultSchemaEnumNameOrOptions["schema"]]["Enums"]
-    : never = never,
+    : never) = never,
 > = DefaultSchemaEnumNameOrOptions extends {
   schema: keyof DatabaseWithoutInternals
 }
@@ -933,11 +1003,11 @@ export type CompositeTypes<
   PublicCompositeTypeNameOrOptions extends
     | keyof DefaultSchema["CompositeTypes"]
     | { schema: keyof DatabaseWithoutInternals },
-  CompositeTypeName extends PublicCompositeTypeNameOrOptions extends {
+  CompositeTypeName extends (PublicCompositeTypeNameOrOptions extends {
     schema: keyof DatabaseWithoutInternals
   }
     ? keyof DatabaseWithoutInternals[PublicCompositeTypeNameOrOptions["schema"]]["CompositeTypes"]
-    : never = never,
+    : never) = never,
 > = PublicCompositeTypeNameOrOptions extends {
   schema: keyof DatabaseWithoutInternals
 }
@@ -995,6 +1065,7 @@ export const Constants = {
         "video",
         "activity_share",
         "contact_share",
+        "document",
       ],
     },
   },

@@ -170,6 +170,19 @@ export default function SettingsScreen() {
           <Ionicons name="chevron-forward" size={18} color={theme.textSecondary} />
         </Pressable>
 
+        <Pressable
+          onPress={() => router.push("/privacy-security")}
+          accessibilityRole="button"
+          accessibilityLabel="Privacy and Security"
+          style={[styles.section, styles.settingRow, { backgroundColor: theme.surfaceElevated }]}
+        >
+          <View style={styles.settingLabel}>
+            <Ionicons name="lock-closed-outline" size={20} color={theme.accent} />
+            <Text style={[styles.settingText, { color: theme.text }]}>Privacy & Security</Text>
+          </View>
+          <Ionicons name="chevron-forward" size={18} color={theme.textSecondary} />
+        </Pressable>
+
         <View style={[styles.section, { backgroundColor: theme.surfaceElevated }]}>
           <View style={styles.settingRow}>
             <View style={styles.settingLabel}>

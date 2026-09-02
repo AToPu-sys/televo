@@ -1,4 +1,5 @@
 import { Ionicons } from "@expo/vector-icons";
+import * as DocumentPicker from "expo-document-picker";
 import * as ImagePicker from "expo-image-picker";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { useEffect, useState } from "react";
@@ -19,13 +20,25 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { Avatar } from "../../src/components/Avatar";
 import { MessageBubble } from "../../src/components/MessageBubble";
 import { useAuth } from "../../src/hooks/useAuth";
+import { blockUser, isUserBlocked } from "../../src/hooks/useBlockedUsers";
 import { useCallManager } from "../../src/hooks/useCallManager";
 import { useConversation } from "../../src/hooks/useConversation";
 import { useE2ee } from "../../src/hooks/useE2ee";
 import { useMessages, type ChatMessage } from "../../src/hooks/useMessages";
+import { useParticipantNames } from "../../src/hooks/useParticipantNames";
+import { supabase } from "../../src/lib/supabase";
 import { useTheme } from "../../src/hooks/useTheme";
 import { useTyping } from "../../src/hooks/useTyping";
 import { radius, spacing } from "../../src/theme";
+
+const SELF_DESTRUCT_OPTIONS: { label: string; seconds: number | null }[] = [
+  { label: "Off", seconds: null },
+  { label: "30 seconds", seconds: 30 },
+  { label: "1 minute", seconds: 60 },
+  { label: "1 hour", seconds: 3600 },
+  { label: "1 day", seconds: 86400 },
+  { label: "1 week", seconds: 604800 },
+];
 
 export default function ConversationScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
@@ -36,11 +49,9 @@ export default function ConversationScreen() {
   const { conversation, loading: loadingConversation, refresh: refreshConversation } =
     useConversation(id, user?.id);
   const isEncrypted = conversation?.isEncrypted ?? false;
-  const { messages, loading, sendMessage, sendImage, deleteMessage, markRead } = useMessages(
-    id,
-    user?.id,
-    isEncrypted
-  );
+  const { messages, loading, sendMessage, editMessage, sendImage, sendDocument, deleteMessage, markRead } =
+    useMessages(id, user?.id, isEncrypted, conversation?.selfDestructSeconds ?? null);
+  const participantNames = useParticipantNames(id, user?.id);
   const { typingLabel, notifyTyping } = useTyping(
     id,
     user?.id,
@@ -52,6 +63,9 @@ export default function ConversationScreen() {
   const [sending, setSending] = useState(false);
   const [attaching, setAttaching] = useState(false);
   const [enablingEncryption, setEnablingEncryption] = useState(false);
+  const [replyTarget, setReplyTarget] = useState<ChatMessage | null>(null);
+  const [isBlocked, setIsBlocked] = useState(false);
+  const [editTarget, setEditTarget] = useState<ChatMessage | null>(null);
 
   async function handleEnableEncryption() {
     if (!id || !conversation || conversation.kind !== "direct" || !conversation.otherUserId) return;
@@ -81,13 +95,110 @@ export default function ConversationScreen() {
     }
   }, [loading, markRead, messages.length]);
 
+  useEffect(() => {
+    if (!user?.id || conversation?.kind !== "direct" || !conversation.otherUserId) return;
+    isUserBlocked(user.id, conversation.otherUserId).then(setIsBlocked);
+  }, [user?.id, conversation?.kind, conversation?.otherUserId]);
+
+  function handleBlockToggle() {
+    if (!user?.id || !conversation?.otherUserId) return;
+    const name = conversation.title;
+
+    if (isBlocked) {
+      Alert.alert(`Unblock ${name}?`, undefined, [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Unblock",
+          onPress: async () => {
+            await supabase
+              .from("blocked_users")
+              .delete()
+              .eq("blocker_id", user.id)
+              .eq("blocked_id", conversation.otherUserId!);
+            setIsBlocked(false);
+          },
+        },
+      ]);
+    } else {
+      Alert.alert(
+        `Block ${name}?`,
+        "They won't be able to send you messages or call you.",
+        [
+          { text: "Cancel", style: "cancel" },
+          {
+            text: "Block",
+            style: "destructive",
+            onPress: async () => {
+              try {
+                await blockUser(user.id, conversation.otherUserId!);
+                setIsBlocked(true);
+              } catch (caught) {
+                Alert.alert(
+                  "Couldn't block",
+                  caught instanceof Error ? caught.message : "Please try again."
+                );
+              }
+            },
+          },
+        ]
+      );
+    }
+  }
+
+  function handleOpenSelfDestructMenu() {
+    if (!id) return;
+
+    const options: { text: string; style?: "cancel"; onPress?: () => void }[] =
+      SELF_DESTRUCT_OPTIONS.map((option) => ({
+        text: option.label,
+        onPress: () => {
+          void supabase
+            .from("conversations")
+            .update({ self_destruct_seconds: option.seconds })
+            .eq("id", id)
+            .then(() => refreshConversation());
+        },
+      }));
+    options.push({ text: "Cancel", style: "cancel" });
+
+    Alert.alert(
+      "Self-Destruct Timer",
+      "Messages you send will disappear for both people after this long.",
+      options
+    );
+  }
+
+  function handleHeaderMenu() {
+    const options: { text: string; style?: "destructive" | "cancel"; onPress?: () => void }[] = [];
+
+    if (isEncrypted) {
+      options.push({ text: "Self-Destruct Timer", onPress: handleOpenSelfDestructMenu });
+    }
+    if (conversation?.kind === "direct") {
+      options.push({
+        text: isBlocked ? "Unblock" : "Block",
+        style: isBlocked ? undefined : "destructive",
+        onPress: handleBlockToggle,
+      });
+    }
+    options.push({ text: "Cancel", style: "cancel" });
+
+    Alert.alert(conversation?.title ?? "Chat", undefined, options);
+  }
+
   async function handleSend() {
     const body = draft.trim();
     if (!body || sending) return;
     setDraft("");
     setSending(true);
     try {
-      await sendMessage(body);
+      if (editTarget) {
+        await editMessage(editTarget.id, body);
+        setEditTarget(null);
+      } else {
+        await sendMessage(body, replyTarget?.id ?? null);
+        setReplyTarget(null);
+      }
     } catch {
       // useMessages marks the bubble as failed; restore the text so the user
       // can retry without retyping.
@@ -125,14 +236,65 @@ export default function ConversationScreen() {
     }
   }
 
+  async function handleAttachDocument() {
+    if (attaching) return;
+
+    const picked = await DocumentPicker.getDocumentAsync({ type: "*/*", copyToCacheDirectory: true });
+    if (picked.canceled || !picked.assets?.[0]) return;
+
+    const asset = picked.assets[0];
+    setAttaching(true);
+    try {
+      await sendDocument(asset.uri, asset.name, asset.size ?? 0);
+    } catch (caught) {
+      Alert.alert("Upload failed", caught instanceof Error ? caught.message : "Please try again.");
+    } finally {
+      setAttaching(false);
+    }
+  }
+
   function handleMessageLongPress(message: ChatMessage) {
+    const isOwn = message.sender_id === user?.id;
+    const canEdit = isOwn && message.kind === "text";
+
+    const options: { text: string; style?: "destructive" | "cancel"; onPress?: () => void }[] = [
+      {
+        text: "Reply",
+        onPress: () => {
+          setEditTarget(null);
+          setReplyTarget(message);
+        },
+      },
+      {
+        text: "Forward",
+        onPress: () => {
+          // Cast: Expo Router's typed-routes generation doesn't pick up
+          // this route (see forward-message.tsx) — file exists, exports
+          // correctly, and bundles/navigates fine at runtime; only the
+          // static type inference misses it.
+          router.push({
+            pathname: "/forward-message" as never,
+            params: { messageId: message.id },
+          });
+        },
+      },
+    ];
+
+    if (canEdit) {
+      options.push({
+        text: "Edit",
+        onPress: () => {
+          setReplyTarget(null);
+          setEditTarget(message);
+          setDraft(message.decryptedBody ?? message.body ?? "");
+        },
+      });
+    }
+
     // Deleting is only offered for your own messages — the RLS policy allows
     // exactly that, so showing it for others' would just produce an error.
-    if (message.sender_id !== user?.id) return;
-
-    Alert.alert("Delete message", "This removes it for everyone in the chat.", [
-      { text: "Cancel", style: "cancel" },
-      {
+    if (isOwn) {
+      options.push({
         text: "Delete",
         style: "destructive",
         onPress: () => {
@@ -143,8 +305,12 @@ export default function ConversationScreen() {
             );
           });
         },
-      },
-    ]);
+      });
+    }
+
+    options.push({ text: "Cancel", style: "cancel" });
+
+    Alert.alert("Message", undefined, options);
   }
 
   const title = conversation?.title ?? "Chat";
@@ -219,6 +385,15 @@ export default function ConversationScreen() {
         >
           <Ionicons name="videocam-outline" size={25} color={theme.accent} />
         </Pressable>
+        <Pressable
+          onPress={handleHeaderMenu}
+          accessibilityRole="button"
+          accessibilityLabel="Chat options"
+          hitSlop={10}
+          style={styles.headerAction}
+        >
+          <Ionicons name="ellipsis-vertical" size={20} color={theme.accent} />
+        </Pressable>
       </View>
 
       <KeyboardAvoidingView
@@ -245,15 +420,71 @@ export default function ConversationScreen() {
                 </Text>
               </View>
             }
-            renderItem={({ item }) => (
-              <MessageBubble
-                message={item}
-                isOwn={item.sender_id === user?.id}
-                onLongPress={handleMessageLongPress}
-              />
-            )}
+            renderItem={({ item }) => {
+              const repliedTo = item.reply_to_id
+                ? messages.find((candidate) => candidate.id === item.reply_to_id)
+                : null;
+              const replyPreview = repliedTo
+                ? {
+                    senderName: participantNames[repliedTo.sender_id] ?? "Someone",
+                    text:
+                      repliedTo.decryptedBody ??
+                      repliedTo.body ??
+                      (repliedTo.kind === "image"
+                        ? "Photo"
+                        : repliedTo.kind === "document"
+                          ? (repliedTo.document_name ?? "Document")
+                          : "Message"),
+                  }
+                : null;
+
+              const forwardedFrom = item.forwarded_from_sender_id
+                ? { senderName: participantNames[item.forwarded_from_sender_id] ?? "Someone" }
+                : null;
+
+              return (
+                <MessageBubble
+                  message={item}
+                  isOwn={item.sender_id === user?.id}
+                  onLongPress={handleMessageLongPress}
+                  replyPreview={replyPreview}
+                  forwardedFrom={forwardedFrom}
+                />
+              );
+            }}
           />
         )}
+
+        {replyTarget || editTarget ? (
+          <View style={[styles.replyBar, { backgroundColor: theme.surfaceElevated, borderTopColor: theme.border }]}>
+            <View style={[styles.replyAccent, { backgroundColor: theme.accent }]} />
+            <View style={styles.replyTextBlock}>
+              <Text style={[styles.replyLabel, { color: theme.accent }]}>
+                {editTarget ? "Editing message" : "Reply"}
+              </Text>
+              <Text style={[styles.replyPreview, { color: theme.textSecondary }]} numberOfLines={1}>
+                {(editTarget ?? replyTarget)?.decryptedBody ??
+                  (editTarget ?? replyTarget)?.body ??
+                  (((editTarget ?? replyTarget)?.kind === "image" && "Photo") ||
+                    ((editTarget ?? replyTarget)?.kind === "document" &&
+                      (editTarget ?? replyTarget)?.document_name) ||
+                    "Message")}
+              </Text>
+            </View>
+            <Pressable
+              onPress={() => {
+                setReplyTarget(null);
+                setEditTarget(null);
+                if (editTarget) setDraft("");
+              }}
+              accessibilityRole="button"
+              accessibilityLabel="Cancel"
+              hitSlop={10}
+            >
+              <Ionicons name="close" size={20} color={theme.textSecondary} />
+            </Pressable>
+          </View>
+        ) : null}
 
         <View
           style={[
@@ -262,10 +493,16 @@ export default function ConversationScreen() {
           ]}
         >
           <Pressable
-            onPress={handleAttachImage}
+            onPress={() =>
+              Alert.alert("Attach", undefined, [
+                { text: "Photo", onPress: () => void handleAttachImage() },
+                { text: "Document", onPress: () => void handleAttachDocument() },
+                { text: "Cancel", style: "cancel" },
+              ])
+            }
             disabled={attaching}
             accessibilityRole="button"
-            accessibilityLabel="Attach a photo"
+            accessibilityLabel="Attach"
             accessibilityState={{ disabled: attaching }}
             hitSlop={8}
             style={styles.attach}
@@ -273,7 +510,7 @@ export default function ConversationScreen() {
             {attaching ? (
               <ActivityIndicator color={theme.accent} />
             ) : (
-              <Ionicons name="image-outline" size={24} color={theme.accent} />
+              <Ionicons name="add-circle-outline" size={26} color={theme.accent} />
             )}
           </Pressable>
           <TextInput
@@ -364,4 +601,16 @@ const styles = StyleSheet.create({
   },
   attach: { width: 40, height: 40, alignItems: "center", justifyContent: "center" },
   headerAction: { marginLeft: spacing.md },
+  replyBar: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+    borderTopWidth: StyleSheet.hairlineWidth,
+  },
+  replyAccent: { width: 3, alignSelf: "stretch", borderRadius: 2 },
+  replyTextBlock: { flex: 1 },
+  replyLabel: { fontSize: 13, fontWeight: "600" },
+  replyPreview: { fontSize: 13 },
 });

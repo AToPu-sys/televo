@@ -10,6 +10,7 @@ export type ConversationHeader = {
   avatarUrl: string | null;
   otherUserId: string | null;
   isEncrypted: boolean;
+  selfDestructSeconds: number | null;
 };
 
 /** Loads the header details for one conversation (title, avatar, member count). */
@@ -34,6 +35,7 @@ export function useConversation(conversationId: string | undefined, userId: stri
         kind,
         title,
         is_encrypted,
+        self_destruct_seconds,
         conversation_participants ( user_id )
       `
       )
@@ -56,6 +58,7 @@ export function useConversation(conversationId: string | undefined, userId: stri
         avatarUrl: null,
         otherUserId: null,
         isEncrypted: false,
+        selfDestructSeconds: null,
       });
       setLoading(false);
       return;
@@ -72,6 +75,7 @@ export function useConversation(conversationId: string | undefined, userId: stri
         avatarUrl: null,
         otherUserId: null,
         isEncrypted: data.is_encrypted,
+        selfDestructSeconds: data.self_destruct_seconds,
       });
       setLoading(false);
       return;
@@ -91,6 +95,7 @@ export function useConversation(conversationId: string | undefined, userId: stri
       avatarUrl: profile?.avatar_url ?? null,
       otherUserId: other.user_id,
       isEncrypted: data.is_encrypted,
+      selfDestructSeconds: data.self_destruct_seconds,
     });
     setLoading(false);
   }, [conversationId, userId]);
