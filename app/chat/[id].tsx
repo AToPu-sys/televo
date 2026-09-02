@@ -17,6 +17,7 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
+import { ActionSheet, type ActionSheetOption } from "../../src/components/ActionSheet";
 import { Avatar } from "../../src/components/Avatar";
 import { MessageBubble } from "../../src/components/MessageBubble";
 import { useAuth } from "../../src/hooks/useAuth";
@@ -70,6 +71,10 @@ export default function ConversationScreen() {
   const [replyTarget, setReplyTarget] = useState<ChatMessage | null>(null);
   const [isBlocked, setIsBlocked] = useState(false);
   const [editTarget, setEditTarget] = useState<ChatMessage | null>(null);
+  const [messageSheetTarget, setMessageSheetTarget] = useState<ChatMessage | null>(null);
+  const [attachSheetOpen, setAttachSheetOpen] = useState(false);
+  const [headerSheetOpen, setHeaderSheetOpen] = useState(false);
+  const [selfDestructSheetOpen, setSelfDestructSheetOpen] = useState(false);
   const isAssistantChat = conversation?.otherUserId === ASSISTANT_USER_ID;
 
   async function handleEnableEncryption() {
@@ -151,44 +156,50 @@ export default function ConversationScreen() {
   }
 
   function handleOpenSelfDestructMenu() {
-    if (!id) return;
+    setSelfDestructSheetOpen(true);
+  }
 
-    const options: { text: string; style?: "cancel"; onPress?: () => void }[] =
-      SELF_DESTRUCT_OPTIONS.map((option) => ({
-        text: option.label,
-        onPress: () => {
-          void supabase
-            .from("conversations")
-            .update({ self_destruct_seconds: option.seconds })
-            .eq("id", id)
-            .then(() => refreshConversation());
-        },
-      }));
-    options.push({ text: "Cancel", style: "cancel" });
-
-    Alert.alert(
-      "Self-Destruct Timer",
-      "Messages you send will disappear for both people after this long.",
-      options
-    );
+  function buildSelfDestructOptions(): ActionSheetOption[] {
+    if (!id) return [];
+    return SELF_DESTRUCT_OPTIONS.map((option) => ({
+      key: option.label,
+      label: option.label,
+      icon: option.seconds === null ? "close-circle-outline" : "timer-outline",
+      onPress: () => {
+        void supabase
+          .from("conversations")
+          .update({ self_destruct_seconds: option.seconds })
+          .eq("id", id)
+          .then(() => refreshConversation());
+      },
+    }));
   }
 
   function handleHeaderMenu() {
-    const options: { text: string; style?: "destructive" | "cancel"; onPress?: () => void }[] = [];
+    setHeaderSheetOpen(true);
+  }
+
+  function buildHeaderSheetOptions(): ActionSheetOption[] {
+    const options: ActionSheetOption[] = [];
 
     if (isEncrypted) {
-      options.push({ text: "Self-Destruct Timer", onPress: handleOpenSelfDestructMenu });
+      options.push({
+        key: "self-destruct",
+        label: "Self-Destruct Timer",
+        icon: "timer-outline",
+        onPress: handleOpenSelfDestructMenu,
+      });
     }
     if (conversation?.kind === "direct") {
       options.push({
-        text: isBlocked ? "Unblock" : "Block",
-        style: isBlocked ? undefined : "destructive",
+        key: "block",
+        label: isBlocked ? "Unblock" : "Block",
+        icon: isBlocked ? "checkmark-circle-outline" : "ban-outline",
+        destructive: !isBlocked,
         onPress: handleBlockToggle,
       });
     }
-    options.push({ text: "Cancel", style: "cancel" });
-
-    Alert.alert(conversation?.title ?? "Chat", undefined, options);
+    return options;
   }
 
   async function handleSend() {
@@ -259,19 +270,27 @@ export default function ConversationScreen() {
   }
 
   function handleMessageLongPress(message: ChatMessage) {
+    setMessageSheetTarget(message);
+  }
+
+  function buildMessageSheetOptions(message: ChatMessage): ActionSheetOption[] {
     const isOwn = message.sender_id === user?.id;
     const canEdit = isOwn && message.kind === "text";
 
-    const options: { text: string; style?: "destructive" | "cancel"; onPress?: () => void }[] = [
+    const options: ActionSheetOption[] = [
       {
-        text: "Reply",
+        key: "reply",
+        label: "Reply",
+        icon: "arrow-undo-outline",
         onPress: () => {
           setEditTarget(null);
           setReplyTarget(message);
         },
       },
       {
-        text: "Forward",
+        key: "forward",
+        label: "Forward",
+        icon: "arrow-redo-outline",
         onPress: () => {
           // Cast: Expo Router's typed-routes generation doesn't pick up
           // this route (see forward-message.tsx) — file exists, exports
@@ -287,7 +306,9 @@ export default function ConversationScreen() {
 
     if (canEdit) {
       options.push({
-        text: "Edit",
+        key: "edit",
+        label: "Edit",
+        icon: "pencil-outline",
         onPress: () => {
           setReplyTarget(null);
           setEditTarget(message);
@@ -300,8 +321,10 @@ export default function ConversationScreen() {
     // exactly that, so showing it for others' would just produce an error.
     if (isOwn) {
       options.push({
-        text: "Delete",
-        style: "destructive",
+        key: "delete",
+        label: "Delete",
+        icon: "trash-outline",
+        destructive: true,
         onPress: () => {
           deleteMessage(message.id).catch((caught: unknown) => {
             Alert.alert(
@@ -313,9 +336,7 @@ export default function ConversationScreen() {
       });
     }
 
-    options.push({ text: "Cancel", style: "cancel" });
-
-    Alert.alert("Message", undefined, options);
+    return options;
   }
 
   const title = conversation?.title ?? "Chat";
@@ -514,13 +535,7 @@ export default function ConversationScreen() {
           ]}
         >
           <Pressable
-            onPress={() =>
-              Alert.alert("Attach", undefined, [
-                { text: "Photo", onPress: () => void handleAttachImage() },
-                { text: "Document", onPress: () => void handleAttachDocument() },
-                { text: "Cancel", style: "cancel" },
-              ])
-            }
+            onPress={() => setAttachSheetOpen(true)}
             disabled={attaching}
             accessibilityRole="button"
             accessibilityLabel="Attach"
@@ -571,6 +586,40 @@ export default function ConversationScreen() {
           </Pressable>
         </View>
       </KeyboardAvoidingView>
+
+      <ActionSheet
+        visible={!!messageSheetTarget}
+        onClose={() => setMessageSheetTarget(null)}
+        options={messageSheetTarget ? buildMessageSheetOptions(messageSheetTarget) : []}
+      />
+
+      <ActionSheet
+        visible={attachSheetOpen}
+        onClose={() => setAttachSheetOpen(false)}
+        options={[
+          { key: "photo", label: "Photo", icon: "image-outline", onPress: () => void handleAttachImage() },
+          {
+            key: "document",
+            label: "Document",
+            icon: "document-text-outline",
+            onPress: () => void handleAttachDocument(),
+          },
+        ]}
+      />
+
+      <ActionSheet
+        visible={headerSheetOpen}
+        onClose={() => setHeaderSheetOpen(false)}
+        title={conversation?.title}
+        options={buildHeaderSheetOptions()}
+      />
+
+      <ActionSheet
+        visible={selfDestructSheetOpen}
+        onClose={() => setSelfDestructSheetOpen(false)}
+        title="Messages you send will disappear for both people after this long"
+        options={buildSelfDestructOptions()}
+      />
     </SafeAreaView>
   );
 }

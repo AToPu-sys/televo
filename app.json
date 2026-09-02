@@ -39,6 +39,13 @@
         {
           "contactsPermission": "Allow $(PRODUCT_NAME) to access your contacts to find friends who are already here."
         }
+      ],
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/icon.png",
+          "color": "#3390EC"
+        }
       ]
     ],
     "experiments": {

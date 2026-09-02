@@ -50,6 +50,9 @@ no native modules.
   matching against your device contacts.
 - **Settings** — profile card, phone number, dark mode, Privacy & Security.
 - **Theming** — light and dark palettes throughout, persisted between launches.
+- **Push notifications** — full server-side pipeline (see "Push
+  notifications" below). Works today on iOS in Expo Go; Android needs one
+  custom dev build, an Expo platform restriction, not a gap in this code.
 
 ## Running the app
 
@@ -142,6 +145,40 @@ on Telegram's own Secret Chats:
   local-only 4-digit PIN (SHA-256 hashed in `expo-secure-store`, never sent
   anywhere) that re-locks the app after ~30s backgrounded, with optional
   biometric unlock via `expo-local-authentication`.
+
+## Push notifications
+
+Uses Expo's push service (`expo-notifications`, `getExpoPushTokenAsync`) —
+not a raw FCM/APNs integration, so no Firebase/Apple developer console setup
+is needed for it to work.
+
+1. On sign-in, the device requests notification permission and registers an
+   Expo push token in `push_tokens` (`src/hooks/usePushNotifications.ts`).
+   RLS scopes each row to its owner — nobody can read or register a token for
+   someone else (`scripts/sql/011_push_tokens.sql`).
+2. `notify_new_message_push()` (a trigger on `messages` INSERT, same async
+   `pg_net` webhook pattern as the AI assistant) fires the
+   `send-push-notification` Edge Function whenever a message lands.
+3. The function resolves every other participant's push tokens and POSTs to
+   Expo's push API (`https://exp.host/--/api/v2/push/send`) — no API key
+   required by default. **Secret Chat message bodies are never sent as
+   notification text** — an encrypted conversation's push always reads
+   "sent a message" instead, since the notification pipeline runs
+   server-side and must not become a way to exfiltrate what E2E encryption
+   is specifically protecting.
+
+**Platform limitation, not a bug in this code:** remote push notifications
+are unavailable in Expo Go on Android from SDK 53 onward — Expo's own
+restriction. This means:
+- **iOS in Expo Go**: works as-is, no extra steps.
+- **Android**: needs one custom dev build (`eas build --profile development`
+  or `npx expo run:android`) instead of Expo Go. Everything else in the app
+  keeps working the same either way — this is the one feature gated by that
+  choice.
+
+`scripts/verify-push-notifications.mjs` verifies token RLS and that the
+webhook successfully reaches Expo's push API (confirmed via
+`net._http_response`, since actual delivery needs a real device's push token).
 
 ## AI Assistant
 

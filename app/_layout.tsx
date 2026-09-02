@@ -1,9 +1,23 @@
+import * as Notifications from "expo-notifications";
 import { Stack, useRouter, useSegments } from "expo-router";
 import { StatusBar } from "expo-status-bar";
 import { useEffect, type ReactNode } from "react";
 import { ActivityIndicator, View } from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { SafeAreaProvider } from "react-native-safe-area-context";
+
+// Show an alert + play a sound even while the app is in the foreground —
+// the default is to suppress notifications while the app is open, which
+// would make it look like messages just aren't arriving.
+Notifications.setNotificationHandler({
+  handleNotification: async () => ({
+    shouldShowAlert: true,
+    shouldPlaySound: true,
+    shouldSetBadge: true,
+    shouldShowBanner: true,
+    shouldShowList: true,
+  }),
+});
 
 import MfaChallengeScreen from "./mfa-challenge";
 import { CallOverlay } from "../src/components/CallOverlay";
@@ -13,6 +27,7 @@ import { AuthProvider, useAuth } from "../src/hooks/useAuth";
 import { CallManagerProvider, useCallManager } from "../src/hooks/useCallManager";
 import { E2eeProvider } from "../src/hooks/useE2ee";
 import { usePresenceHeartbeat } from "../src/hooks/usePresence";
+import { usePushNotifications } from "../src/hooks/usePushNotifications";
 import { ThemeProvider, useTheme } from "../src/hooks/useTheme";
 
 function RootNavigator() {
@@ -125,6 +140,7 @@ function GlobalCallOverlay() {
 function AuthedProviders({ children }: { children: ReactNode }) {
   const { user } = useAuth();
   usePresenceHeartbeat(user?.id);
+  usePushNotifications(user?.id);
   return (
     <E2eeProvider userId={user?.id}>
       <CallManagerProvider>{children}</CallManagerProvider>
