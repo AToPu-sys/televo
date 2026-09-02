@@ -24,12 +24,15 @@ import { blockUser, isUserBlocked } from "../../src/hooks/useBlockedUsers";
 import { useCallManager } from "../../src/hooks/useCallManager";
 import { useConversation } from "../../src/hooks/useConversation";
 import { useE2ee } from "../../src/hooks/useE2ee";
+import { useLastSeen } from "../../src/hooks/useLastSeen";
 import { useMessages, type ChatMessage } from "../../src/hooks/useMessages";
 import { useParticipantNames } from "../../src/hooks/useParticipantNames";
 import { supabase } from "../../src/lib/supabase";
 import { useTheme } from "../../src/hooks/useTheme";
 import { useTyping } from "../../src/hooks/useTyping";
 import { radius, spacing } from "../../src/theme";
+
+const ASSISTANT_USER_ID = "00000000-0000-0000-0000-000000000001";
 
 const SELF_DESTRUCT_OPTIONS: { label: string; seconds: number | null }[] = [
   { label: "Off", seconds: null },
@@ -52,6 +55,7 @@ export default function ConversationScreen() {
   const { messages, loading, sendMessage, editMessage, sendImage, sendDocument, deleteMessage, markRead } =
     useMessages(id, user?.id, isEncrypted, conversation?.selfDestructSeconds ?? null);
   const participantNames = useParticipantNames(id, user?.id);
+  const { label: presenceLabel } = useLastSeen(user?.id, conversation?.otherUserId);
   const { typingLabel, notifyTyping } = useTyping(
     id,
     user?.id,
@@ -66,6 +70,7 @@ export default function ConversationScreen() {
   const [replyTarget, setReplyTarget] = useState<ChatMessage | null>(null);
   const [isBlocked, setIsBlocked] = useState(false);
   const [editTarget, setEditTarget] = useState<ChatMessage | null>(null);
+  const isAssistantChat = conversation?.otherUserId === ASSISTANT_USER_ID;
 
   async function handleEnableEncryption() {
     if (!id || !conversation || conversation.kind !== "direct" || !conversation.otherUserId) return;
@@ -345,13 +350,23 @@ export default function ConversationScreen() {
             <Text style={[styles.headerSubtitle, { color: theme.accent }]} numberOfLines={1}>
               {typingLabel}
             </Text>
+          ) : presenceLabel ? (
+            <Text
+              style={[
+                styles.headerSubtitle,
+                { color: presenceLabel === "online" ? theme.online : theme.textSecondary },
+              ]}
+              numberOfLines={1}
+            >
+              {presenceLabel}
+            </Text>
           ) : conversation?.subtitle ? (
             <Text style={[styles.headerSubtitle, { color: theme.textSecondary }]} numberOfLines={1}>
               {conversation.subtitle}
             </Text>
           ) : null}
         </View>
-        {conversation?.kind === "direct" && !isEncrypted ? (
+        {conversation?.kind === "direct" && !isEncrypted && !isAssistantChat ? (
           <Pressable
             onPress={handleEnableEncryption}
             disabled={enablingEncryption}
@@ -367,33 +382,39 @@ export default function ConversationScreen() {
             )}
           </Pressable>
         ) : null}
-        <Pressable
-          onPress={() => handleCall("audio")}
-          accessibilityRole="button"
-          accessibilityLabel="Voice call"
-          hitSlop={10}
-          style={styles.headerAction}
-        >
-          <Ionicons name="call-outline" size={23} color={theme.accent} />
-        </Pressable>
-        <Pressable
-          onPress={() => handleCall("video")}
-          accessibilityRole="button"
-          accessibilityLabel="Video call"
-          hitSlop={10}
-          style={styles.headerAction}
-        >
-          <Ionicons name="videocam-outline" size={25} color={theme.accent} />
-        </Pressable>
-        <Pressable
-          onPress={handleHeaderMenu}
-          accessibilityRole="button"
-          accessibilityLabel="Chat options"
-          hitSlop={10}
-          style={styles.headerAction}
-        >
-          <Ionicons name="ellipsis-vertical" size={20} color={theme.accent} />
-        </Pressable>
+        {/* A bot has no voice/video, nothing to block, and no self-destruct
+            menu worth showing — only calling/block/encryption are hidden. */}
+        {!isAssistantChat ? (
+          <>
+            <Pressable
+              onPress={() => handleCall("audio")}
+              accessibilityRole="button"
+              accessibilityLabel="Voice call"
+              hitSlop={10}
+              style={styles.headerAction}
+            >
+              <Ionicons name="call-outline" size={23} color={theme.accent} />
+            </Pressable>
+            <Pressable
+              onPress={() => handleCall("video")}
+              accessibilityRole="button"
+              accessibilityLabel="Video call"
+              hitSlop={10}
+              style={styles.headerAction}
+            >
+              <Ionicons name="videocam-outline" size={25} color={theme.accent} />
+            </Pressable>
+            <Pressable
+              onPress={handleHeaderMenu}
+              accessibilityRole="button"
+              accessibilityLabel="Chat options"
+              hitSlop={10}
+              style={styles.headerAction}
+            >
+              <Ionicons name="ellipsis-vertical" size={20} color={theme.accent} />
+            </Pressable>
+          </>
+        ) : null}
       </View>
 
       <KeyboardAvoidingView

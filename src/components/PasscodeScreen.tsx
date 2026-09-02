@@ -9,7 +9,12 @@ import { useTheme } from "../hooks/useTheme";
 import { spacing } from "../theme";
 
 const PASSCODE_LENGTH = 4;
-const DIGITS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 0];
+// Standard phone keypad layout: 1-9 in order, then 0 centered on its own row.
+const KEYPAD_ROWS = [
+  [1, 2, 3],
+  [4, 5, 6],
+  [7, 8, 9],
+];
 
 /** Full-screen PIN pad shown whenever the app is locked. Modeled on
  * Telegram's Passcode Lock screen. */
@@ -70,47 +75,63 @@ export function PasscodeScreen() {
         </View>
 
         <View style={styles.pad}>
-          {DIGITS.map((digit) => (
+          {KEYPAD_ROWS.map((row) => (
+            <View key={row.join(",")} style={styles.padRow}>
+              {row.map((digit) => (
+                <Pressable
+                  key={digit}
+                  onPress={() => handleDigit(digit)}
+                  accessibilityRole="button"
+                  accessibilityLabel={`${digit}`}
+                  style={({ pressed }) => [
+                    styles.key,
+                    { backgroundColor: pressed ? theme.surfaceElevated : "transparent" },
+                  ]}
+                >
+                  <Text style={[styles.keyText, { color: theme.text }]}>{digit}</Text>
+                </Pressable>
+              ))}
+            </View>
+          ))}
+
+          <View style={styles.padRow}>
+            {biometricsAvailable ? (
+              <Pressable
+                onPress={() => void unlockWithBiometrics()}
+                accessibilityRole="button"
+                accessibilityLabel="Unlock with biometrics"
+                style={styles.key}
+              >
+                <Ionicons name="finger-print" size={28} color={theme.accent} />
+              </Pressable>
+            ) : (
+              <View style={styles.key} />
+            )}
+
             <Pressable
-              key={digit}
-              onPress={() => handleDigit(digit)}
+              onPress={() => handleDigit(0)}
               accessibilityRole="button"
-              accessibilityLabel={`${digit}`}
+              accessibilityLabel="0"
               style={({ pressed }) => [
                 styles.key,
                 { backgroundColor: pressed ? theme.surfaceElevated : "transparent" },
               ]}
             >
-              <Text style={[styles.keyText, { color: theme.text }]}>{digit}</Text>
+              <Text style={[styles.keyText, { color: theme.text }]}>0</Text>
             </Pressable>
-          ))}
 
-          {biometricsAvailable ? (
             <Pressable
-              onPress={() => void unlockWithBiometrics()}
+              onPress={handleBackspace}
               accessibilityRole="button"
-              accessibilityLabel="Unlock with biometrics"
-              style={styles.key}
+              accessibilityLabel="Backspace"
+              style={({ pressed }) => [
+                styles.key,
+                { backgroundColor: pressed ? theme.surfaceElevated : "transparent" },
+              ]}
             >
-              <Ionicons name="finger-print" size={28} color={theme.accent} />
+              <Ionicons name="backspace-outline" size={26} color={theme.text} />
             </Pressable>
-          ) : (
-            <View style={styles.key} />
-          )}
-
-          <View style={styles.key} />
-
-          <Pressable
-            onPress={handleBackspace}
-            accessibilityRole="button"
-            accessibilityLabel="Backspace"
-            style={({ pressed }) => [
-              styles.key,
-              { backgroundColor: pressed ? theme.surfaceElevated : "transparent" },
-            ]}
-          >
-            <Ionicons name="backspace-outline" size={26} color={theme.text} />
-          </Pressable>
+          </View>
         </View>
       </View>
     </SafeAreaView>
@@ -123,12 +144,8 @@ const styles = StyleSheet.create({
   title: { fontSize: 20, fontWeight: "600" },
   dots: { flexDirection: "row", gap: spacing.md, marginVertical: spacing.lg },
   dot: { width: 14, height: 14, borderRadius: 7, borderWidth: 2 },
-  pad: {
-    flexDirection: "row",
-    flexWrap: "wrap",
-    width: 280,
-    justifyContent: "center",
-  },
+  pad: { gap: spacing.sm },
+  padRow: { flexDirection: "row", justifyContent: "center", gap: spacing.sm },
   key: {
     width: 80,
     height: 80,

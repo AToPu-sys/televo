@@ -12,6 +12,7 @@ import { AppLockProvider, useAppLock } from "../src/hooks/useAppLock";
 import { AuthProvider, useAuth } from "../src/hooks/useAuth";
 import { CallManagerProvider, useCallManager } from "../src/hooks/useCallManager";
 import { E2eeProvider } from "../src/hooks/useE2ee";
+import { usePresenceHeartbeat } from "../src/hooks/usePresence";
 import { ThemeProvider, useTheme } from "../src/hooks/useTheme";
 
 function RootNavigator() {
@@ -123,6 +124,7 @@ function GlobalCallOverlay() {
 
 function AuthedProviders({ children }: { children: ReactNode }) {
   const { user } = useAuth();
+  usePresenceHeartbeat(user?.id);
   return (
     <E2eeProvider userId={user?.id}>
       <CallManagerProvider>{children}</CallManagerProvider>

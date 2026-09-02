@@ -42,6 +42,14 @@ export function useCall(userId: string | undefined) {
 
   const bridgeRef = useRef<WebRtcBridgeHandle | null>(null);
   const signalChannelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
+  // A channel object exists synchronously after .channel().subscribe(), but
+  // the join itself is async — sending before the SUBSCRIBED callback fires
+  // is a known way for Supabase Realtime broadcast to silently drop the
+  // message. Signals sent too early are queued here and flushed once ready,
+  // rather than lost (this is what caused "decline" to never reach the
+  // caller, leaving it stuck on "Ringing…").
+  const channelReadyRef = useRef(false);
+  const pendingSignalsRef = useRef<Signal[]>([]);
   const pendingOfferRef = useRef<{ sdp: string; kind: CallKind } | null>(null);
   const roleRef = useRef<"caller" | "callee" | null>(null);
 
@@ -57,6 +65,8 @@ export function useCall(userId: string | undefined) {
     sendCommand({ type: "hangup" });
     roleRef.current = null;
     pendingOfferRef.current = null;
+    channelReadyRef.current = false;
+    pendingSignalsRef.current = [];
 
     if (signalChannelRef.current) {
       void supabase.removeChannel(signalChannelRef.current);
@@ -66,17 +76,35 @@ export function useCall(userId: string | undefined) {
 
   const sendSignal = useCallback((signal: Signal) => {
     if (!signalChannelRef.current) return;
+    if (!channelReadyRef.current) {
+      // Not joined yet — queue it. flushed once the channel reports
+      // SUBSCRIBED (see joinSignalChannel below).
+      pendingSignalsRef.current.push(signal);
+      return;
+    }
     void signalChannelRef.current.send({ type: "broadcast", event: "signal", payload: signal });
   }, []);
 
   const joinSignalChannel = useCallback(
     (callId: string, onSignal: (signal: Signal) => void) => {
+      channelReadyRef.current = false;
+      pendingSignalsRef.current = [];
+
       const channel = supabase
         .channel(`call:${callId}`, { config: { broadcast: { self: false } } })
         .on("broadcast", { event: "signal" }, ({ payload }: { payload: Signal }) => {
           onSignal(payload);
         })
-        .subscribe();
+        .subscribe((status) => {
+          if (status === "SUBSCRIBED") {
+            channelReadyRef.current = true;
+            const queued = pendingSignalsRef.current;
+            pendingSignalsRef.current = [];
+            for (const signal of queued) {
+              void channel.send({ type: "broadcast", event: "signal", payload: signal });
+            }
+          }
+        });
 
       signalChannelRef.current = channel;
       return channel;

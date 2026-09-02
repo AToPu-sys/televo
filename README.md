@@ -36,6 +36,10 @@ no native modules.
   read receipts. **Blocking** is enforced server-side (RLS on the `messages`
   INSERT policy) — a blocked relationship stops messages in both directions,
   not just hidden client-side.
+- **AI Assistant** — a pinned "Televo Assistant" contact every user gets
+  automatically. Messages to it are answered by Claude, generated
+  server-side by a Supabase Edge Function — the app never holds an API key.
+  See "AI Assistant" below.
 - **App security** — a local 4-digit **Passcode Lock** (optional biometric
   unlock) that gates the whole app after backgrounding, and **Two-Step
   Verification** via TOTP (an authenticator app code required at login, on
@@ -138,6 +142,35 @@ on Telegram's own Secret Chats:
   local-only 4-digit PIN (SHA-256 hashed in `expo-secure-store`, never sent
   anywhere) that re-locks the app after ~30s backgrounded, with optional
   biometric unlock via `expo-local-authentication`.
+
+## AI Assistant
+
+Every user automatically gets a pinned direct conversation with "Televo
+Assistant" (a reserved system account, fixed id
+`00000000-0000-0000-0000-000000000001`), created by a database trigger
+(`on_profile_created_add_assistant`) the moment their profile row exists.
+
+Replies are generated **server-side**, never on the client:
+
+1. `notify_ai_assistant()` (a trigger on `messages` INSERT) fires an async
+   `pg_net` HTTP POST to the `ai-assistant-reply` Edge Function whenever a
+   non-assistant message lands in a conversation the assistant participates in.
+2. The Edge Function re-validates the conversation, pulls recent history,
+   calls the Claude API (`claude-haiku-4-5`) with the Anthropic key stored as
+   an Edge Function **secret** (`supabase secrets set`, never in `.env`, the
+   app, or git), and inserts the reply using the service-role key.
+3. The webhook call itself is gated by a shared-secret header
+   (`x-webhook-secret`) since the function is deployed with
+   `--no-verify-jwt` (the caller is Postgres, not a client with a Supabase
+   session).
+
+Call/block/self-destruct/E2E-encryption UI is hidden for this conversation in
+the chat screen — none of those apply to a bot contact.
+
+**Live-verified**: a new user gets the conversation + welcome message
+automatically, and a real message triggers a real Claude-generated reply,
+confirmed via `scripts/verify-ai-assistant.mjs` end to end through the full
+webhook → Edge Function → Claude API → insert pipeline.
 
 ## Contact discovery ("Find friends")
 

@@ -56,7 +56,7 @@ export default function ContactsScreen() {
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]} edges={["top"]}>
       <View style={[styles.header, { borderBottomColor: theme.border }]}>
-        <Text style={[styles.headerTitle, { color: theme.text }]}>Contacts</Text>
+        <Text style={[styles.headerTitle, { color: theme.text }]}>People on Televo</Text>
       </View>
 
       <View style={styles.searchWrapper}>
@@ -72,6 +72,13 @@ export default function ContactsScreen() {
             autoCapitalize="none"
           />
         </View>
+        {/* This lists everyone registered on Televo, not your phone's address
+            book — no contacts permission is used or needed here. Use "Find
+            friends" in Settings to match against your real phone contacts. */}
+        <Text style={[styles.hint, { color: theme.textSecondary }]}>
+          Everyone registered on Televo. To find people from your phone's
+          contacts instead, use Find friends in Settings.
+        </Text>
       </View>
 
       {loading ? (
@@ -153,6 +160,7 @@ const styles = StyleSheet.create({
     height: 38,
   },
   searchInput: { flex: 1, fontSize: 16, paddingVertical: 0 },
+  hint: { fontSize: 12, marginTop: spacing.sm, marginHorizontal: spacing.xs, lineHeight: 16 },
   row: {
     flexDirection: "row",
     alignItems: "center",

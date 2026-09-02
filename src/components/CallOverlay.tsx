@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import { StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
@@ -44,25 +45,36 @@ export function CallOverlay({
 }: CallOverlayProps) {
   const { theme } = useTheme();
 
+  // Auto-dismiss "ended" after a beat so the reason is visible, then let the
+  // caller reset back to idle. Must be an effect, not a call in the render
+  // body — otherwise every re-render while phase is "ended" schedules a new
+  // competing timer, and a stale one can fire during a subsequent call.
+  useEffect(() => {
+    if (state.phase !== "ended") return;
+    const timer = setTimeout(onDismissEnded, 1500);
+    return () => clearTimeout(timer);
+  }, [state.phase, onDismissEnded]);
+
   if (state.phase === "idle") return null;
 
-  // Auto-dismiss "ended" after a beat so the reason is visible, then let the
-  // caller reset back to idle.
-  if (state.phase === "ended") {
-    setTimeout(onDismissEnded, 1500);
-  }
-
   const showVideo = isVideo && state.phase === "active";
+  // Only mount the WebView once the user has actually accepted/placed the
+  // call (connecting/active/ended) — never during "incoming", where its
+  // Accept/Decline buttons must be tappable. react-native-webview's
+  // pointerEvents="none" is unreliable on Android (a documented upstream
+  // issue: the WebView can still intercept touches meant for views layered
+  // over it even when marked non-interactive), so the safest fix is to not
+  // have a WebView on screen at all until there's nothing left to tap around
+  // it. This also means the mic/camera prompt still only fires on consent,
+  // matching the original intent.
+  const shouldMountBridge =
+    state.phase === "connecting" || state.phase === "active" || state.phase === "outgoing";
 
   return (
     <View style={[StyleSheet.absoluteFill, styles.container, { backgroundColor: theme.background }]}>
-      {/* The WebView IS the WebRTC engine — real getUserMedia/RTCPeerConnection
-          run inside its browser context, which Expo Go already supports. It's
-          always mounted while a call is active so the peer connection and
-          media tracks survive; `visible` only toggles whether its <video>
-          surfaces render full-bleed (for video calls) or stay off-screen
-          (audio-only). */}
-      <WebRtcBridge ref={onBridgeReady} onEvent={onBridgeEvent} visible={!!showVideo} />
+      {shouldMountBridge ? (
+        <WebRtcBridge ref={onBridgeReady} onEvent={onBridgeEvent} visible={!!showVideo} />
+      ) : null}
 
       <SafeAreaView style={styles.content} pointerEvents="box-none">
         <View style={styles.header}>
