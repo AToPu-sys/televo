@@ -321,7 +321,7 @@ export function useMessages(
   // there's no per-conversation "forward" action that belongs on this hook.
 
   const sendImage = useCallback(
-    async (localUri: string) => {
+    async (localUri: string, kind: "image" | "video" = "image") => {
       if (!conversationId || !userId) return;
 
       const optimisticId = `optimistic-${Date.now()}`;
@@ -329,7 +329,7 @@ export function useMessages(
         id: optimisticId,
         conversation_id: conversationId,
         sender_id: userId,
-        kind: "image",
+        kind,
         body: null,
         // Show the local file while the upload is in flight.
         media_url: localUri,
@@ -356,7 +356,7 @@ export function useMessages(
         const { error: insertError } = await supabase.from("messages").insert({
           conversation_id: conversationId,
           sender_id: userId,
-          kind: "image",
+          kind,
           media_url: path,
         });
         if (insertError) throw insertError;

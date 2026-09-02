@@ -2,7 +2,7 @@ import { Ionicons } from "@expo/vector-icons";
 import * as DocumentPicker from "expo-document-picker";
 import * as ImagePicker from "expo-image-picker";
 import { useLocalSearchParams, useRouter } from "expo-router";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -84,6 +84,9 @@ export default function ConversationScreen() {
   const [editTarget, setEditTarget] = useState<ChatMessage | null>(null);
   const [messageSheetTarget, setMessageSheetTarget] = useState<ChatMessage | null>(null);
   const [attachSheetOpen, setAttachSheetOpen] = useState(false);
+  // Set synchronously the instant a picker is requested, so a rapid second
+  // tap can't open a second picker before the first one resolves.
+  const pickerBusyRef = useRef(false);
   const [headerSheetOpen, setHeaderSheetOpen] = useState(false);
   const [selfDestructSheetOpen, setSelfDestructSheetOpen] = useState(false);
   const isAssistantChat = conversation?.otherUserId === ASSISTANT_USER_ID;
@@ -257,7 +260,12 @@ export default function ConversationScreen() {
   }
 
   async function handleAttachImage() {
-    if (attaching) return;
+    // pickerBusyRef, not `attaching`: `attaching` is only set once the
+    // picker RESOLVES, so a second tap in the meantime slipped through and
+    // launched a second picker ("Different document picking in progress").
+    if (pickerBusyRef.current) return;
+    pickerBusyRef.current = true;
+    try {
 
     const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (!permission.granted) {
@@ -269,35 +277,44 @@ export default function ConversationScreen() {
     }
 
     const picked = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ["images"],
-      quality: 0.7,
-    });
+        mediaTypes: ["images", "videos"],
+        quality: 0.7,
+      });
     if (picked.canceled || !picked.assets?.[0]) return;
 
-    setAttaching(true);
-    try {
-      await sendImage(picked.assets[0].uri);
-    } catch (caught) {
-      Alert.alert("Upload failed", caught instanceof Error ? caught.message : "Please try again.");
+      const asset = picked.assets[0];
+      setAttaching(true);
+      try {
+        await sendImage(asset.uri, asset.type === "video" ? "video" : "image");
+      } catch (caught) {
+        Alert.alert("Upload failed", caught instanceof Error ? caught.message : "Please try again.");
+      } finally {
+        setAttaching(false);
+      }
     } finally {
-      setAttaching(false);
+      pickerBusyRef.current = false;
     }
   }
 
   async function handleAttachDocument() {
-    if (attaching) return;
+    if (pickerBusyRef.current) return;
+    pickerBusyRef.current = true;
+    try {
 
     const picked = await DocumentPicker.getDocumentAsync({ type: "*/*", copyToCacheDirectory: true });
     if (picked.canceled || !picked.assets?.[0]) return;
 
-    const asset = picked.assets[0];
-    setAttaching(true);
-    try {
-      await sendDocument(asset.uri, asset.name, asset.size ?? 0);
-    } catch (caught) {
-      Alert.alert("Upload failed", caught instanceof Error ? caught.message : "Please try again.");
+      const asset = picked.assets[0];
+      setAttaching(true);
+      try {
+        await sendDocument(asset.uri, asset.name, asset.size ?? 0);
+      } catch (caught) {
+        Alert.alert("Upload failed", caught instanceof Error ? caught.message : "Please try again.");
+      } finally {
+        setAttaching(false);
+      }
     } finally {
-      setAttaching(false);
+      pickerBusyRef.current = false;
     }
   }
 
@@ -695,7 +712,12 @@ export default function ConversationScreen() {
         visible={attachSheetOpen}
         onClose={() => setAttachSheetOpen(false)}
         options={[
-          { key: "photo", label: "Photo", icon: "image-outline", onPress: () => void handleAttachImage() },
+          {
+            key: "photo",
+            label: "Photo or video",
+            icon: "image-outline",
+            onPress: () => void handleAttachImage(),
+          },
           {
             key: "document",
             label: "Document",

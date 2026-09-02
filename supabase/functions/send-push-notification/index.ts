@@ -22,6 +22,9 @@ type WebhookPayload = {
 };
 
 function previewFor(kind: string, body: string | null, isEncrypted: boolean): string {
+  // A call notification carries its own text and is never a Secret Chat
+  // body, so it must not be replaced with "sent a message".
+  if (kind === "call") return body ?? "Incoming call";
   if (isEncrypted) return "sent a message";
   switch (kind) {
     case "image":

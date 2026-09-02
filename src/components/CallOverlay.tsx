@@ -5,6 +5,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import type { BridgeEvent, WebRtcBridgeHandle } from "./WebRtcBridge";
 import { WebRtcBridge } from "./WebRtcBridge";
 import type { CallState } from "../hooks/useCall";
+import { useRinger } from "../hooks/useRinger";
 import { useTheme } from "../hooks/useTheme";
 import { spacing } from "../theme";
 import { Avatar } from "./Avatar";
@@ -45,6 +46,13 @@ export function CallOverlay({
 }: CallOverlayProps) {
   const { theme } = useTheme();
 
+  // Ring (vibrate) while the call is pending — the app was previously
+  // completely silent on an incoming call.
+  useRinger(
+    state.phase === "incoming" || state.phase === "outgoing",
+    state.phase === "incoming" ? "incoming" : "outgoing"
+  );
+
   // Auto-dismiss "ended" after a beat so the reason is visible, then let the
   // caller reset back to idle. Must be an effect, not a call in the render
   // body — otherwise every re-render while phase is "ended" schedules a new
@@ -58,17 +66,20 @@ export function CallOverlay({
   if (state.phase === "idle") return null;
 
   const showVideo = isVideo && state.phase === "active";
-  // Only mount the WebView once the user has actually accepted/placed the
-  // call (connecting/active/ended) — never during "incoming", where its
-  // Accept/Decline buttons must be tappable. react-native-webview's
-  // pointerEvents="none" is unreliable on Android (a documented upstream
-  // issue: the WebView can still intercept touches meant for views layered
-  // over it even when marked non-interactive), so the safest fix is to not
-  // have a WebView on screen at all until there's nothing left to tap around
-  // it. This also means the mic/camera prompt still only fires on consent,
-  // matching the original intent.
-  const shouldMountBridge =
-    state.phase === "connecting" || state.phase === "active" || state.phase === "outgoing";
+
+  // The WebView IS the media engine — getUserMedia and RTCPeerConnection run
+  // inside it. It therefore has to be mounted and loaded during "incoming"
+  // too: previously it only mounted from "connecting" onward, so on the
+  // receiving side the mic and camera were never opened at all, and tapping
+  // Accept tried to answer with an engine that hadn't loaded yet.
+  //
+  // It was excluded from "incoming" to dodge an Android issue where a
+  // WebView swallows touches meant for views above it despite
+  // pointerEvents="none". That's handled instead by keeping it off-screen
+  // (1x1, far outside the viewport) until the call is actually connected,
+  // so it can load and request permissions without covering the
+  // Accept/Decline buttons.
+  const shouldMountBridge = state.phase !== "ended";
 
   return (
     <View style={[StyleSheet.absoluteFill, styles.container, { backgroundColor: theme.background }]}>

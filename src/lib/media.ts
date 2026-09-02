@@ -11,6 +11,13 @@ import { randomUUID } from "./uuid";
  * Upload to any other path fails the RLS check.
  */
 
+/** Copies a view into a standalone ArrayBuffer for the storage client. */
+function toArrayBuffer(view: Uint8Array): ArrayBuffer {
+  const copy = new ArrayBuffer(view.byteLength);
+  new Uint8Array(copy).set(view);
+  return copy;
+}
+
 async function readAsArrayBuffer(uri: string) {
   // fetch() on a local file:// URI is how Expo exposes picked media; this
   // avoids pulling in a filesystem dependency just to read bytes.
@@ -53,18 +60,21 @@ export async function uploadChatMedia(
 ) {
   const extension = extensionFor(localUri, "jpg");
   const path = `${conversationId}/${randomUUID()}.${extension}`;
-  const raw = new Uint8Array(await readAsArrayBuffer(localUri));
+  const buffer = await readAsArrayBuffer(localUri);
 
-  let payload: Uint8Array = raw;
+  // Supabase's storage client wants an ArrayBuffer/Blob. Passing a bare
+  // Uint8Array (which the encryption path produces) can upload as empty, so
+  // ciphertext is wrapped back into its own ArrayBuffer before sending.
+  let payload: ArrayBuffer = buffer;
   let nonce: string | null = null;
 
   if (encryptor) {
-    const encrypted = await encryptor(raw);
+    const encrypted = await encryptor(new Uint8Array(buffer));
     if (!encrypted) {
       // Refuse rather than silently fall back to an unencrypted upload.
       throw new Error("This Secret Chat has no encryption key yet, so the file wasn't sent.");
     }
-    payload = encrypted.ciphertext;
+    payload = toArrayBuffer(encrypted.ciphertext);
     nonce = encrypted.nonce;
   }
 
@@ -93,17 +103,17 @@ export async function uploadChatDocument(
 ) {
   const safeName = fileName.replace(/[^a-zA-Z0-9._-]/g, "_");
   const path = `${conversationId}/documents/${randomUUID()}-${safeName}`;
-  const raw = new Uint8Array(await readAsArrayBuffer(localUri));
+  const buffer = await readAsArrayBuffer(localUri);
 
-  let payload: Uint8Array = raw;
+  let payload: ArrayBuffer = buffer;
   let nonce: string | null = null;
 
   if (encryptor) {
-    const encrypted = await encryptor(raw);
+    const encrypted = await encryptor(new Uint8Array(buffer));
     if (!encrypted) {
       throw new Error("This Secret Chat has no encryption key yet, so the file wasn't sent.");
     }
-    payload = encrypted.ciphertext;
+    payload = toArrayBuffer(encrypted.ciphertext);
     nonce = encrypted.nonce;
   }
 

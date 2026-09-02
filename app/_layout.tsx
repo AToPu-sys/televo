@@ -11,7 +11,8 @@ import { SafeAreaProvider } from "react-native-safe-area-context";
 // would make it look like messages just aren't arriving.
 Notifications.setNotificationHandler({
   handleNotification: async () => ({
-    shouldShowAlert: true,
+    // shouldShowAlert is deprecated; shouldShowBanner + shouldShowList
+    // replace it.
     shouldPlaySound: true,
     shouldSetBadge: true,
     shouldShowBanner: true,
