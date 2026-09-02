@@ -25,7 +25,13 @@ type Signal =
   | { type: "answer"; sdp: string }
   | { type: "ice-candidate"; candidate: RTCIceCandidateInit }
   | { type: "hangup" }
-  | { type: "decline" };
+  | { type: "decline" }
+  // Sent by the callee once its signaling channel is actually joined.
+  // Realtime broadcast has no replay for late joiners, so the caller's
+  // original offer -- sent while the callee was still resolving the peer and
+  // subscribing -- was simply dropped, leaving Accept doing nothing and the
+  // caller stuck on "Ringing...". The caller re-sends the offer on this.
+  | { type: "callee-ready" };
 
 /**
  * The actual media engine lives inside a hidden WebView (see WebRtcBridge +
@@ -34,6 +40,9 @@ type Signal =
  * hook owns the call state machine and signaling; it talks to the bridge only
  * through JSON commands/events, never touching WebRTC types directly.
  */
+/** How long an unanswered call keeps ringing before it's marked missed. */
+const RING_TIMEOUT_MS = 45_000;
+
 export function useCall(userId: string | undefined) {
   const [state, setState] = useState<CallState>({ phase: "idle" });
   const [muted, setMuted] = useState(false);
@@ -52,6 +61,7 @@ export function useCall(userId: string | undefined) {
   const pendingSignalsRef = useRef<Signal[]>([]);
   const pendingOfferRef = useRef<{ sdp: string; kind: CallKind } | null>(null);
   const roleRef = useRef<"caller" | "callee" | null>(null);
+  const startingRef = useRef(false);
 
   const setBridgeRef = useCallback((handle: WebRtcBridgeHandle | null) => {
     bridgeRef.current = handle;
@@ -85,6 +95,19 @@ export function useCall(userId: string | undefined) {
     void signalChannelRef.current.send({ type: "broadcast", event: "signal", payload: signal });
   }, []);
 
+  /** Like sendSignal, but resolves once the broadcast has actually been
+   * handed off — used before cleanup() tears the channel down. */
+  const sendSignalAndWait = useCallback(async (signal: Signal) => {
+    const channel = signalChannelRef.current;
+    if (!channel || !channelReadyRef.current) return;
+    try {
+      await channel.send({ type: "broadcast", event: "signal", payload: signal });
+    } catch {
+      // Best effort: if the send fails the local side still tears down, and
+      // the peer falls back to its own timeout.
+    }
+  }, []);
+
   const joinSignalChannel = useCallback(
     (callId: string, onSignal: (signal: Signal) => void) => {
       channelReadyRef.current = false;
@@ -116,6 +139,11 @@ export function useCall(userId: string | undefined) {
   const startCall = useCallback(
     async (conversationId: string, kind: CallKind) => {
       if (!userId) return;
+      // Guard against a double-tap: the call sites check state.phase, but
+      // placeCall() awaits a peer lookup first, so a second tap slips through
+      // that window and creates a second call row + a leaked channel.
+      if (startingRef.current || roleRef.current) return;
+      startingRef.current = true;
 
       const { data: call, error } = await supabase
         .from("calls")
@@ -124,15 +152,24 @@ export function useCall(userId: string | undefined) {
         .single();
 
       if (error || !call) {
+        startingRef.current = false;
         setState({ phase: "ended", reason: "failed" });
         return;
       }
+      startingRef.current = false;
 
       roleRef.current = "caller";
       setState({ phase: "outgoing", call });
 
       joinSignalChannel(call.id, async (signal) => {
-        if (signal.type === "answer") {
+        if (signal.type === "callee-ready") {
+          // The callee joined after our offer already went out (broadcast has
+          // no replay), so re-send it now that someone is listening.
+          const offer = pendingOfferRef.current;
+          if (offer?.sdp) {
+            sendSignal({ type: "offer", sdp: offer.sdp, kind: offer.kind });
+          }
+        } else if (signal.type === "answer") {
           sendCommand({ type: "accept-answer", sdp: signal.sdp });
           setState({ phase: "active", call });
         } else if (signal.type === "ice-candidate") {
@@ -195,34 +232,52 @@ export function useCall(userId: string | undefined) {
           sendCommand({ type: "ice-candidate", candidate: signal.candidate });
         }
       });
+
+      // Tell the caller we're listening now. Their offer was very likely
+      // broadcast before this channel existed (resolving the peer takes two
+      // network round trips first), and broadcast doesn't replay for late
+      // joiners — without this the offer is lost and Accept does nothing.
+      // sendSignal queues until SUBSCRIBED, so this is safe to call here.
+      sendSignal({ type: "callee-ready" });
     },
-    [joinSignalChannel, cleanup, sendCommand]
+    [joinSignalChannel, cleanup, sendCommand, sendSignal]
   );
 
   const accept = useCallback(async () => {
-    if (state.phase !== "incoming" || !pendingOfferRef.current) return;
+    if (state.phase !== "incoming") return;
+    // If the offer still hasn't arrived, ask the caller for it rather than
+    // silently doing nothing (the old behaviour — the button looked dead).
+    if (!pendingOfferRef.current?.sdp) {
+      sendSignal({ type: "callee-ready" });
+      return;
+    }
     const { sdp, kind } = pendingOfferRef.current;
     await answerCall(state.call, sdp, kind);
-  }, [state, answerCall]);
+  }, [state, answerCall, sendSignal]);
 
   const decline = useCallback(async () => {
     if (state.phase !== "incoming") return;
-    sendSignal({ type: "decline" });
+    // AWAIT the broadcast before cleanup(): removeChannel() cancels an
+    // in-flight send, which is why "decline" never reached the caller and
+    // left them stuck on "Ringing…".
+    await sendSignalAndWait({ type: "decline" });
     await supabase.from("calls").update({ status: "declined" }).eq("id", state.call.id);
     setState({ phase: "ended", reason: "declined" });
     cleanup();
-  }, [state, sendSignal, cleanup]);
+  }, [state, sendSignalAndWait, cleanup]);
 
   const hangup = useCallback(async () => {
     if (state.phase === "idle" || state.phase === "ended") return;
-    sendSignal({ type: "hangup" });
+    // Same as decline: the peer only learns the call ended via this
+    // broadcast, so it must actually leave before the channel is removed.
+    await sendSignalAndWait({ type: "hangup" });
     await supabase
       .from("calls")
       .update({ status: "ended", ended_at: new Date().toISOString() })
       .eq("id", state.call.id);
     setState({ phase: "ended", reason: "hangup" });
     cleanup();
-  }, [state, sendSignal, cleanup]);
+  }, [state, sendSignalAndWait, cleanup]);
 
   const toggleMute = useCallback(() => {
     const next = !muted;
@@ -247,7 +302,11 @@ export function useCall(userId: string | undefined) {
       if (event.type === "ready") {
         setBridgeReady(true);
       } else if (event.type === "offer" && roleRef.current === "caller") {
-        sendSignal({ type: "offer", sdp: event.sdp, kind: pendingOfferRef.current?.kind ?? "audio" });
+        const kind = pendingOfferRef.current?.kind ?? "audio";
+        // Keep the SDP so it can be re-sent if the callee joins the channel
+        // after this first broadcast (see the "callee-ready" handler).
+        pendingOfferRef.current = { sdp: event.sdp, kind };
+        sendSignal({ type: "offer", sdp: event.sdp, kind });
       } else if (event.type === "answer" && roleRef.current === "callee") {
         sendSignal({ type: "answer", sdp: event.sdp });
       } else if (event.type === "ice-candidate") {
@@ -262,6 +321,29 @@ export function useCall(userId: string | undefined) {
     },
     [sendSignal]
   );
+
+  // Missed-call timeout. Without this an unanswered call rings forever on
+  // both devices — the "missed" state existed in the type and the UI but
+  // nothing ever set it.
+  useEffect(() => {
+    if (state.phase !== "outgoing" && state.phase !== "incoming") return;
+
+    const timer = setTimeout(() => {
+      void (async () => {
+        if (state.phase === "outgoing") {
+          await sendSignalAndWait({ type: "hangup" });
+          await supabase
+            .from("calls")
+            .update({ status: "missed", ended_at: new Date().toISOString() })
+            .eq("id", state.call.id);
+        }
+        setState({ phase: "ended", reason: "missed" });
+        cleanup();
+      })();
+    }, RING_TIMEOUT_MS);
+
+    return () => clearTimeout(timer);
+  }, [state, sendSignalAndWait, cleanup]);
 
   useEffect(() => cleanup, []); // eslint-disable-line react-hooks/exhaustive-deps
 

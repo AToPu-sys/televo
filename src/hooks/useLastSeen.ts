@@ -16,6 +16,15 @@ export type PresenceInfo = { label: string | null };
  */
 export function useLastSeen(viewerId: string | undefined, targetUserId: string | null | undefined) {
   const [presence, setPresence] = useState<PresenceInfo>({ label: null });
+  // Presence was fetched once and never again, so "online" stayed frozen on
+  // screen after the peer left (and "last seen ..." never flipped to online).
+  // Re-poll on an interval matching the sender's heartbeat.
+  const [tick, setTick] = useState(0);
+
+  useEffect(() => {
+    const interval = setInterval(() => setTick((value) => value + 1), 30_000);
+    return () => clearInterval(interval);
+  }, []);
 
   useEffect(() => {
     if (!viewerId || !targetUserId) {
@@ -56,7 +65,7 @@ export function useLastSeen(viewerId: string | undefined, targetUserId: string |
     return () => {
       active = false;
     };
-  }, [viewerId, targetUserId]);
+  }, [viewerId, targetUserId, tick]);
 
   return presence;
 }

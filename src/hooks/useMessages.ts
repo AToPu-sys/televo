@@ -18,6 +18,19 @@ export type ChatMessage = MessageRow & {
 
 const PAGE_SIZE = 50;
 
+/** True only for a body that actually looks like our ciphertext envelope
+ * ({"ciphertext":...,"nonce":...}), so plaintext history in a chat that was
+ * later switched to a Secret Chat still renders normally. */
+function isEncryptedEnvelope(body: string): boolean {
+  if (!body.startsWith("{")) return false;
+  try {
+    const parsed = JSON.parse(body);
+    return typeof parsed?.ciphertext === "string" && typeof parsed?.nonce === "string";
+  } catch {
+    return false;
+  }
+}
+
 export function useMessages(
   conversationId: string | undefined,
   userId: string | undefined,
@@ -30,6 +43,8 @@ export function useMessages(
   // Tracks optimistic ids so the realtime INSERT can replace them instead of
   // appending a duplicate when our own message echoes back.
   const optimisticIds = useRef(new Set<string>());
+  const [hasMore, setHasMore] = useState(false);
+  const loadingOlderRef = useRef(false);
   const { encryptForConversation, decryptForConversation } = useE2ee();
 
   const decorateWithDecryption = useCallback(
@@ -39,6 +54,13 @@ export function useMessages(
       return Promise.all(
         rows.map(async (row) => {
           if (row.kind !== "text" || !row.body) return row;
+
+          // Messages sent BEFORE this chat was switched to a Secret Chat are
+          // plain text, not ciphertext envelopes. Treating them as encrypted
+          // turned the entire prior history into "Unable to decrypt" the
+          // moment encryption was enabled — leave genuine plaintext alone.
+          if (!isEncryptedEnvelope(row.body)) return row;
+
           const decrypted = await decryptForConversation(conversationId, row.body);
           return { ...row, decryptedBody: decrypted };
         })
@@ -64,10 +86,45 @@ export function useMessages(
     if (queryError) {
       setError(queryError.message);
     } else {
-      setMessages(await decorateWithDecryption(data ?? []));
+      const rows = data ?? [];
+      setMessages(await decorateWithDecryption(rows));
+      setHasMore(rows.length === PAGE_SIZE);
     }
     setLoading(false);
   }, [conversationId, decorateWithDecryption]);
+
+  /** Loads the next page of older messages. Without this, anything past the
+   * first 50 was permanently unreachable — scrolling up just hit a wall, and
+   * replies to older messages rendered with no quote. */
+  const loadOlder = useCallback(async () => {
+    if (!conversationId || loadingOlderRef.current || !hasMore) return;
+
+    const oldest = messages[messages.length - 1];
+    if (!oldest) return;
+
+    loadingOlderRef.current = true;
+    try {
+      const { data } = await supabase
+        .from("messages")
+        .select("*")
+        .eq("conversation_id", conversationId)
+        .lt("created_at", oldest.created_at)
+        .order("created_at", { ascending: false })
+        .limit(PAGE_SIZE);
+
+      const rows = data ?? [];
+      setHasMore(rows.length === PAGE_SIZE);
+      if (rows.length > 0) {
+        const decorated = await decorateWithDecryption(rows);
+        setMessages((current) => {
+          const seen = new Set(current.map((m) => m.id));
+          return [...current, ...decorated.filter((m) => !seen.has(m.id))];
+        });
+      }
+    } finally {
+      loadingOlderRef.current = false;
+    }
+  }, [conversationId, hasMore, messages, decorateWithDecryption]);
 
   useEffect(() => {
     setLoading(true);
@@ -218,25 +275,42 @@ export function useMessages(
     [conversationId, userId, isEncrypted, encryptForConversation, selfDestructSeconds]
   );
 
-  const editMessage = useCallback(async (messageId: string, newBody: string) => {
-    const trimmed = newBody.trim();
-    if (!trimmed) return;
+  const editMessage = useCallback(
+    async (messageId: string, newBody: string) => {
+      const trimmed = newBody.trim();
+      if (!trimmed || !conversationId) return;
 
-    // Optimistic edit.
-    setMessages((current) =>
-      current.map((message) =>
-        message.id === messageId
-          ? { ...message, body: trimmed, decryptedBody: trimmed, edited_at: new Date().toISOString() }
-          : message
-      )
-    );
+      // In a Secret Chat the stored body is a ciphertext envelope. Writing
+      // the edit as plaintext (which this used to do) made the message
+      // unreadable to the peer — parseEnvelope fails and they see
+      // "Unable to decrypt" — as well as leaking the edited text server-side.
+      const storedBody = isEncrypted
+        ? await encryptForConversation(conversationId, trimmed)
+        : trimmed;
 
-    const { error } = await supabase
-      .from("messages")
-      .update({ body: trimmed, edited_at: new Date().toISOString() })
-      .eq("id", messageId);
-    if (error) throw error;
-  }, []);
+      // Optimistic edit: `body` mirrors what's stored, `decryptedBody` is
+      // what gets rendered.
+      setMessages((current) =>
+        current.map((message) =>
+          message.id === messageId
+            ? {
+                ...message,
+                body: storedBody,
+                decryptedBody: isEncrypted ? trimmed : undefined,
+                edited_at: new Date().toISOString(),
+              }
+            : message
+        )
+      );
+
+      const { error } = await supabase
+        .from("messages")
+        .update({ body: storedBody, edited_at: new Date().toISOString() })
+        .eq("id", messageId);
+      if (error) throw error;
+    },
+    [conversationId, isEncrypted, encryptForConversation]
+  );
 
   // Forwarding is handled by app/forward-message.tsx, which inserts directly
   // into the CHOSEN destination conversation (not necessarily this one) —
@@ -389,6 +463,8 @@ export function useMessages(
     messages,
     loading,
     error,
+    hasMore,
+    loadOlder,
     sendMessage,
     editMessage,
     sendImage,

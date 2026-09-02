@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { supabase } from "../lib/supabase";
 import type { Database } from "../types/database";
@@ -23,6 +23,10 @@ export type ChatSummary = {
 export function useChats(userId: string | undefined) {
   const [chats, setChats] = useState<ChatSummary[]>([]);
   const [loading, setLoading] = useState(true);
+  // useChats is mounted by BOTH the chats tab and the forward-message modal.
+  // A fixed channel name meant the modal's cleanup tore down the topic the
+  // chats screen was still using, silently killing its live updates.
+  const channelIdRef = useRef(Math.random().toString(36).slice(2));
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
@@ -173,7 +177,7 @@ export function useChats(userId: string | undefined) {
     if (!userId) return;
 
     const channel = supabase
-      .channel("chats-list")
+      .channel(`chats-list:${channelIdRef.current}`)
       .on(
         "postgres_changes",
         { event: "INSERT", schema: "public", table: "messages" },

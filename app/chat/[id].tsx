@@ -53,8 +53,18 @@ export default function ConversationScreen() {
   const { conversation, loading: loadingConversation, refresh: refreshConversation } =
     useConversation(id, user?.id);
   const isEncrypted = conversation?.isEncrypted ?? false;
-  const { messages, loading, sendMessage, editMessage, sendImage, sendDocument, deleteMessage, markRead } =
-    useMessages(id, user?.id, isEncrypted, conversation?.selfDestructSeconds ?? null);
+  const {
+    messages,
+    loading,
+    hasMore,
+    loadOlder,
+    sendMessage,
+    editMessage,
+    sendImage,
+    sendDocument,
+    deleteMessage,
+    markRead,
+  } = useMessages(id, user?.id, isEncrypted, conversation?.selfDestructSeconds ?? null);
   const participantNames = useParticipantNames(id, user?.id);
   const { label: presenceLabel } = useLastSeen(user?.id, conversation?.otherUserId);
   const { typingLabel, notifyTyping } = useTyping(
@@ -109,6 +119,11 @@ export default function ConversationScreen() {
     if (!user?.id || conversation?.kind !== "direct" || !conversation.otherUserId) return;
     isUserBlocked(user.id, conversation.otherUserId).then(setIsBlocked);
   }, [user?.id, conversation?.kind, conversation?.otherUserId]);
+
+  // Blocking is bidirectional server-side, so once either side blocks, every
+  // send fails at RLS. Previously the composer stayed fully enabled and the
+  // message just turned into a red "failed" bubble with no explanation.
+  const composerDisabled = isBlocked;
 
   function handleBlockToggle() {
     if (!user?.id || !conversation?.otherUserId) return;
@@ -455,6 +470,15 @@ export default function ConversationScreen() {
             data={messages}
             keyExtractor={(item) => item.id}
             contentContainerStyle={styles.list}
+            // The list is inverted, so "end" is the OLDEST message — this is
+            // what loads older history instead of hitting a wall at 50.
+            onEndReached={() => void loadOlder()}
+            onEndReachedThreshold={0.4}
+            ListFooterComponent={
+              hasMore ? (
+                <ActivityIndicator color={theme.accent} style={styles.olderLoader} />
+              ) : null
+            }
             ListEmptyComponent={
               <View style={[styles.center, styles.emptyInverted]}>
                 <Text style={[styles.emptyText, { color: theme.textSecondary }]}>
@@ -536,7 +560,7 @@ export default function ConversationScreen() {
         >
           <Pressable
             onPress={() => setAttachSheetOpen(true)}
-            disabled={attaching}
+            disabled={attaching || composerDisabled}
             accessibilityRole="button"
             accessibilityLabel="Attach"
             accessibilityState={{ disabled: attaching }}
@@ -551,11 +575,12 @@ export default function ConversationScreen() {
           </Pressable>
           <TextInput
             value={draft}
+            editable={!composerDisabled}
             onChangeText={(text) => {
               setDraft(text);
               notifyTyping();
             }}
-            placeholder="Message"
+            placeholder={composerDisabled ? "You blocked this person" : "Message"}
             placeholderTextColor={theme.textSecondary}
             style={[
               styles.input,
@@ -566,7 +591,7 @@ export default function ConversationScreen() {
           />
           <Pressable
             onPress={handleSend}
-            disabled={!draft.trim() || sending}
+            disabled={!draft.trim() || sending || composerDisabled}
             accessibilityRole="button"
             accessibilityLabel="Send message"
             accessibilityState={{ disabled: !draft.trim() || sending }}
@@ -683,4 +708,5 @@ const styles = StyleSheet.create({
   replyTextBlock: { flex: 1 },
   replyLabel: { fontSize: 13, fontWeight: "600" },
   replyPreview: { fontSize: 13 },
+  olderLoader: { paddingVertical: spacing.md },
 });
