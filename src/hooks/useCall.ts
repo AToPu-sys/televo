@@ -60,8 +60,19 @@ export function useCall(userId: string | undefined) {
   const channelReadyRef = useRef(false);
   const pendingSignalsRef = useRef<Signal[]>([]);
   const pendingOfferRef = useRef<{ sdp: string; kind: CallKind } | null>(null);
+  // Set when the user taps Accept before the caller's offer has arrived.
+  // Accept used to just re-ping the caller and return, so the offer would
+  // land a moment later and sit unused — the button appeared dead and you had
+  // to keep tapping it. The offer handler now checks this and answers as soon
+  // as the offer shows up.
+  const acceptRequestedRef = useRef(false);
   const roleRef = useRef<"caller" | "callee" | null>(null);
   const startingRef = useRef(false);
+  // listenForOffer() needs answerCall(), which is declared below it. A ref
+  // breaks the ordering cycle without reshuffling the file.
+  const answerCallRef = useRef<
+    ((call: CallRow, offerSdp: string, kind: CallKind) => Promise<void>) | null
+  >(null);
 
   const setBridgeRef = useCallback((handle: WebRtcBridgeHandle | null) => {
     bridgeRef.current = handle;
@@ -75,6 +86,9 @@ export function useCall(userId: string | undefined) {
     sendCommand({ type: "hangup" });
     roleRef.current = null;
     pendingOfferRef.current = null;
+    // Must reset, or a tap that was never fulfilled on one call would
+    // auto-answer the NEXT incoming call without the user consenting.
+    acceptRequestedRef.current = false;
     channelReadyRef.current = false;
     pendingSignalsRef.current = [];
 
@@ -214,6 +228,8 @@ export function useCall(userId: string | undefined) {
     [sendCommand]
   );
 
+  answerCallRef.current = answerCall;
+
   /** Listens for an incoming offer on a call id the app already knows about
    * (from a `calls` INSERT elsewhere) and stages the answer path. */
   const listenForOffer = useCallback(
@@ -225,6 +241,14 @@ export function useCall(userId: string | undefined) {
           // Stash the offer; answerCall() is invoked explicitly when the user
           // taps Accept, so the mic/camera prompt only fires on consent.
           pendingOfferRef.current = { sdp: signal.sdp, kind: signal.kind };
+
+          // The user already tapped Accept while we were still waiting for
+          // this. Consent is given, so answer immediately instead of leaving
+          // the offer sitting here and the call unanswerable.
+          if (acceptRequestedRef.current) {
+            acceptRequestedRef.current = false;
+            void answerCallRef.current?.(call, signal.sdp, signal.kind);
+          }
         } else if (signal.type === "hangup") {
           setState({ phase: "ended", reason: "hangup" });
           cleanup();
@@ -245,9 +269,13 @@ export function useCall(userId: string | undefined) {
 
   const accept = useCallback(async () => {
     if (state.phase !== "incoming") return;
-    // If the offer still hasn't arrived, ask the caller for it rather than
-    // silently doing nothing (the old behaviour — the button looked dead).
+    // If the offer still hasn't arrived, remember that the user wants to
+    // answer and re-ask the caller for it. The offer handler in
+    // listenForOffer() completes the answer the moment it lands. Previously
+    // this just returned, so a tap that landed before the offer did nothing
+    // at all and the call could not be answered.
     if (!pendingOfferRef.current?.sdp) {
+      acceptRequestedRef.current = true;
       sendSignal({ type: "callee-ready" });
       return;
     }
