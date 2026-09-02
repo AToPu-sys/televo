@@ -288,6 +288,51 @@ export default function ConversationScreen() {
     setMessageSheetTarget(message);
   }
 
+  // App Store Guideline 1.2 requires a way to report offensive content in
+  // any app with user-generated content. Snapshots the body because the
+  // message may be deleted before the report is reviewed.
+  function handleReportMessage(message: ChatMessage) {
+    if (!user?.id) return;
+    const reasons: { key: string; label: string }[] = [
+      { key: "spam", label: "Spam" },
+      { key: "harassment", label: "Harassment or bullying" },
+      { key: "inappropriate", label: "Inappropriate content" },
+      { key: "violence", label: "Violence or threats" },
+      { key: "other", label: "Something else" },
+    ];
+
+    Alert.alert(
+      "Report message",
+      "Tell us what's wrong. Reports are reviewed within 24 hours.",
+      [
+        ...reasons.map((reason) => ({
+          text: reason.label,
+          onPress: () => {
+            void supabase
+              .from("content_reports")
+              .insert({
+                reporter_id: user.id,
+                reported_user_id: message.sender_id,
+                message_id: message.id,
+                conversation_id: message.conversation_id,
+                reason: reason.key,
+                reported_content: message.decryptedBody ?? message.body ?? null,
+              })
+              .then(({ error }) => {
+                Alert.alert(
+                  error ? "Couldn't send report" : "Report sent",
+                  error
+                    ? error.message
+                    : "Thanks. We'll review this within 24 hours. You can also block this person."
+                );
+              });
+          },
+        })),
+        { text: "Cancel", style: "cancel" as const },
+      ]
+    );
+  }
+
   function buildMessageSheetOptions(message: ChatMessage): ActionSheetOption[] {
     const isOwn = message.sender_id === user?.id;
     const canEdit = isOwn && message.kind === "text";
@@ -318,6 +363,16 @@ export default function ConversationScreen() {
         },
       },
     ];
+
+    if (!isOwn) {
+      options.push({
+        key: "report",
+        label: "Report",
+        icon: "flag-outline",
+        destructive: true,
+        onPress: () => handleReportMessage(message),
+      });
+    }
 
     if (canEdit) {
       options.push({

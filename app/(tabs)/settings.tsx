@@ -95,6 +95,41 @@ export default function SettingsScreen() {
     }
   }
 
+  // App Store Guideline 5.1.1(v): an app that supports account creation must
+  // let the user delete their account from within the app — not just
+  // deactivate, and not by emailing support.
+  function handleDeleteAccount() {
+    Alert.alert(
+      "Delete account?",
+      "This permanently deletes your account, profile, messages and media. It cannot be undone.",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Delete",
+          style: "destructive",
+          onPress: () => {
+            Alert.alert("Are you sure?", "This is permanent. Everything will be erased.", [
+              { text: "Cancel", style: "cancel" },
+              {
+                text: "Delete forever",
+                style: "destructive",
+                onPress: async () => {
+                  const { error } = await supabase.rpc("delete_own_account");
+                  if (error) {
+                    Alert.alert("Couldn't delete account", error.message);
+                    return;
+                  }
+                  // The account is gone; drop the now-orphaned local session.
+                  await signOut().catch(() => {});
+                },
+              },
+            ]);
+          },
+        },
+      ]
+    );
+  }
+
   function handleSignOut() {
     Alert.alert("Sign out", "You'll need to sign in again to read your messages.", [
       { text: "Cancel", style: "cancel" },
@@ -226,6 +261,15 @@ export default function SettingsScreen() {
         </View>
 
         <Button title="Sign out" variant="secondary" onPress={handleSignOut} />
+
+        <Pressable
+          onPress={handleDeleteAccount}
+          accessibilityRole="button"
+          accessibilityLabel="Delete account"
+          style={styles.deleteAccountRow}
+        >
+          <Text style={[styles.deleteAccountText, { color: theme.danger }]}>Delete account</Text>
+        </Pressable>
       </ScrollView>
     </SafeAreaView>
   );
@@ -265,4 +309,6 @@ const styles = StyleSheet.create({
   settingText: { fontSize: 16 },
   divider: { height: StyleSheet.hairlineWidth },
   savePhoneButton: { marginTop: spacing.sm },
+  deleteAccountRow: { alignItems: "center", paddingVertical: spacing.md },
+  deleteAccountText: { fontSize: 15, fontWeight: "600" },
 });
