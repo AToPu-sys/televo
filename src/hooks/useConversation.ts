@@ -4,9 +4,12 @@ import { supabase } from "../lib/supabase";
 
 export type ConversationHeader = {
   id: string;
+  kind: "direct" | "group";
   title: string;
   subtitle: string | null;
   avatarUrl: string | null;
+  otherUserId: string | null;
+  isEncrypted: boolean;
 };
 
 /** Loads the header details for one conversation (title, avatar, member count). */
@@ -30,6 +33,7 @@ export function useConversation(conversationId: string | undefined, userId: stri
         id,
         kind,
         title,
+        is_encrypted,
         conversation_participants ( user_id )
       `
       )
@@ -46,9 +50,12 @@ export function useConversation(conversationId: string | undefined, userId: stri
     if (data.kind === "group") {
       setConversation({
         id: data.id,
+        kind: "group",
         title: data.title ?? "Group",
         subtitle: `${participants.length} members`,
         avatarUrl: null,
+        otherUserId: null,
+        isEncrypted: false,
       });
       setLoading(false);
       return;
@@ -57,7 +64,15 @@ export function useConversation(conversationId: string | undefined, userId: stri
     const other = participants.find((participant) => participant.user_id !== userId);
 
     if (!other) {
-      setConversation({ id: data.id, title: "Unknown", subtitle: null, avatarUrl: null });
+      setConversation({
+        id: data.id,
+        kind: "direct",
+        title: "Unknown",
+        subtitle: null,
+        avatarUrl: null,
+        otherUserId: null,
+        isEncrypted: data.is_encrypted,
+      });
       setLoading(false);
       return;
     }
@@ -70,9 +85,12 @@ export function useConversation(conversationId: string | undefined, userId: stri
 
     setConversation({
       id: data.id,
+      kind: "direct",
       title: profile?.display_name ?? "Unknown",
       subtitle: profile?.username ? `@${String(profile.username)}` : null,
       avatarUrl: profile?.avatar_url ?? null,
+      otherUserId: other.user_id,
+      isEncrypted: data.is_encrypted,
     });
     setLoading(false);
   }, [conversationId, userId]);

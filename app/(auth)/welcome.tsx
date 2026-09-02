@@ -15,9 +15,9 @@ export default function WelcomeScreen() {
     <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]}>
       <View style={styles.hero}>
         <View style={[styles.logo, { backgroundColor: theme.accent }]}>
-          <Ionicons name="paper-plane" size={56} color="#FFFFFF" />
+          <Ionicons name="chatbubbles" size={56} color="#FFFFFF" />
         </View>
-        <Text style={[styles.title, { color: theme.text }]}>Telegram Clone</Text>
+        <Text style={[styles.title, { color: theme.text }]}>Televo</Text>
         <Text style={[styles.subtitle, { color: theme.textSecondary }]}>
           Fast, simple messaging. Sign in to pick up where you left off.
         </Text>
@@ -25,11 +25,6 @@ export default function WelcomeScreen() {
 
       <View style={styles.actions}>
         <Button title="Continue with Email" onPress={() => router.push("/(auth)/sign-in")} />
-        <Button
-          title="Use Phone Number"
-          variant="secondary"
-          onPress={() => router.push("/(auth)/phone")}
-        />
       </View>
     </SafeAreaView>
   );

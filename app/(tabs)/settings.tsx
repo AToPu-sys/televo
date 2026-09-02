@@ -1,10 +1,12 @@
 import { Ionicons } from "@expo/vector-icons";
+import { useRouter } from "expo-router";
 import { useEffect, useState } from "react";
 import { Alert, Pressable, ScrollView, StyleSheet, Switch, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
 import { Avatar } from "../../src/components/Avatar";
 import { Button } from "../../src/components/Button";
+import { TextField } from "../../src/components/TextField";
 import { useAuth } from "../../src/hooks/useAuth";
 import { useTheme } from "../../src/hooks/useTheme";
 import { supabase } from "../../src/lib/supabase";
@@ -15,12 +17,17 @@ type Profile = {
   username: string;
   bio: string | null;
   avatar_url: string | null;
+  phone: string | null;
 };
 
 export default function SettingsScreen() {
   const { theme, preference, setPreference } = useTheme();
   const { user, signOut } = useAuth();
+  const router = useRouter();
   const [profile, setProfile] = useState<Profile | null>(null);
+  const [phoneDraft, setPhoneDraft] = useState("");
+  const [savingPhone, setSavingPhone] = useState(false);
+  const [phoneError, setPhoneError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!user?.id) return;
@@ -28,7 +35,7 @@ export default function SettingsScreen() {
 
     supabase
       .from("profiles")
-      .select("display_name, username, bio, avatar_url")
+      .select("display_name, username, bio, avatar_url, phone")
       .eq("id", user.id)
       .single()
       .then(({ data }) => {
@@ -38,7 +45,9 @@ export default function SettingsScreen() {
             username: String(data.username),
             bio: data.bio,
             avatar_url: data.avatar_url,
+            phone: data.phone,
           });
+          setPhoneDraft(data.phone ?? "");
         }
       });
 
@@ -46,6 +55,35 @@ export default function SettingsScreen() {
       active = false;
     };
   }, [user?.id]);
+
+  async function handleSavePhone() {
+    if (!user?.id) return;
+    setPhoneError(null);
+
+    const trimmed = phoneDraft.trim();
+    if (trimmed && !/^\+[1-9]\d{6,14}$/.test(trimmed)) {
+      setPhoneError("Use international format, e.g. +14155552671.");
+      return;
+    }
+
+    setSavingPhone(true);
+    try {
+      const { error } = await supabase
+        .from("profiles")
+        .update({ phone: trimmed || null })
+        .eq("id", user.id);
+      if (error) throw error;
+      setProfile((current) => (current ? { ...current, phone: trimmed || null } : current));
+    } catch (caught) {
+      setPhoneError(
+        caught instanceof Error && caught.message.includes("duplicate")
+          ? "That number is already linked to another account."
+          : "Couldn't save your number. Try again."
+      );
+    } finally {
+      setSavingPhone(false);
+    }
+  }
 
   function handleSignOut() {
     Alert.alert("Sign out", "You'll need to sign in again to read your messages.", [
@@ -97,6 +135,40 @@ export default function SettingsScreen() {
             <Text style={[styles.sectionValue, { color: theme.text }]}>{profile.bio}</Text>
           </View>
         ) : null}
+
+        <View style={[styles.section, { backgroundColor: theme.surfaceElevated, paddingVertical: spacing.md }]}>
+          <TextField
+            label="Phone number"
+            value={phoneDraft}
+            onChangeText={setPhoneDraft}
+            keyboardType="phone-pad"
+            autoComplete="tel"
+            placeholder="+1 415 555 2671"
+            hint="Optional — lets friends find you from their contacts."
+            error={phoneError}
+          />
+          {phoneDraft.trim() !== (profile?.phone ?? "") ? (
+            <Button
+              title="Save number"
+              onPress={handleSavePhone}
+              loading={savingPhone}
+              style={styles.savePhoneButton}
+            />
+          ) : null}
+        </View>
+
+        <Pressable
+          onPress={() => router.push("/find-friends")}
+          accessibilityRole="button"
+          accessibilityLabel="Find friends from your contacts"
+          style={[styles.section, styles.settingRow, { backgroundColor: theme.surfaceElevated }]}
+        >
+          <View style={styles.settingLabel}>
+            <Ionicons name="person-add-outline" size={20} color={theme.accent} />
+            <Text style={[styles.settingText, { color: theme.text }]}>Find friends</Text>
+          </View>
+          <Ionicons name="chevron-forward" size={18} color={theme.textSecondary} />
+        </Pressable>
 
         <View style={[styles.section, { backgroundColor: theme.surfaceElevated }]}>
           <View style={styles.settingRow}>
@@ -169,4 +241,5 @@ const styles = StyleSheet.create({
   settingLabel: { flexDirection: "row", alignItems: "center", gap: spacing.md },
   settingText: { fontSize: 16 },
   divider: { height: StyleSheet.hairlineWidth },
+  savePhoneButton: { marginTop: spacing.sm },
 });

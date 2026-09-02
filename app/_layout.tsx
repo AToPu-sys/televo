@@ -1,6 +1,6 @@
 import { Stack, useRouter, useSegments } from "expo-router";
 import { StatusBar } from "expo-status-bar";
-import { useEffect } from "react";
+import { useEffect, type ReactNode } from "react";
 import { ActivityIndicator, View } from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { SafeAreaProvider } from "react-native-safe-area-context";
@@ -8,6 +8,7 @@ import { SafeAreaProvider } from "react-native-safe-area-context";
 import { CallOverlay } from "../src/components/CallOverlay";
 import { AuthProvider, useAuth } from "../src/hooks/useAuth";
 import { CallManagerProvider, useCallManager } from "../src/hooks/useCallManager";
+import { E2eeProvider } from "../src/hooks/useE2ee";
 import { ThemeProvider, useTheme } from "../src/hooks/useTheme";
 
 function RootNavigator() {
@@ -51,6 +52,7 @@ function RootNavigator() {
         <Stack.Screen name="(tabs)" />
         <Stack.Screen name="chat/[id]" options={{ headerShown: false }} />
         <Stack.Screen name="new-group" options={{ presentation: "modal" }} />
+        <Stack.Screen name="find-friends" options={{ presentation: "modal" }} />
       </Stack>
       {session ? <GlobalCallOverlay /> : null}
     </>
@@ -100,15 +102,24 @@ function GlobalCallOverlay() {
   );
 }
 
+function AuthedProviders({ children }: { children: ReactNode }) {
+  const { user } = useAuth();
+  return (
+    <E2eeProvider userId={user?.id}>
+      <CallManagerProvider>{children}</CallManagerProvider>
+    </E2eeProvider>
+  );
+}
+
 export default function RootLayout() {
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
       <SafeAreaProvider>
         <ThemeProvider>
           <AuthProvider>
-            <CallManagerProvider>
+            <AuthedProviders>
               <RootNavigator />
-            </CallManagerProvider>
+            </AuthedProviders>
           </AuthProvider>
         </ThemeProvider>
       </SafeAreaProvider>

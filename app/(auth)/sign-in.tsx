@@ -28,6 +28,7 @@ export default function SignInScreen() {
   const [password, setPassword] = useState("");
   const [username, setUsername] = useState("");
   const [displayName, setDisplayName] = useState("");
+  const [phone, setPhone] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -57,6 +58,7 @@ export default function SignInScreen() {
         const { needsConfirmation } = await signUpWithEmail(email, password, {
           username: username.trim(),
           displayName: displayName.trim() || username.trim(),
+          phone: phone.trim() || undefined,
         });
         if (needsConfirmation) {
           setNotice("Check your email to confirm your account, then sign in.");
@@ -135,6 +137,15 @@ export default function SignInScreen() {
                   onChangeText={setDisplayName}
                   placeholder="Jane Doe"
                   hint="Optional — defaults to your username."
+                />
+                <TextField
+                  label="Phone number"
+                  value={phone}
+                  onChangeText={setPhone}
+                  keyboardType="phone-pad"
+                  autoComplete="tel"
+                  placeholder="+1 415 555 2671"
+                  hint="Optional — lets friends find you from their contacts."
                 />
               </>
             ) : null}

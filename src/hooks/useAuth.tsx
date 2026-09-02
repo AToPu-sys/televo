@@ -20,10 +20,8 @@ type AuthContextValue = {
   signUpWithEmail: (
     email: string,
     password: string,
-    profile: { username: string; displayName: string }
+    profile: { username: string; displayName: string; phone?: string }
   ) => Promise<{ needsConfirmation: boolean }>;
-  sendPhoneOtp: (phone: string) => Promise<void>;
-  verifyPhoneOtp: (phone: string, token: string) => Promise<void>;
   signOut: () => Promise<void>;
 };
 
@@ -64,14 +62,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     async (
       email: string,
       password: string,
-      profile: { username: string; displayName: string }
+      profile: { username: string; displayName: string; phone?: string }
     ) => {
       const { data, error } = await supabase.auth.signUp({
         email: email.trim(),
         password,
         options: {
           // A database trigger (handle_new_user) reads these to create the
-          // profiles row, so we must not insert one ourselves.
+          // profiles row, so we must not insert one ourselves. The trigger
+          // doesn't know about `phone` (it's newer than the trigger), so it's
+          // set with a follow-up update once the row and a session exist.
           data: {
             username: profile.username.trim(),
             display_name: profile.displayName.trim(),
@@ -79,25 +79,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         },
       });
       if (error) throw error;
+
+      if (profile.phone && data.session && data.user) {
+        await supabase
+          .from("profiles")
+          .update({ phone: profile.phone.trim() })
+          .eq("id", data.user.id);
+      }
+
       // With email confirmation on, Supabase returns a user but no session.
       return { needsConfirmation: !data.session };
     },
     []
   );
-
-  const sendPhoneOtp = useCallback(async (phone: string) => {
-    const { error } = await supabase.auth.signInWithOtp({ phone: phone.trim() });
-    if (error) throw error;
-  }, []);
-
-  const verifyPhoneOtp = useCallback(async (phone: string, token: string) => {
-    const { error } = await supabase.auth.verifyOtp({
-      phone: phone.trim(),
-      token: token.trim(),
-      type: "sms",
-    });
-    if (error) throw error;
-  }, []);
 
   const signOut = useCallback(async () => {
     const { error } = await supabase.auth.signOut();
@@ -111,19 +105,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       initializing,
       signInWithEmail,
       signUpWithEmail,
-      sendPhoneOtp,
-      verifyPhoneOtp,
       signOut,
     }),
-    [
-      session,
-      initializing,
-      signInWithEmail,
-      signUpWithEmail,
-      sendPhoneOtp,
-      verifyPhoneOtp,
-      signOut,
-    ]
+    [session, initializing, signInWithEmail, signUpWithEmail, signOut]
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

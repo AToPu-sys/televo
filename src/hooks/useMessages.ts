@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { uploadChatMedia } from "../lib/media";
 import { supabase } from "../lib/supabase";
 import type { Database } from "../types/database";
+import { useE2ee } from "./useE2ee";
 
 type MessageRow = Database["public"]["Tables"]["messages"]["Row"];
 
@@ -10,17 +11,40 @@ export type ChatMessage = MessageRow & {
   /** Set while an optimistic message is still in flight. */
   pending?: boolean;
   failed?: boolean;
+  /** Set for encrypted conversations once the body has been decrypted client-side.
+   * `body` itself stays as the raw ciphertext envelope; render this instead. */
+  decryptedBody?: string | null;
 };
 
 const PAGE_SIZE = 50;
 
-export function useMessages(conversationId: string | undefined, userId: string | undefined) {
+export function useMessages(
+  conversationId: string | undefined,
+  userId: string | undefined,
+  isEncrypted: boolean = false
+) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   // Tracks optimistic ids so the realtime INSERT can replace them instead of
   // appending a duplicate when our own message echoes back.
   const optimisticIds = useRef(new Set<string>());
+  const { encryptForConversation, decryptForConversation } = useE2ee();
+
+  const decorateWithDecryption = useCallback(
+    async (rows: ChatMessage[]): Promise<ChatMessage[]> => {
+      if (!isEncrypted || !conversationId) return rows;
+
+      return Promise.all(
+        rows.map(async (row) => {
+          if (row.kind !== "text" || !row.body) return row;
+          const decrypted = await decryptForConversation(conversationId, row.body);
+          return { ...row, decryptedBody: decrypted };
+        })
+      );
+    },
+    [isEncrypted, conversationId, decryptForConversation]
+  );
 
   const load = useCallback(async () => {
     if (!conversationId) {
@@ -39,10 +63,10 @@ export function useMessages(conversationId: string | undefined, userId: string |
     if (queryError) {
       setError(queryError.message);
     } else {
-      setMessages(data ?? []);
+      setMessages(await decorateWithDecryption(data ?? []));
     }
     setLoading(false);
-  }, [conversationId]);
+  }, [conversationId, decorateWithDecryption]);
 
   useEffect(() => {
     setLoading(true);
@@ -64,25 +88,33 @@ export function useMessages(conversationId: string | undefined, userId: string |
         },
         (payload) => {
           const incoming = payload.new as MessageRow;
-          setMessages((current) => {
-            // Our own optimistic copy is already on screen — swap it for the
-            // server row rather than showing the message twice.
-            const withoutOptimistic = current.filter((message) => {
-              if (!message.pending) return true;
-              const isOurEcho =
-                message.sender_id === incoming.sender_id && message.body === incoming.body;
-              if (isOurEcho) {
-                optimisticIds.current.delete(message.id);
-                return false;
-              }
-              return true;
-            });
 
-            if (withoutOptimistic.some((message) => message.id === incoming.id)) {
-              return withoutOptimistic;
-            }
-            return [incoming, ...withoutOptimistic];
-          });
+          void (async () => {
+            const [decorated] = await decorateWithDecryption([incoming]);
+
+            setMessages((current) => {
+              // Our own optimistic copy is already on screen — swap it for the
+              // server row rather than showing the message twice. Compare by
+              // the ciphertext body when encrypted (plaintext bodies differ
+              // by nonce each time, so they'd never match).
+              const withoutOptimistic = current.filter((message) => {
+                if (!message.pending) return true;
+                const isOurEcho =
+                  message.sender_id === incoming.sender_id &&
+                  (isEncrypted || message.body === incoming.body);
+                if (isOurEcho) {
+                  optimisticIds.current.delete(message.id);
+                  return false;
+                }
+                return true;
+              });
+
+              if (withoutOptimistic.some((message) => message.id === decorated.id)) {
+                return withoutOptimistic;
+              }
+              return [decorated, ...withoutOptimistic];
+            });
+          })();
         }
       )
       .on(
@@ -103,7 +135,7 @@ export function useMessages(conversationId: string | undefined, userId: string |
     return () => {
       void supabase.removeChannel(channel);
     };
-  }, [conversationId]);
+  }, [conversationId, isEncrypted, decorateWithDecryption]);
 
   const sendMessage = useCallback(
     async (body: string) => {
@@ -118,7 +150,8 @@ export function useMessages(conversationId: string | undefined, userId: string |
         conversation_id: conversationId,
         sender_id: userId,
         kind: "text",
-        body: trimmed,
+        body: isEncrypted ? null : trimmed,
+        decryptedBody: isEncrypted ? trimmed : undefined,
         media_url: null,
         shared_activity_id: null,
         shared_profile_id: null,
@@ -127,14 +160,19 @@ export function useMessages(conversationId: string | undefined, userId: string |
       };
       setMessages((current) => [optimistic, ...current]);
 
-      const { error: insertError } = await supabase.from("messages").insert({
-        conversation_id: conversationId,
-        sender_id: userId,
-        kind: "text",
-        body: trimmed,
-      });
+      try {
+        const storedBody = isEncrypted
+          ? await encryptForConversation(conversationId, trimmed)
+          : trimmed;
 
-      if (insertError) {
+        const { error: insertError } = await supabase.from("messages").insert({
+          conversation_id: conversationId,
+          sender_id: userId,
+          kind: "text",
+          body: storedBody,
+        });
+        if (insertError) throw insertError;
+      } catch (error) {
         // Leave the bubble in place but mark it failed, so the text isn't lost.
         setMessages((current) =>
           current.map((message) =>
@@ -142,10 +180,10 @@ export function useMessages(conversationId: string | undefined, userId: string |
           )
         );
         optimisticIds.current.delete(optimisticId);
-        throw insertError;
+        throw error;
       }
     },
-    [conversationId, userId]
+    [conversationId, userId, isEncrypted, encryptForConversation]
   );
 
   const sendImage = useCallback(

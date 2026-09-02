@@ -1,11 +1,11 @@
 {
   "expo": {
-    "name": "Telegram Clone",
-    "slug": "telegram-clone",
+    "name": "Televo",
+    "slug": "televo",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
-    "scheme": "tgclone",
+    "scheme": "televo",
     "userInterfaceStyle": "automatic",
     "ios": {
       "supportsTablet": true,
@@ -32,6 +32,12 @@
         "expo-image-picker",
         {
           "photosPermission": "Allow $(PRODUCT_NAME) to access your photos so you can send them in chats."
+        }
+      ],
+      [
+        "expo-contacts",
+        {
+          "contactsPermission": "Allow $(PRODUCT_NAME) to access your contacts to find friends who are already here."
         }
       ]
     ],

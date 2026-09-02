@@ -330,6 +330,7 @@ export type Database = {
           created_at: string
           created_by: string
           id: string
+          is_encrypted: boolean
           kind: Database["public"]["Enums"]["conversation_kind"]
           title: string | null
           updated_at: string
@@ -338,6 +339,7 @@ export type Database = {
           created_at?: string
           created_by: string
           id?: string
+          is_encrypted?: boolean
           kind: Database["public"]["Enums"]["conversation_kind"]
           title?: string | null
           updated_at?: string
@@ -346,11 +348,47 @@ export type Database = {
           created_at?: string
           created_by?: string
           id?: string
+          is_encrypted?: boolean
           kind?: Database["public"]["Enums"]["conversation_kind"]
           title?: string | null
           updated_at?: string
         }
         Relationships: []
+      }
+      encrypted_session_keys: {
+        Row: {
+          conversation_id: string
+          created_at: string
+          encrypted_key: string
+          nonce: string
+          recipient_id: string
+          sender_public_key: string
+        }
+        Insert: {
+          conversation_id: string
+          created_at?: string
+          encrypted_key: string
+          nonce: string
+          recipient_id: string
+          sender_public_key: string
+        }
+        Update: {
+          conversation_id?: string
+          created_at?: string
+          encrypted_key?: string
+          nonce?: string
+          recipient_id?: string
+          sender_public_key?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "encrypted_session_keys_conversation_id_fkey"
+            columns: ["conversation_id"]
+            isOneToOne: false
+            referencedRelation: "conversations"
+            referencedColumns: ["id"]
+          },
+        ]
       }
       friendships: {
         Row: {
@@ -501,9 +539,11 @@ export type Database = {
           created_at: string
           default_activity_visibility: Database["public"]["Enums"]["activity_visibility"]
           display_name: string
+          e2e_public_key: string | null
           id: string
           language: string
           onboarding_completed_at: string | null
+          phone: string | null
           sports: string[]
           units: string
           updated_at: string
@@ -515,9 +555,11 @@ export type Database = {
           created_at?: string
           default_activity_visibility?: Database["public"]["Enums"]["activity_visibility"]
           display_name: string
+          e2e_public_key?: string | null
           id: string
           language?: string
           onboarding_completed_at?: string | null
+          phone?: string | null
           sports?: string[]
           units?: string
           updated_at?: string
@@ -529,9 +571,11 @@ export type Database = {
           created_at?: string
           default_activity_visibility?: Database["public"]["Enums"]["activity_visibility"]
           display_name?: string
+          e2e_public_key?: string | null
           id?: string
           language?: string
           onboarding_completed_at?: string | null
+          phone?: string | null
           sports?: string[]
           units?: string
           updated_at?: string

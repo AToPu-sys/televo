@@ -21,6 +21,7 @@ import { MessageBubble } from "../../src/components/MessageBubble";
 import { useAuth } from "../../src/hooks/useAuth";
 import { useCallManager } from "../../src/hooks/useCallManager";
 import { useConversation } from "../../src/hooks/useConversation";
+import { useE2ee } from "../../src/hooks/useE2ee";
 import { useMessages, type ChatMessage } from "../../src/hooks/useMessages";
 import { useTheme } from "../../src/hooks/useTheme";
 import { useTyping } from "../../src/hooks/useTyping";
@@ -32,10 +33,13 @@ export default function ConversationScreen() {
   const { user } = useAuth();
   const router = useRouter();
 
-  const { conversation, loading: loadingConversation } = useConversation(id, user?.id);
+  const { conversation, loading: loadingConversation, refresh: refreshConversation } =
+    useConversation(id, user?.id);
+  const isEncrypted = conversation?.isEncrypted ?? false;
   const { messages, loading, sendMessage, sendImage, deleteMessage, markRead } = useMessages(
     id,
-    user?.id
+    user?.id,
+    isEncrypted
   );
   const { typingLabel, notifyTyping } = useTyping(
     id,
@@ -43,9 +47,27 @@ export default function ConversationScreen() {
     user?.user_metadata?.display_name as string | undefined
   );
   const { placeCall, state: callState } = useCallManager();
+  const { startEncryptedChat } = useE2ee();
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
   const [attaching, setAttaching] = useState(false);
+  const [enablingEncryption, setEnablingEncryption] = useState(false);
+
+  async function handleEnableEncryption() {
+    if (!id || !conversation || conversation.kind !== "direct" || !conversation.otherUserId) return;
+    setEnablingEncryption(true);
+    try {
+      await startEncryptedChat(id, conversation.otherUserId);
+      await refreshConversation();
+    } catch (caught) {
+      Alert.alert(
+        "Couldn't start Secret Chat",
+        caught instanceof Error ? caught.message : "Please try again."
+      );
+    } finally {
+      setEnablingEncryption(false);
+    }
+  }
 
   function handleCall(kind: "audio" | "video") {
     if (!id || callState.phase !== "idle") return;
@@ -145,9 +167,14 @@ export default function ConversationScreen() {
         </Pressable>
         <Avatar name={title} uri={conversation?.avatarUrl ?? null} size={38} />
         <View style={styles.headerText}>
-          <Text style={[styles.headerTitle, { color: theme.text }]} numberOfLines={1}>
-            {loadingConversation ? "…" : title}
-          </Text>
+          <View style={styles.headerTitleRow}>
+            {isEncrypted ? (
+              <Ionicons name="lock-closed" size={13} color={theme.online} style={styles.lockIcon} />
+            ) : null}
+            <Text style={[styles.headerTitle, { color: theme.text }]} numberOfLines={1}>
+              {loadingConversation ? "…" : title}
+            </Text>
+          </View>
           {typingLabel ? (
             <Text style={[styles.headerSubtitle, { color: theme.accent }]} numberOfLines={1}>
               {typingLabel}
@@ -158,6 +185,22 @@ export default function ConversationScreen() {
             </Text>
           ) : null}
         </View>
+        {conversation?.kind === "direct" && !isEncrypted ? (
+          <Pressable
+            onPress={handleEnableEncryption}
+            disabled={enablingEncryption}
+            accessibilityRole="button"
+            accessibilityLabel="Start Secret Chat (end-to-end encrypted)"
+            hitSlop={10}
+            style={styles.headerAction}
+          >
+            {enablingEncryption ? (
+              <ActivityIndicator color={theme.accent} />
+            ) : (
+              <Ionicons name="lock-open-outline" size={22} color={theme.accent} />
+            )}
+          </Pressable>
+        ) : null}
         <Pressable
           onPress={() => handleCall("audio")}
           accessibilityRole="button"
@@ -286,7 +329,9 @@ const styles = StyleSheet.create({
     borderBottomWidth: StyleSheet.hairlineWidth,
   },
   headerText: { flex: 1 },
+  headerTitleRow: { flexDirection: "row", alignItems: "center" },
   headerTitle: { fontSize: 17, fontWeight: "600" },
+  lockIcon: { marginRight: 4 },
   headerSubtitle: { fontSize: 12 },
   list: { paddingHorizontal: spacing.md, paddingVertical: spacing.md, gap: 2 },
   center: { flex: 1, alignItems: "center", justifyContent: "center", padding: spacing.xl },

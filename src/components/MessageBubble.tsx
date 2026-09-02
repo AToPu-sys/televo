@@ -20,8 +20,9 @@ export function MessageBubble({ message, isOwn, onLongPress }: MessageBubbleProp
   const textColor = isOwn ? theme.bubbleOutText : theme.bubbleInText;
 
   return (
-    // The list is inverted, so each row is flipped back upright here.
-    <View style={[styles.row, styles.unflip, isOwn ? styles.alignEnd : styles.alignStart]}>
+    // The FlatList itself has `inverted` set, which already flips rendering
+    // order bottom-up — rows must NOT be re-flipped here, or text mirrors.
+    <View style={[styles.row, isOwn ? styles.alignEnd : styles.alignStart]}>
       <Pressable
         onLongPress={onLongPress ? () => onLongPress(message) : undefined}
         delayLongPress={350}
@@ -38,7 +39,15 @@ export function MessageBubble({ message, isOwn, onLongPress }: MessageBubbleProp
           <ChatImage path={message.media_url} pending={message.pending} />
         ) : null}
 
-        {message.body ? (
+        {message.decryptedBody !== undefined ? (
+          message.decryptedBody === null ? (
+            <Text style={[styles.text, styles.undecryptable, { color: textColor }]}>
+              🔒 Unable to decrypt this message
+            </Text>
+          ) : (
+            <Text style={[styles.text, { color: textColor }]}>{message.decryptedBody}</Text>
+          )
+        ) : message.body ? (
           <Text style={[styles.text, { color: textColor }]}>{message.body}</Text>
         ) : null}
 
@@ -131,7 +140,6 @@ function formatTime(iso: string) {
 
 const styles = StyleSheet.create({
   row: { flexDirection: "row", marginVertical: 2 },
-  unflip: { transform: [{ scaleY: -1 }] },
   alignStart: { justifyContent: "flex-start" },
   alignEnd: { justifyContent: "flex-end" },
   bubble: {
@@ -144,6 +152,7 @@ const styles = StyleSheet.create({
   bubbleOut: { borderBottomRightRadius: radius.xs },
   bubbleIn: { borderBottomLeftRadius: radius.xs },
   text: { fontSize: 16, lineHeight: 21 },
+  undecryptable: { fontStyle: "italic", opacity: 0.7 },
   media: { width: 220, height: 160, borderRadius: radius.md },
   mediaPlaceholder: { alignItems: "center", justifyContent: "center", gap: spacing.xs },
   mediaError: { fontSize: 12 },
