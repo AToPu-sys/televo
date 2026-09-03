@@ -1,10 +1,19 @@
 import { Ionicons } from "@expo/vector-icons";
+import { Directory, File, Paths } from "expo-file-system";
+import * as Sharing from "expo-sharing";
+import { useVideoPlayer, VideoView } from "expo-video";
 import { useEffect, useState } from "react";
-import { ActivityIndicator, Image, Pressable, StyleSheet, Text, View } from "react-native";
+import { ActivityIndicator, Alert, Image, Pressable, StyleSheet, Text, View } from "react-native";
 
 import { useTheme } from "../hooks/useTheme";
 import type { ChatMessage } from "../hooks/useMessages";
-import { fetchDecryptedMedia, parseMediaRef, signedChatMediaUrl } from "../lib/media";
+import {
+  fetchDecryptedBytes,
+  fetchDecryptedMedia,
+  mimeForPath,
+  parseMediaRef,
+  signedChatMediaUrl,
+} from "../lib/media";
 import { useE2ee } from "../hooks/useE2ee";
 import { radius, spacing } from "../theme";
 
@@ -77,12 +86,21 @@ export function MessageBubble({
           />
         ) : null}
 
+        {message.kind === "video" && message.media_url ? (
+          <ChatVideo
+            path={message.media_url}
+            pending={message.pending}
+            conversationId={message.conversation_id}
+          />
+        ) : null}
+
         {message.kind === "document" && message.media_url ? (
           <DocumentAttachment
             path={message.media_url}
             name={message.document_name}
             sizeBytes={message.document_size_bytes}
             textColor={textColor}
+            conversationId={message.conversation_id}
           />
         ) : null}
 
@@ -149,8 +167,11 @@ function ChatImage({
     const { nonce } = parseMediaRef(path);
 
     const load = nonce
-      ? fetchDecryptedMedia(path, (ciphertext, mediaNonce) =>
-          decryptBytesForConversation(conversationId ?? "", ciphertext, mediaNonce)
+      ? fetchDecryptedMedia(
+          path,
+          (ciphertext, mediaNonce) =>
+            decryptBytesForConversation(conversationId ?? "", ciphertext, mediaNonce),
+          mimeForPath(path)
         )
       : signedChatMediaUrl(path);
 
@@ -205,22 +226,193 @@ function formatFileSize(bytes: number | null) {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+/**
+ * Plays a video message. Resolves through the same path as ChatImage: a
+ * signed URL for plaintext media, or download-and-decrypt for Secret Chats.
+ * Videos previously had no render branch at all, so a sent video arrived as
+ * an empty bubble.
+ */
+function ChatVideo({
+  path,
+  pending,
+  conversationId,
+}: {
+  path: string;
+  pending?: boolean;
+  conversationId?: string;
+}) {
+  const { theme } = useTheme();
+  const { decryptBytesForConversation } = useE2ee();
+  const isLocal = path.startsWith("file:") || path.startsWith("content:");
+  const [uri, setUri] = useState<string | null>(isLocal ? path : null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    if (isLocal) {
+      setUri(path);
+      return;
+    }
+
+    let active = true;
+    const { nonce } = parseMediaRef(path);
+
+    const load = nonce
+      ? fetchDecryptedMedia(
+          path,
+          (ciphertext, mediaNonce) =>
+            decryptBytesForConversation(conversationId ?? "", ciphertext, mediaNonce),
+          mimeForPath(path)
+        )
+      : signedChatMediaUrl(path);
+
+    Promise.resolve(load)
+      .then((resolved) => {
+        if (!active) return;
+        if (resolved) setUri(resolved);
+        else setFailed(true);
+      })
+      .catch(() => {
+        if (active) setFailed(true);
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [path, isLocal, conversationId, decryptBytesForConversation]);
+
+  // The player must be created unconditionally — hooks cannot sit behind the
+  // early returns below. A null source simply leaves it idle until the URI
+  // resolves.
+  const player = useVideoPlayer(uri, (instance) => {
+    instance.loop = false;
+  });
+
+  if (failed) {
+    return (
+      <View style={[styles.media, styles.mediaPlaceholder, { backgroundColor: theme.surfaceElevated }]}>
+        <Ionicons name="videocam-outline" size={28} color={theme.textSecondary} />
+        <Text style={[styles.mediaError, { color: theme.textSecondary }]}>Video unavailable</Text>
+      </View>
+    );
+  }
+
+  if (!uri) {
+    return (
+      <View style={[styles.media, styles.mediaPlaceholder, { backgroundColor: theme.surfaceElevated }]}>
+        <ActivityIndicator color={theme.accent} />
+      </View>
+    );
+  }
+
+  return (
+    <View>
+      <VideoView
+        player={player}
+        style={styles.media}
+        nativeControls
+        allowsFullscreen
+        contentFit="cover"
+      />
+      {pending ? (
+        <View style={styles.uploadOverlay}>
+          <ActivityIndicator color="#FFFFFF" />
+        </View>
+      ) : null}
+    </View>
+  );
+}
+
+/**
+ * A document message. Tapping it saves the file to the app's cache and hands
+ * it to the OS share sheet, which is what lets the user actually open it in
+ * Files, Quick Look, or another app — previously this was an inert row and
+ * an attached document could never be opened.
+ */
 function DocumentAttachment({
   path,
   name,
   sizeBytes,
   textColor,
+  conversationId,
 }: {
   path: string;
   name: string | null;
   sizeBytes: number | null;
   textColor: string;
+  conversationId?: string;
 }) {
   const { theme } = useTheme();
+  const { decryptBytesForConversation } = useE2ee();
+  const [busy, setBusy] = useState(false);
+
+  const open = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      if (!(await Sharing.isAvailableAsync())) {
+        Alert.alert("Not supported", "This device can't open attachments.");
+        return;
+      }
+
+      // Save under the name the sender gave it, not the storage key, so the
+      // file arrives in Files/Quick Look correctly named.
+      const { nonce } = parseMediaRef(path);
+      const safeName = (name ?? "document").replace(/[^a-zA-Z0-9._-]/g, "_");
+
+      // A dedicated subdirectory keeps one attachment from overwriting
+      // another that happens to share a filename.
+      const folder = new Directory(Paths.cache, "attachments");
+      if (!folder.exists) folder.create({ intermediates: true });
+
+      // `File` here is expo-file-system's class, which TypeScript's DOM lib
+      // also declares; the alias keeps the two from being confused.
+      const target = new File(folder, safeName);
+      if (target.exists) target.delete();
+
+      if (nonce) {
+        // Secret Chat: the stored bytes are ciphertext, so they have to be
+        // downloaded and decrypted before anything can open them.
+        const plain = await fetchDecryptedBytes(path, (ciphertext, mediaNonce) =>
+          decryptBytesForConversation(conversationId ?? "", ciphertext, mediaNonce)
+        );
+        if (!plain) {
+          Alert.alert("Unavailable", "This file could not be decrypted.");
+          return;
+        }
+        target.create();
+        target.write(plain);
+      } else {
+        const url = await signedChatMediaUrl(path);
+        // The download writes into `target`. Its declared return type in
+        // expo-file-system 19 resolves to the DOM `File` rather than the
+        // filesystem one (an upstream typing bug), so the result is ignored
+        // and the handle created above is used instead.
+        await File.downloadFileAsync(url, target);
+      }
+
+      await Sharing.shareAsync(target.uri, {
+        mimeType: mimeForPath(path),
+        dialogTitle: safeName,
+      });
+    } catch {
+      Alert.alert("Unavailable", "This file could not be opened.");
+    } finally {
+      setBusy(false);
+    }
+  };
 
   return (
-    <View style={styles.documentRow}>
-      <Ionicons name="document-text-outline" size={28} color={textColor} />
+    <Pressable
+      onPress={open}
+      accessibilityRole="button"
+      accessibilityLabel={`Open ${name ?? "document"}`}
+      style={styles.documentRow}
+    >
+      {busy ? (
+        <ActivityIndicator color={textColor} style={styles.documentIcon} />
+      ) : (
+        <Ionicons name="document-text-outline" size={28} color={textColor} />
+      )}
       <View style={styles.documentText}>
         <Text style={[styles.documentName, { color: textColor }]} numberOfLines={1}>
           {name ?? "Document"}
@@ -229,7 +421,7 @@ function DocumentAttachment({
           {formatFileSize(sizeBytes)}
         </Text>
       </View>
-    </View>
+    </Pressable>
   );
 }
 
@@ -306,6 +498,7 @@ const styles = StyleSheet.create({
     backgroundColor: "rgba(0,0,0,0.35)",
     borderRadius: radius.md,
   },
+  documentIcon: { width: 28 },
   documentRow: { flexDirection: "row", alignItems: "center", gap: spacing.sm, minWidth: 180 },
   documentText: { flex: 1, gap: 2 },
   documentName: { fontSize: 14, fontWeight: "600" },

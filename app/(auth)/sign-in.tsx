@@ -1,15 +1,9 @@
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
 import { useState } from "react";
-import {
-  KeyboardAvoidingView,
-  Platform,
-  Pressable,
-  ScrollView,
-  StyleSheet,
-  Text,
-  View,
-} from "react-native";
+import { KeyboardAvoidingView, Linking, Platform, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+
+import { PRIVACY_URL, TERMS_URL } from "../../src/lib/legal";
 import { SafeAreaView } from "react-native-safe-area-context";
 
 import { Button } from "../../src/components/Button";
@@ -155,6 +149,31 @@ export default function SignInScreen() {
               <Text style={[styles.notice, { color: theme.accent }]}>{notice}</Text>
             ) : null}
 
+            {/* App Review requires an explicit agreement to terms for apps
+                with user-generated content (Guideline 1.2), and the privacy
+                policy has to be reachable from inside the app. */}
+            {isSignUp ? (
+              <Text style={[styles.legal, { color: theme.textSecondary }]}>
+                By creating an account you agree to the{" "}
+                <Text
+                  style={[styles.legalLink, { color: theme.accent }]}
+                  onPress={() => Linking.openURL(TERMS_URL)}
+                  accessibilityRole="link"
+                >
+                  Terms of Service
+                </Text>{" "}
+                and{" "}
+                <Text
+                  style={[styles.legalLink, { color: theme.accent }]}
+                  onPress={() => Linking.openURL(PRIVACY_URL)}
+                  accessibilityRole="link"
+                >
+                  Privacy Policy
+                </Text>
+                , including a zero-tolerance policy for abusive content.
+              </Text>
+            ) : null}
+
             <Button
               title={isSignUp ? "Create account" : "Sign in"}
               onPress={handleSubmit}
@@ -186,4 +205,6 @@ const styles = StyleSheet.create({
   form: { gap: spacing.lg },
   error: { fontSize: 14 },
   notice: { fontSize: 14 },
+  legal: { fontSize: 12, lineHeight: 17 },
+  legalLink: { textDecorationLine: "underline" },
 });

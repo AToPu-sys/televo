@@ -134,10 +134,64 @@ export function parseMediaRef(ref: string): { path: string; nonce: string | null
     : { path: ref.slice(0, hash), nonce: ref.slice(hash + 1) };
 }
 
+/** Base64-encodes bytes in chunks. Building the binary string one character
+ * at a time is O(n^2) in JS engines and janks the UI on a multi-MB video;
+ * String.fromCharCode over a bounded slice avoids both that and the argument
+ * -count limit that a single spread would hit. */
+function toBase64(bytes: Uint8Array): string {
+  const CHUNK = 0x8000;
+  let binary = "";
+  for (let index = 0; index < bytes.length; index += CHUNK) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + CHUNK));
+  }
+  return btoa(binary);
+}
+
+/** Guesses a MIME type from a stored path so decrypted bytes get a data URI
+ * the platform will actually play or display. This used to be hardcoded to
+ * image/jpeg, which silently broke every encrypted video and document. */
+export function mimeForPath(path: string): string {
+  const match = /\.([a-zA-Z0-9]+)(?:#|\?|$)/.exec(path);
+  switch (match?.[1].toLowerCase()) {
+    case "png":
+      return "image/png";
+    case "webp":
+      return "image/webp";
+    case "gif":
+      return "image/gif";
+    case "mp4":
+      return "video/mp4";
+    case "mov":
+      return "video/quicktime";
+    case "pdf":
+      return "application/pdf";
+    default:
+      return "image/jpeg";
+  }
+}
+
+/** Downloads encrypted media and returns the decrypted RAW BYTES.
+ *
+ * Used for files that are written to disk (documents), where going through a
+ * base64 data URI would just be wasted work and memory. */
+export async function fetchDecryptedBytes(
+  ref: string,
+  decryptor: (ciphertext: Uint8Array, nonce: string) => Promise<Uint8Array | null>
+): Promise<Uint8Array | null> {
+  const { path, nonce } = parseMediaRef(ref);
+  if (!nonce) return null;
+
+  const { data, error } = await supabase.storage.from("chat-media").download(path);
+  if (error || !data) return null;
+
+  return await decryptor(new Uint8Array(await data.arrayBuffer()), nonce);
+}
+
 /** Downloads encrypted media and returns a data URI the app can render. */
 export async function fetchDecryptedMedia(
   ref: string,
-  decryptor: (ciphertext: Uint8Array, nonce: string) => Promise<Uint8Array | null>
+  decryptor: (ciphertext: Uint8Array, nonce: string) => Promise<Uint8Array | null>,
+  mimeType?: string
 ): Promise<string | null> {
   const { path, nonce } = parseMediaRef(ref);
   if (!nonce) return null;
@@ -148,11 +202,7 @@ export async function fetchDecryptedMedia(
   const plain = await decryptor(new Uint8Array(await data.arrayBuffer()), nonce);
   if (!plain) return null;
 
-  let binary = "";
-  for (let index = 0; index < plain.length; index += 1) {
-    binary += String.fromCharCode(plain[index]);
-  }
-  return `data:image/jpeg;base64,${btoa(binary)}`;
+  return `data:${mimeType ?? mimeForPath(path)};base64,${toBase64(plain)}`;
 }
 
 /**

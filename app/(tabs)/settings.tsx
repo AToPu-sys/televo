@@ -1,7 +1,7 @@
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
 import { useEffect, useState } from "react";
-import { Alert, Pressable, ScrollView, StyleSheet, Switch, Text, View } from "react-native";
+import { Alert, Linking, Pressable, ScrollView, StyleSheet, Switch, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
 import { Avatar } from "../../src/components/Avatar";
@@ -9,6 +9,7 @@ import { Button } from "../../src/components/Button";
 import { TextField } from "../../src/components/TextField";
 import { useAuth } from "../../src/hooks/useAuth";
 import { useTheme } from "../../src/hooks/useTheme";
+import { PRIVACY_URL, TERMS_URL } from "../../src/lib/legal";
 import { supabase } from "../../src/lib/supabase";
 import { radius, spacing } from "../../src/theme";
 
@@ -232,6 +233,34 @@ export default function SettingsScreen() {
             <Text style={[styles.settingText, { color: theme.text }]}>Privacy & Security</Text>
           </View>
           <Ionicons name="chevron-forward" size={18} color={theme.textSecondary} />
+        </Pressable>
+
+        {/* App Review checks that the privacy policy and terms are reachable
+            from inside the app, not only from the store listing. */}
+        <Pressable
+          onPress={() => Linking.openURL(TERMS_URL)}
+          accessibilityRole="link"
+          accessibilityLabel="Terms of Service"
+          style={[styles.section, styles.settingRow, { backgroundColor: theme.surfaceElevated }]}
+        >
+          <View style={styles.settingLabel}>
+            <Ionicons name="document-text-outline" size={20} color={theme.accent} />
+            <Text style={[styles.settingText, { color: theme.text }]}>Terms of Service</Text>
+          </View>
+          <Ionicons name="open-outline" size={18} color={theme.textSecondary} />
+        </Pressable>
+
+        <Pressable
+          onPress={() => Linking.openURL(PRIVACY_URL)}
+          accessibilityRole="link"
+          accessibilityLabel="Privacy Policy"
+          style={[styles.section, styles.settingRow, { backgroundColor: theme.surfaceElevated }]}
+        >
+          <View style={styles.settingLabel}>
+            <Ionicons name="shield-checkmark-outline" size={20} color={theme.accent} />
+            <Text style={[styles.settingText, { color: theme.text }]}>Privacy Policy</Text>
+          </View>
+          <Ionicons name="open-outline" size={18} color={theme.textSecondary} />
         </Pressable>
 
         <View style={[styles.section, { backgroundColor: theme.surfaceElevated }]}>

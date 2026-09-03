@@ -9,22 +9,34 @@
     "userInterfaceStyle": "automatic",
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.tgclone.app",
+      "bundleIdentifier": "com.televo.app",
       "infoPlist": {
-        "ITSAppUsesNonExemptEncryption": false,
+        "ITSAppUsesNonExemptEncryption": true,
         "NSMicrophoneUsageDescription": "Televo uses your microphone for voice and video calls.",
-        "NSCameraUsageDescription": "Televo uses your camera for video calls."
-      }
+        "NSCameraUsageDescription": "Televo uses your camera for video calls.",
+        "NSPhotoLibraryUsageDescription": "Televo needs access to your photos so you can send them in chats.",
+        "NSPhotoLibraryAddUsageDescription": "Televo saves photos and videos you download from chats to your library.",
+        "NSContactsUsageDescription": "Televo uses your contacts to find friends who already use Televo. Contacts are hashed before they are sent and are never stored in the clear.",
+        "NSFaceIDUsageDescription": "Televo uses Face ID to unlock the app.",
+        "UIBackgroundModes": [
+          "audio",
+          "voip",
+          "remote-notification"
+        ],
+        "ITSAppUsesEncryptionExemption": true
+      },
+      "buildNumber": "1"
     },
     "android": {
-      "package": "com.tgclone.app",
+      "package": "com.televo.app",
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/android-icon-foreground.png",
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
       },
-      "predictiveBackGestureEnabled": false
+      "predictiveBackGestureEnabled": false,
+      "versionCode": 1
     },
     "web": {
       "favicon": "./assets/favicon.png",
@@ -52,7 +64,8 @@
           "color": "#3390EC"
         }
       ],
-      "expo-audio"
+      "expo-audio",
+      "expo-video"
     ],
     "experiments": {
       "typedRoutes": true
