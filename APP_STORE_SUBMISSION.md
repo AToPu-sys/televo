@@ -89,18 +89,40 @@ Claude-powered answers — so it degrades honestly rather than looking broken.
 Shipping it in the current degraded state is defensible but weak: a reviewer
 may still read "assistant that can't assist" as an incomplete feature.
 
-### 3.2 Push notifications need a real build
+### 3.2 The app no longer runs in Expo Go
 
-Expo Go cannot receive push notifications on Android since SDK 53, and on iOS
-they require a provisioned build. This only affects Expo Go testing — a
-TestFlight/App Store build handles push normally.
+Calls use `react-native-webrtc`, a native module. Expo Go cannot load it, so
+development now needs a development build:
+
+```bash
+eas build --profile development --platform ios
+```
+
+Install that build once, then `npx expo start --dev-client` works the same way
+Expo Go did — the QR code still applies.
+
+This was not a choice. Calls in Expo Go were impossible: the old engine ran
+browser WebRTC in a WebView, and a WebView page loaded from an inline `html`
+source has a non-secure origin, where iOS leaves `navigator.mediaDevices`
+undefined. The mic and camera were never requested, which is why no permission
+prompt ever appeared and calls could not be answered.
+
+Push notifications also require a real build (Expo Go dropped Android push in
+SDK 53), so both now come together.
 
 ### 3.3 Calls are not verified on real hardware
 
-The signaling layer passes its automated suite (8/8), but a two-device audio
-and video call has never been confirmed end to end. **Test this before
-submitting** — a reviewer who taps Call and gets nothing is a Guideline 2.1
-rejection.
+The signaling layer passes its automated suite (8/8) and the engine is now
+native, but a two-device audio and video call has never been confirmed end to
+end. **Test this before submitting** — a reviewer who taps Call and gets
+nothing is a Guideline 2.1 rejection.
+
+Check specifically:
+- iOS shows the microphone prompt on the first call, and the camera prompt on
+  the first video call
+- both sides hear each other over mobile data, not only Wi-Fi (this is what
+  exercises the TURN relay)
+- declining, hanging up, and a missed call all end cleanly on both devices
 
 ### 3.4 No forward secrecy
 
