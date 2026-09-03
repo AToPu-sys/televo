@@ -1,7 +1,7 @@
 // Free public TURN service (Open Relay Project) for NAT traversal, plus
 // Google's public STUN server. This is fine for development and light usage;
 // swap in dedicated TURN credentials for production load. Passed straight
-// through to the WebView bridge's RTCPeerConnection config as JSON.
+// through to the native RTCPeerConnection config.
 export const ICE_SERVERS = [
   { urls: "stun:stun.l.google.com:19302" },
   {

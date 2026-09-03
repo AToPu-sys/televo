@@ -34,11 +34,16 @@ type Signal =
   | { type: "callee-ready" };
 
 /**
- * The actual media engine lives inside a hidden WebView (see WebRtcBridge +
- * webrtcBridgeHtml) — plain browser getUserMedia/RTCPeerConnection, which
- * Expo Go's WebView already supports without a custom native module. This
- * hook owns the call state machine and signaling; it talks to the bridge only
- * through JSON commands/events, never touching WebRTC types directly.
+ * The media engine is native WebRTC (see WebRtcBridge, backed by
+ * react-native-webrtc). This hook owns the call state machine and signaling;
+ * it talks to the engine only through commands/events and never touches
+ * WebRTC types directly.
+ *
+ * This previously ran browser WebRTC inside a WebView so it would work in
+ * Expo Go. That could never have worked: the page was served from an inline
+ * html source, so its origin is not secure and WKWebView leaves
+ * navigator.mediaDevices undefined — the mic and camera were never
+ * requested. Calls now require a development build.
  */
 /** How long an unanswered call keeps ringing before it's marked missed. */
 const RING_TIMEOUT_MS = 45_000;
@@ -340,14 +345,18 @@ export function useCall(userId: string | undefined) {
       } else if (event.type === "ice-candidate") {
         sendSignal({ type: "ice-candidate", candidate: event.candidate });
       }
-      // "log" / "error" / "local-ready" / "connection-state" are diagnostic
-      // only in this app; surface them via console rather than call state.
       if (event.type === "error") {
         // eslint-disable-next-line no-console
-        console.warn("[call bridge]", event.message);
+        console.warn("[call engine]", event.message);
+        // A media failure is fatal to the call: without a microphone there is
+        // nothing to send. This used to be logged and swallowed, so a denied
+        // permission left the call sitting on "Connecting..." forever with no
+        // explanation. Ending it surfaces the failure in the UI instead.
+        setState({ phase: "ended", reason: "failed" });
+        cleanup();
       }
     },
-    [sendSignal]
+    [sendSignal, cleanup]
   );
 
   // Missed-call timeout. Without this an unanswered call rings forever on

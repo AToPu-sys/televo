@@ -1,8 +1,13 @@
-import { forwardRef, useImperativeHandle, useRef } from "react";
+import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react";
 import { StyleSheet, View } from "react-native";
-import WebView from "react-native-webview";
-
-import { WEBRTC_BRIDGE_HTML } from "../lib/webrtcBridgeHtml";
+import {
+  MediaStream,
+  RTCIceCandidate,
+  RTCPeerConnection,
+  RTCSessionDescription,
+  RTCView,
+  mediaDevices,
+} from "react-native-webrtc";
 
 export type BridgeEvent =
   | { type: "ready" }
@@ -24,53 +29,218 @@ type WebRtcBridgeProps = {
   visible: boolean;
 };
 
+type Command =
+  | { type: "start-local"; video?: boolean }
+  | { type: "create-offer"; iceServers: RTCIceServer[]; video?: boolean }
+  | { type: "create-answer"; iceServers: RTCIceServer[]; sdp: string; video?: boolean }
+  | { type: "accept-answer"; sdp: string }
+  | { type: "ice-candidate"; candidate: RTCIceCandidateInit }
+  | { type: "set-mic"; enabled: boolean }
+  | { type: "set-camera"; enabled: boolean }
+  | { type: "hangup" };
+
 /**
- * Hosts the browser-WebRTC page from webrtcBridgeHtml.ts. The WebView itself
- * IS the WebRTC engine here — getUserMedia/RTCPeerConnection run inside its
- * browser context, which Expo Go already supports without any native module.
- * React Native only ever sees JSON events in and JSON commands out.
+ * The real media engine: native WebRTC via react-native-webrtc.
+ *
+ * This replaces a WebView that ran browser WebRTC inside an HTML page. That
+ * approach cannot work: the page was loaded from an inline `html` source, so
+ * its origin is `about:blank`, and WKWebView refuses getUserMedia on a
+ * non-secure origin — `navigator.mediaDevices` is simply undefined there. The
+ * call therefore threw before iOS ever showed a microphone or camera prompt,
+ * which is why calls never opened the mic and could not be answered.
+ *
+ * The command/event contract is unchanged, so useCall's state machine and
+ * signaling are untouched. Requires a development build; react-native-webrtc
+ * is a native module and is not present in Expo Go.
  */
 export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(function WebRtcBridge(
   { onEvent, visible },
   ref
 ) {
-  const webviewRef = useRef<WebView>(null);
+  const pcRef = useRef<RTCPeerConnection | null>(null);
+  const localStreamRef = useRef<MediaStream | null>(null);
+  // ICE candidates that arrive before the remote description is set cannot be
+  // added yet; WebRTC rejects them. They are queued and flushed afterwards.
+  const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
+  const [localUrl, setLocalUrl] = useState<string | null>(null);
+  const [remoteUrl, setRemoteUrl] = useState<string | null>(null);
+
+  // onEvent is read through a ref so the imperative handle never goes stale
+  // mid-call if the parent re-renders with a new callback identity.
+  const onEventRef = useRef(onEvent);
+  onEventRef.current = onEvent;
+  const post = (event: BridgeEvent) => onEventRef.current(event);
+
+  useEffect(() => {
+    post({ type: "ready" });
+    // Teardown on unmount: a surviving stream keeps the mic light on.
+    return () => {
+      localStreamRef.current?.getTracks().forEach((track) => track.stop());
+      pcRef.current?.close();
+      localStreamRef.current = null;
+      pcRef.current = null;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useImperativeHandle(ref, () => ({
     send(command: object) {
-      const script = `document.dispatchEvent(new MessageEvent("message", { data: ${JSON.stringify(
-        JSON.stringify(command)
-      )} })); true;`;
-      webviewRef.current?.injectJavaScript(script);
+      void handleCommand(command as Command);
     },
   }));
 
+  async function getMedia(video: boolean) {
+    if (localStreamRef.current) return localStreamRef.current;
+
+    // This is what triggers the native iOS microphone/camera permission
+    // prompt — the thing the WebView could never reach.
+    const stream = await mediaDevices.getUserMedia({
+      audio: true,
+      video: video ? { facingMode: "user" } : false,
+    });
+
+    localStreamRef.current = stream as MediaStream;
+    setLocalUrl((stream as MediaStream).toURL());
+    post({ type: "local-ready" });
+    return stream as MediaStream;
+  }
+
+  function createPeer(iceServers: RTCIceServer[]) {
+    const pc = new RTCPeerConnection({ iceServers });
+
+    // react-native-webrtc types these callbacks as a bare Event<string>
+    // without the payload fields, so the runtime shapes are annotated here.
+    pc.onicecandidate = (event: unknown) => {
+      const { candidate } = event as { candidate: RTCIceCandidate | null };
+      if (candidate) {
+        post({ type: "ice-candidate", candidate: candidate.toJSON() });
+      }
+    };
+
+    pc.ontrack = (event: unknown) => {
+      const [stream] = (event as { streams: MediaStream[] }).streams ?? [];
+      if (stream) setRemoteUrl(stream.toURL());
+    };
+
+    pc.onconnectionstatechange = () => {
+      post({ type: "connection-state", state: pc.connectionState ?? "unknown" });
+    };
+
+    pcRef.current = pc;
+    return pc;
+  }
+
+  async function flushCandidates(pc: RTCPeerConnection) {
+    const queued = pendingCandidatesRef.current;
+    pendingCandidatesRef.current = [];
+    for (const candidate of queued) {
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch {
+        // A candidate that no longer applies is not fatal to the call.
+      }
+    }
+  }
+
+  async function handleCommand(command: Command) {
+    try {
+      if (command.type === "start-local") {
+        await getMedia(!!command.video);
+        return;
+      }
+
+      if (command.type === "create-offer") {
+        const stream = await getMedia(!!command.video);
+        const pc = createPeer(command.iceServers);
+        stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+
+        const offer = await pc.createOffer({});
+        await pc.setLocalDescription(offer);
+        post({ type: "offer", sdp: offer.sdp ?? "" });
+        return;
+      }
+
+      if (command.type === "create-answer") {
+        const stream = await getMedia(!!command.video);
+        const pc = createPeer(command.iceServers);
+        stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+
+        await pc.setRemoteDescription(
+          new RTCSessionDescription({ type: "offer", sdp: command.sdp })
+        );
+        await flushCandidates(pc);
+
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        post({ type: "answer", sdp: answer.sdp ?? "" });
+        return;
+      }
+
+      if (command.type === "accept-answer") {
+        const pc = pcRef.current;
+        if (!pc) return;
+        await pc.setRemoteDescription(
+          new RTCSessionDescription({ type: "answer", sdp: command.sdp })
+        );
+        await flushCandidates(pc);
+        return;
+      }
+
+      if (command.type === "ice-candidate") {
+        const pc = pcRef.current;
+        // Queue until there is a peer WITH a remote description, otherwise
+        // addIceCandidate throws and the candidate is lost.
+        if (!pc || !pc.remoteDescription) {
+          pendingCandidatesRef.current.push(command.candidate);
+          return;
+        }
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(command.candidate));
+        } catch {
+          // Stale candidate; not fatal.
+        }
+        return;
+      }
+
+      if (command.type === "set-mic") {
+        localStreamRef.current?.getAudioTracks().forEach((track) => {
+          track.enabled = command.enabled;
+        });
+        return;
+      }
+
+      if (command.type === "set-camera") {
+        localStreamRef.current?.getVideoTracks().forEach((track) => {
+          track.enabled = command.enabled;
+        });
+        return;
+      }
+
+      if (command.type === "hangup") {
+        localStreamRef.current?.getTracks().forEach((track) => track.stop());
+        pcRef.current?.close();
+        localStreamRef.current = null;
+        pcRef.current = null;
+        pendingCandidatesRef.current = [];
+        setLocalUrl(null);
+        setRemoteUrl(null);
+      }
+    } catch (error) {
+      post({
+        type: "error",
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
   return (
     <View style={visible ? styles.visible : styles.hidden} pointerEvents="none">
-      <WebView
-        ref={webviewRef}
-        originWhitelist={["*"]}
-        source={{ html: WEBRTC_BRIDGE_HTML }}
-        onMessage={(event) => {
-          try {
-            const parsed = JSON.parse(event.nativeEvent.data) as BridgeEvent;
-            onEvent(parsed);
-          } catch {
-            // Ignore malformed frames rather than crashing the call.
-          }
-        }}
-        // Required for getUserMedia to fire without a tap inside the page.
-        mediaPlaybackRequiresUserAction={false}
-        allowsInlineMediaPlayback
-        mediaCapturePermissionGrantType="grant"
-        // Android: this react-native-webview version doesn't expose
-        // onPermissionRequest, but Expo Go's own WebView host already
-        // auto-grants getUserMedia by default, so no handler is needed here.
-        // If this ever moves to a standalone/dev build on a newer webview
-        // version, add onPermissionRequest to explicitly grant camera/mic.
-        javaScriptEnabled
-        domStorageEnabled
-      />
+      {remoteUrl ? (
+        <RTCView streamURL={remoteUrl} style={styles.remote} objectFit="cover" />
+      ) : null}
+      {localUrl ? (
+        <RTCView streamURL={localUrl} style={styles.local} objectFit="cover" zOrder={1} mirror />
+      ) : null}
     </View>
   );
 });
@@ -78,6 +248,8 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
 const styles = StyleSheet.create({
   visible: StyleSheet.absoluteFillObject,
   // Off-screen rather than unmounted: keeps the peer connection and mic/cam
-  // streams alive for audio-only calls without showing video surfaces.
-  hidden: { position: "absolute", width: 1, height: 1, opacity: 0, top: -9999, left: -9999 },
+  // alive for an audio call without the video surfaces covering the UI.
+  hidden: { position: "absolute", width: 1, height: 1, top: -1000, left: -1000, opacity: 0 },
+  remote: { ...StyleSheet.absoluteFillObject },
+  local: { position: "absolute", right: 16, top: 60, width: 100, height: 150, borderRadius: 12 },
 });
