@@ -23,6 +23,26 @@ type WebhookPayload = {
   };
 };
 
+/**
+ * Posts a visible message into the assistant thread when a reply cannot be
+ * generated. Without this the function just returned an error status and the
+ * user was left staring at a chat that never answers — which reads as a
+ * broken feature (and is an App Review failure under Guideline 2.1).
+ */
+async function postFallback(
+  admin: ReturnType<typeof createClient>,
+  conversationId: string,
+  text: string
+) {
+  const { error } = await admin.from("messages").insert({
+    conversation_id: conversationId,
+    sender_id: ASSISTANT_USER_ID,
+    kind: "text",
+    body: text,
+  });
+  if (error) console.error("Failed to post assistant fallback:", error.message);
+}
+
 Deno.serve(async (req) => {
   // Deployed with --no-verify-jwt because the caller is a Postgres webhook,
   // not a client holding a Supabase auth session — so this endpoint is
@@ -59,12 +79,20 @@ Deno.serve(async (req) => {
   const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
   const anthropicApiKey = Deno.env.get("ANTHROPIC_API_KEY");
 
+  // The admin client is built BEFORE the key check so an unconfigured or
+  // failing upstream can still post a visible reply rather than leaving the
+  // user with a chat that silently never answers.
+  const admin = createClient(supabaseUrl, serviceRoleKey);
+
   if (!anthropicApiKey) {
     console.error("ANTHROPIC_API_KEY is not configured");
+    await postFallback(
+      admin,
+      message.conversation_id,
+      "The assistant is unavailable right now. Everything else in Televo works normally — you can keep chatting and calling as usual."
+    );
     return new Response("server not configured", { status: 500 });
   }
-
-  const admin = createClient(supabaseUrl, serviceRoleKey);
 
   // Confirm the assistant is actually a participant in this conversation —
   // the webhook already filters by table/event, but this keeps the function
@@ -115,6 +143,11 @@ Deno.serve(async (req) => {
   if (!claudeResponse.ok) {
     const errorText = await claudeResponse.text();
     console.error("Claude API error:", claudeResponse.status, errorText);
+    await postFallback(
+      admin,
+      message.conversation_id,
+      "The assistant is unavailable right now. Everything else in Televo works normally — you can keep chatting and calling as usual."
+    );
     return new Response("upstream error", { status: 502 });
   }
 
