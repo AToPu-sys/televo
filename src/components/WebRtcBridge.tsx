@@ -1,13 +1,11 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react";
 import { StyleSheet, View } from "react-native";
-import {
+import type {
   MediaStream,
-  RTCIceCandidate,
-  RTCPeerConnection,
-  RTCSessionDescription,
-  RTCView,
-  mediaDevices,
+  RTCPeerConnection as RTCPeerConnectionType,
 } from "react-native-webrtc";
+
+import { getWebRtc } from "../lib/webrtcModule";
 
 export type BridgeEvent =
   | { type: "ready" }
@@ -57,7 +55,7 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
   { onEvent, visible },
   ref
 ) {
-  const pcRef = useRef<RTCPeerConnection | null>(null);
+  const pcRef = useRef<RTCPeerConnectionType | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   // ICE candidates that arrive before the remote description is set cannot be
   // added yet; WebRTC rejects them. They are queued and flushed afterwards.
@@ -92,9 +90,16 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
   async function getMedia(video: boolean) {
     if (localStreamRef.current) return localStreamRef.current;
 
+    const webrtc = getWebRtc();
+    if (!webrtc) {
+      throw new Error(
+        "Calls need a development build — the native WebRTC module isn't available in Expo Go."
+      );
+    }
+
     // This is what triggers the native iOS microphone/camera permission
     // prompt — the thing the WebView could never reach.
-    const stream = await mediaDevices.getUserMedia({
+    const stream = await webrtc.mediaDevices.getUserMedia({
       audio: true,
       video: video ? { facingMode: "user" } : false,
     });
@@ -106,7 +111,9 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
   }
 
   function createPeer(iceServers: RTCIceServer[]) {
-    const pc = new RTCPeerConnection({ iceServers });
+    const webrtc = getWebRtc();
+    if (!webrtc) throw new Error("Calls need a development build.");
+    const pc = new webrtc.RTCPeerConnection({ iceServers });
 
     // react-native-webrtc types these callbacks as a bare Event<string>
     // without the payload fields, so the runtime shapes are annotated here.
@@ -130,12 +137,14 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
     return pc;
   }
 
-  async function flushCandidates(pc: RTCPeerConnection) {
+  async function flushCandidates(pc: RTCPeerConnectionType) {
+    const webrtc = getWebRtc();
+    if (!webrtc) return;
     const queued = pendingCandidatesRef.current;
     pendingCandidatesRef.current = [];
     for (const candidate of queued) {
       try {
-        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+        await pc.addIceCandidate(new webrtc.RTCIceCandidate(candidate));
       } catch {
         // A candidate that no longer applies is not fatal to the call.
       }
@@ -162,11 +171,13 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
 
       if (command.type === "create-answer") {
         const stream = await getMedia(!!command.video);
+        const webrtc = getWebRtc();
+        if (!webrtc) return;
         const pc = createPeer(command.iceServers);
         stream.getTracks().forEach((track) => pc.addTrack(track, stream));
 
         await pc.setRemoteDescription(
-          new RTCSessionDescription({ type: "offer", sdp: command.sdp })
+          new webrtc.RTCSessionDescription({ type: "offer", sdp: command.sdp })
         );
         await flushCandidates(pc);
 
@@ -178,9 +189,10 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
 
       if (command.type === "accept-answer") {
         const pc = pcRef.current;
-        if (!pc) return;
+        const webrtc = getWebRtc();
+        if (!pc || !webrtc) return;
         await pc.setRemoteDescription(
-          new RTCSessionDescription({ type: "answer", sdp: command.sdp })
+          new webrtc.RTCSessionDescription({ type: "answer", sdp: command.sdp })
         );
         await flushCandidates(pc);
         return;
@@ -188,6 +200,8 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
 
       if (command.type === "ice-candidate") {
         const pc = pcRef.current;
+        const webrtc = getWebRtc();
+        if (!webrtc) return;
         // Queue until there is a peer WITH a remote description, otherwise
         // addIceCandidate throws and the candidate is lost.
         if (!pc || !pc.remoteDescription) {
@@ -233,12 +247,16 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
     }
   }
 
+  // Resolved at render time rather than imported: in Expo Go there is no
+  // native view to render, and the streams stay null anyway.
+  const RTCView = getWebRtc()?.RTCView;
+
   return (
     <View style={visible ? styles.visible : styles.hidden} pointerEvents="none">
-      {remoteUrl ? (
+      {RTCView && remoteUrl ? (
         <RTCView streamURL={remoteUrl} style={styles.remote} objectFit="cover" />
       ) : null}
-      {localUrl ? (
+      {RTCView && localUrl ? (
         <RTCView streamURL={localUrl} style={styles.local} objectFit="cover" zOrder={1} mirror />
       ) : null}
     </View>

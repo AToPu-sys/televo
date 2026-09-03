@@ -7,8 +7,10 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import { Alert } from "react-native";
 
 import { supabase } from "../lib/supabase";
+import { callsSupported } from "../lib/webrtcModule";
 import type { Database } from "../types/database";
 import { useAuth } from "./useAuth";
 import { useCall } from "./useCall";
@@ -74,6 +76,16 @@ export function CallManagerProvider({ children }: { children: ReactNode }) {
 
   const placeCall = useCallback(
     async (conversationId: string, kind: CallKind) => {
+      // Calls need the native WebRTC module, which Expo Go does not ship.
+      // Saying so is better than starting a call that can never open the
+      // microphone and appears to hang.
+      if (!callsSupported()) {
+        Alert.alert(
+          "Calls need the full app",
+          "Voice and video calls use a native module that Expo Go can't load. Install the development build to make calls."
+        );
+        return;
+      }
       const info = await resolvePeer(conversationId);
       setPeer(info);
       await call.startCall(conversationId, kind);
@@ -83,6 +95,9 @@ export function CallManagerProvider({ children }: { children: ReactNode }) {
 
   const handleIncoming = useCallback(
     async (incomingCall: CallRow) => {
+      // Without the native module there is no way to answer, so ringing would
+      // only offer an Accept button that cannot work.
+      if (!callsSupported()) return;
       const info = await resolvePeer(incomingCall.conversation_id);
       setPeer(info);
       call.listenForOffer(incomingCall);
