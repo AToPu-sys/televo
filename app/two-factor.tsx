@@ -1,4 +1,6 @@
 import { Ionicons } from "@expo/vector-icons";
+import * as LocalAuthentication from "expo-local-authentication";
+import { SvgXml } from "react-native-svg";
 import { useRouter } from "expo-router";
 import { useEffect, useState } from "react";
 import {
@@ -17,7 +19,20 @@ import { Button } from "../src/components/Button";
 import { TextField } from "../src/components/TextField";
 import { useTheme } from "../src/hooks/useTheme";
 import { supabase } from "../src/lib/supabase";
+
+/** Unwraps the `data:image/svg+xml,...` URI Supabase hands back into raw SVG
+ * markup. Handles both the base64 and the percent-encoded form, since which
+ * one arrives depends on the Supabase version. */
+function decodeSvgDataUri(uri: string): string {
+  const base64Match = uri.match(/^data:image\/svg\+xml;base64,(.*)$/);
+  if (base64Match) return atob(base64Match[1]);
+  const utf8Match = uri.match(/^data:image\/svg\+xml(?:;charset=[^,]*)?,(.*)$/);
+  if (utf8Match) return decodeURIComponent(utf8Match[1]);
+  // Already raw markup (older Supabase returned the SVG unwrapped).
+  return uri;
+}
 import { radius, spacing } from "../src/theme";
+import { useAuth, verifyCurrentPassword } from "../src/hooks/useAuth";
 
 type Factor = { id: string; friendly_name: string | null; status: string };
 
@@ -30,6 +45,7 @@ type Factor = { id: string; friendly_name: string | null; status: string };
 export default function TwoFactorScreen() {
   const { theme } = useTheme();
   const router = useRouter();
+  const { user } = useAuth();
 
   const [factors, setFactors] = useState<Factor[]>([]);
   const [loading, setLoading] = useState(true);
@@ -59,6 +75,11 @@ export default function TwoFactorScreen() {
       const { data, error: enrollError } = await supabase.auth.mfa.enroll({
         factorType: "totp",
         friendlyName: "Televo",
+        // `issuer` is not optional in practice: without it GoTrue returns a
+        // 500 "Error generating QR Code" and enrolment is impossible. It also
+        // becomes the account label shown in the authenticator app, so a
+        // domain rather than a display name is the right value.
+        issuer: "televo.app",
       });
       if (enrollError) throw enrollError;
 
@@ -105,6 +126,20 @@ export default function TwoFactorScreen() {
     }
   }
 
+  function promptForPassword(): Promise<string | null> {
+    return new Promise((resolve) => {
+      Alert.prompt(
+        "Confirm your password",
+        "Enter your account password to turn off Two-Step Verification.",
+        [
+          { text: "Cancel", style: "cancel", onPress: () => resolve(null) },
+          { text: "Confirm", onPress: (value?: string) => resolve(value ?? null) },
+        ],
+        "secure-text"
+      );
+    });
+  }
+
   async function handleRemove(id: string) {
     Alert.alert(
       "Turn off Two-Step Verification?",
@@ -115,6 +150,38 @@ export default function TwoFactorScreen() {
           text: "Turn off",
           style: "destructive",
           onPress: async () => {
+            // Face ID / passcode first, as a quick local check — but it is
+            // NOT the proof that gates removal. Anyone holding an already-
+            // unlocked, already-authenticated phone (the exact "stolen
+            // unlocked phone" scenario 2FA exists to protect against) could
+            // sail past a device-local biometric prompt with the same touch
+            // that unlocked the phone in the first place, and it was
+            // skippable entirely on a device with no biometrics enrolled at
+            // all. The account PASSWORD is what's actually required below —
+            // biometrics are just a faster path to typing it.
+            const hasHardware = await LocalAuthentication.hasHardwareAsync();
+            const enrolled = await LocalAuthentication.isEnrolledAsync();
+            if (hasHardware && enrolled) {
+              const result = await LocalAuthentication.authenticateAsync({
+                promptMessage: "Confirm it's you to turn off Two-Step Verification",
+                cancelLabel: "Cancel",
+              });
+              if (!result.success) return;
+            }
+
+            if (!user?.email) {
+              Alert.alert("Couldn't verify", "No account email on file.");
+              return;
+            }
+            const password = await promptForPassword();
+            if (!password) return;
+
+            const verified = await verifyCurrentPassword(user.email, password);
+            if (!verified) {
+              Alert.alert("Wrong password", "That password isn't correct — Two-Step Verification was not changed.");
+              return;
+            }
+
             const { error: unenrollError } = await supabase.auth.mfa.unenroll({ factorId: id });
             if (unenrollError) {
               Alert.alert("Couldn't remove it", unenrollError.message);
@@ -166,7 +233,11 @@ export default function TwoFactorScreen() {
             <Text style={[styles.statusBody, { color: theme.textSecondary }]}>
               Scan this code with Google Authenticator, Authy, or any TOTP app.
             </Text>
-            <Image source={{ uri: qrUri }} style={styles.qr} accessibilityIgnoresInvertColors />
+            {/* Supabase returns the QR as an SVG document in a data: URI.
+                React Native's <Image> cannot rasterise SVG at all — it fails
+                with "Error generating QR code", which is what made setup
+                impossible to complete. SvgXml renders the markup directly. */}
+            <SvgXml xml={decodeSvgDataUri(qrUri)} width={220} height={220} />
             {secret ? (
               <Text style={[styles.secret, { color: theme.textSecondary }]} selectable>
                 Can't scan? Enter manually: {secret}

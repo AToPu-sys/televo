@@ -8,11 +8,28 @@ import { useAppLock } from "../src/hooks/useAppLock";
 import { useTheme } from "../src/hooks/useTheme";
 import {
   clearPasscode,
+  getBiometricKind,
   isBiometricUnlockEnabled,
   isPasscodeSet,
   setBiometricUnlockEnabled,
+  type BiometricKind,
 } from "../src/lib/passcode";
 import { radius, spacing } from "../src/theme";
+import { FaceIdIcon } from "../src/components/FaceIdIcon";
+
+const IONICON_FALLBACK: Record<BiometricKind, keyof typeof Ionicons.glyphMap> = {
+  face: "finger-print", // unreachable — face renders FaceIdIcon below instead
+  fingerprint: "finger-print",
+  iris: "finger-print",
+  generic: "finger-print",
+};
+
+const BIOMETRIC_LABEL: Record<BiometricKind, string> = {
+  face: "Unlock with Face ID",
+  fingerprint: "Unlock with Touch ID",
+  iris: "Unlock with Biometrics",
+  generic: "Unlock with Biometrics",
+};
 
 export default function PrivacySecurityScreen() {
   const { theme } = useTheme();
@@ -21,10 +38,15 @@ export default function PrivacySecurityScreen() {
 
   const [passcodeEnabled, setPasscodeEnabled] = useState(false);
   const [biometricsEnabled, setBiometricsEnabled] = useState(false);
+  const [biometricKind, setBiometricKind] = useState<BiometricKind>("fingerprint");
 
   useEffect(() => {
-    isPasscodeSet().then(setPasscodeEnabled);
-    isBiometricUnlockEnabled().then(setBiometricsEnabled);
+    // SecureStore/LocalAuthentication calls can reject (unavailable on this
+    // device); an unhandled rejection here just leaves the toggles at their
+    // default rather than surfacing anything, so fail closed instead.
+    isPasscodeSet().then(setPasscodeEnabled).catch(() => setPasscodeEnabled(false));
+    isBiometricUnlockEnabled().then(setBiometricsEnabled).catch(() => setBiometricsEnabled(false));
+    getBiometricKind().then(setBiometricKind).catch(() => setBiometricKind("fingerprint"));
   }, []);
 
   async function handleTogglePasscode(next: boolean) {
@@ -89,8 +111,14 @@ export default function PrivacySecurityScreen() {
               <View style={[styles.divider, { backgroundColor: theme.border }]} />
               <View style={styles.row}>
                 <View style={styles.rowLabel}>
-                  <Ionicons name="finger-print" size={20} color={theme.accent} />
-                  <Text style={[styles.rowText, { color: theme.text }]}>Unlock with Biometrics</Text>
+                  {biometricKind === "face" ? (
+                    <FaceIdIcon size={20} color={theme.accent} />
+                  ) : (
+                    <Ionicons name={IONICON_FALLBACK[biometricKind]} size={20} color={theme.accent} />
+                  )}
+                  <Text style={[styles.rowText, { color: theme.text }]}>
+                    {BIOMETRIC_LABEL[biometricKind]}
+                  </Text>
                 </View>
                 <Switch
                   value={biometricsEnabled}
@@ -102,6 +130,19 @@ export default function PrivacySecurityScreen() {
             </>
           ) : null}
         </View>
+
+        <Pressable
+          onPress={() => router.push("/change-email" as never)}
+          accessibilityRole="button"
+          accessibilityLabel="Change Email"
+          style={[styles.section, styles.row, { backgroundColor: theme.surfaceElevated }]}
+        >
+          <View style={styles.rowLabel}>
+            <Ionicons name="mail-outline" size={20} color={theme.accent} />
+            <Text style={[styles.rowText, { color: theme.text }]}>Change Email</Text>
+          </View>
+          <Ionicons name="chevron-forward" size={18} color={theme.textSecondary} />
+        </Pressable>
 
         <Pressable
           onPress={() => router.push("/two-factor")}

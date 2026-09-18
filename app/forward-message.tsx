@@ -39,26 +39,25 @@ export default function ForwardMessageScreen() {
     setForwardingTo(conversationId);
 
     try {
-      // A message from an encrypted conversation can't carry its ciphertext
-      // into a destination with a different (or no) session key, so forwards
-      // into an encrypted destination are dropped to null body rather than
-      // leaking ciphertext that would just fail to decrypt there. Forwarding
-      // OUT of a Secret Chat into a plaintext one is intentionally not
-      // supported either, for the same reason in reverse — this only forwards
-      // a message's plaintext-capable fields (media, document), not text
-      // bodies, when the destination is encrypted.
-      const { data: destination } = await supabase
-        .from("conversations")
-        .select("is_encrypted")
-        .eq("id", conversationId)
-        .single();
+      // A message's `body` is ciphertext when its own conversation is
+      // encrypted (Secret Chat) — that ciphertext is only decryptable with
+      // that specific conversation's session key. Forwarding must therefore
+      // drop the text body whenever EITHER side is encrypted: a different
+      // (or no) session key at the destination can't decrypt it, so sending
+      // it as-is would show the raw ciphertext envelope as plaintext to the
+      // recipient. Only media/document fields, which aren't encrypted, carry
+      // over either way.
+      const [{ data: destination }, { data: origin }] = await Promise.all([
+        supabase.from("conversations").select("is_encrypted").eq("id", conversationId).single(),
+        supabase.from("conversations").select("is_encrypted").eq("id", source.conversation_id).single(),
+      ]);
 
-      const bodyToForward = source.body;
+      const bodyToForward = destination?.is_encrypted || origin?.is_encrypted ? null : source.body;
       const { error } = await supabase.from("messages").insert({
         conversation_id: conversationId,
         sender_id: user.id,
         kind: source.kind,
-        body: destination?.is_encrypted ? null : bodyToForward,
+        body: bodyToForward,
         media_url: source.media_url,
         document_name: source.document_name,
         document_size_bytes: source.document_size_bytes,

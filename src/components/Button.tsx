@@ -17,10 +17,13 @@ type ButtonProps = PressableProps & {
   variant?: "primary" | "secondary" | "ghost";
   loading?: boolean;
   style?: StyleProp<ViewStyle>;
+  /** Overrides the variant's default text/spinner color — e.g. a "secondary"
+   * button used for a destructive action like Block. */
+  textColor?: string;
 };
 
 export const Button = forwardRef<any, ButtonProps>(function Button(
-  { title, variant = "primary", loading = false, disabled, style, ...rest },
+  { title, variant = "primary", loading = false, disabled, style, textColor: textColorProp, ...rest },
   ref
 ) {
   const { theme } = useTheme();
@@ -28,7 +31,7 @@ export const Button = forwardRef<any, ButtonProps>(function Button(
 
   const backgroundColor =
     variant === "primary" ? theme.accent : variant === "secondary" ? "transparent" : "transparent";
-  const textColor = variant === "primary" ? "#FFFFFF" : theme.accent;
+  const textColor = textColorProp ?? (variant === "primary" ? "#FFFFFF" : theme.accent);
 
   return (
     <Pressable
@@ -40,7 +43,7 @@ export const Button = forwardRef<any, ButtonProps>(function Button(
         styles.base,
         {
           backgroundColor,
-          borderColor: variant === "secondary" ? theme.accent : "transparent",
+          borderColor: variant === "secondary" ? textColor : "transparent",
           borderWidth: variant === "secondary" ? 1 : 0,
           opacity: isDisabled ? 0.5 : pressed ? 0.85 : 1,
         },

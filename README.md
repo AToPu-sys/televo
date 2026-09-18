@@ -7,9 +7,13 @@ synced live across devices, voice/video calls, opt-in end-to-end encrypted
 document sending, privacy controls (last seen, read receipts), blocking, an
 app passcode lock, and Two-Step Verification (TOTP).
 
-Built on **Expo SDK 54** (React Native 0.81, React 19.1). **Runs entirely in
-Expo Go** — `npx expo start`, scan the QR code, done. No custom dev build,
-no native modules.
+Built on **Expo SDK 54** (React Native 0.81, React 19.1). Calls use the
+native `react-native-webrtc` module, so the app needs a **development
+build** — it no longer runs in plain Expo Go. See "Running the app" below.
+
+**Site:** [gettelevo.space](https://gettelevo.space) — landing page, privacy
+policy, terms of service, and support/FAQ, all served from one domain (repo:
+[televo-site](https://github.com/AToPu-sys/televo-site)).
 
 ## Features
 
@@ -27,19 +31,24 @@ no native modules.
 - **Group chats** — create a group, name it, pick members; the creator is admin.
 - **Delete** — long-press your own message to delete it for everyone.
 - **Typing indicators** — live over Realtime broadcast (no DB writes).
-- **Voice & video calls** — real WebRTC peer connections (real audio/video,
-  not a stub), running inside Expo Go. Signaling over Realtime broadcast; a
-  free public TURN relay handles NAT traversal. A **Calls tab** shows history
-  (incoming/outgoing/missed/declined) with tap-to-call-back.
+- **Voice & video calls** — real WebRTC peer connections via the native
+  `react-native-webrtc` module (requires a development build, see below).
+  Signaling over Realtime broadcast; a free public TURN relay handles NAT
+  traversal. A **Calls tab** shows history (incoming/outgoing/missed/declined)
+  with tap-to-call-back. 1:1 calls only for now — call buttons are hidden in
+  group chats (group ringing/answer handling isn't implemented yet).
 - **Privacy** — toggle whether others see your Last Seen (reciprocal — turning
   it off also hides theirs from you, matching Telegram) and whether you send
   read receipts. **Blocking** is enforced server-side (RLS on the `messages`
   INSERT policy) — a blocked relationship stops messages in both directions,
   not just hidden client-side.
 - **AI Assistant** — a pinned "Televo Assistant" contact every user gets
-  automatically. Messages to it are answered by Claude, generated
-  server-side by a Supabase Edge Function — the app never holds an API key.
-  See "AI Assistant" below.
+  automatically, answered by Claude via a Supabase Edge Function that never
+  exposes an API key to the client. **Currently hidden from the UI**
+  (chats/contacts/new-group/forward) because the backing Anthropic
+  organization is on hold and every reply falls back to "unavailable" — see
+  `src/lib/assistant.ts`. Re-enable by removing the `ASSISTANT_USER_ID`
+  filters in `useChats.ts`/`useContacts.ts` once the account works again.
 - **App security** — a local 4-digit **Passcode Lock** (optional biometric
   unlock) that gates the whole app after backgrounding, and **Two-Step
   Verification** via TOTP (an authenticator app code required at login, on
@@ -51,35 +60,37 @@ no native modules.
 - **Settings** — profile card, phone number, dark mode, Privacy & Security.
 - **Theming** — light and dark palettes throughout, persisted between launches.
 - **Push notifications** — full server-side pipeline (see "Push
-  notifications" below). Works today on iOS in Expo Go; Android needs one
-  custom dev build, an Expo platform restriction, not a gap in this code.
+  notifications" below). Needs a development/production build on both
+  platforms now (see below) — Expo Go dropped Android push in SDK 53, and
+  the native WebRTC module already requires a dev build anyway.
 
 ## Running the app
 
 ```bash
 npm install
 cp .env.example .env   # then fill in your Supabase values
-npx expo start
+npx expo prebuild -p ios   # regenerates ios/ from app.json, if needed
+npx expo run:ios           # or: eas build --profile development --platform ios
 ```
 
-Scan the QR code with Expo Go (Android) or the Camera app (iOS, opens Expo
-Go). No native build step, no `expo run:*`, no Xcode/Android Studio required.
+Calls use the native `react-native-webrtc` module, which Expo Go cannot load,
+so a **development build** is required — plain `npx expo start` + Expo Go no
+longer works for this app. Build once with `npx expo run:ios` (needs Xcode) or
+`eas build --profile development --platform ios`, install that build on your
+device/simulator, then `npx expo start --dev-client` for the usual fast-refresh
+workflow — the QR code still applies.
 
-### How calling works in Expo Go without a native WebRTC module
+### How calling works
 
-`react-native-webrtc` requires native code Expo Go doesn't ship, so it isn't
-used. Instead, `src/components/WebRtcBridge.tsx` renders a hidden
-`react-native-webview` — which Expo Go *does* ship — hosting a tiny local HTML
-page (`src/lib/webrtcBridgeHtml.ts`) that runs plain browser
-`getUserMedia`/`RTCPeerConnection`. That's the WebView engine's own built-in
-WebRTC (WKWebView on iOS, Chromium WebView on Android), not a React Native
-native module, so no linking or dev build is needed.
-
-React Native and the WebView talk over `postMessage`/`injectJavaScript`, JSON
-only — `src/hooks/useCall.ts` owns the call state machine and forwards
-offer/answer/ICE between the WebView and the Realtime signaling channel; it
-never touches a WebRTC type directly. Voice/video calls need a real device
-(or two) — simulators/emulators don't reliably expose a camera/mic.
+`src/lib/webrtcModule.ts` lazily loads the real `react-native-webrtc` native
+module; `src/components/WebRtcBridge.tsx` and `src/hooks/useCall.ts` own the
+peer connection and the call state machine, forwarding offer/answer/ICE over
+the Realtime signaling channel. This replaced an earlier WebView-based engine
+(`react-native-webview` running browser `getUserMedia` in a hidden page) that
+looked simpler but never actually worked: a WebView loaded from an inline
+`html` source has a non-secure origin, so iOS leaves `navigator.mediaDevices`
+undefined and the mic/camera prompt never appears. Voice/video calls need a
+real device (or two) — simulators/emulators don't reliably expose a camera/mic.
 
 ### Environment
 
@@ -96,14 +107,22 @@ and access is enforced by Row Level Security. Never ship the `service_role` key.
 Opt-in per direct conversation, via the lock icon in a chat's header. Modeled
 on Telegram's own Secret Chats:
 
-1. Each device generates an X25519 keypair on first use
-   (`src/lib/e2e.ts` → `getOrCreateDeviceKeyPair`). The private key is stored
-   in `expo-secure-store` and **never leaves the device**; only the public key
-   is published (`profiles.e2e_public_key`).
+1. Each device generates two keypairs on first use
+   (`src/lib/e2e.ts` → `getOrCreateDeviceKeyPair`): an X25519 keypair, and an
+   **ML-KEM-768** (FIPS 203, via `crystals-kyber-js`) keypair for
+   post-quantum key encapsulation. Both private halves are stored in
+   `expo-secure-store` and **never leave the device**; only the public
+   halves are published (`profiles.e2e_public_key`,
+   `profiles.e2e_kyber_public_key`).
 2. Starting a Secret Chat generates one random session key, then wraps a copy
-   of it to each participant's public key (`nacl.box`) and stores those
-   wrapped copies in `encrypted_session_keys` — RLS restricts each row to the
-   one recipient it was wrapped for.
+   of it to each participant using a **hybrid** scheme: an X25519
+   Diffie–Hellman exchange combined with an ML-KEM-768 encapsulation
+   (`combineSharedSecrets`), so the wrap stays secure even against a future
+   quantum adversary, not only today's classical one. Falls back to
+   X25519-only when wrapping for a recipient who hasn't upgraded to a build
+   with an ML-KEM keypair yet. Wrapped copies are stored in
+   `encrypted_session_keys` — RLS restricts each row to the one recipient it
+   was wrapped for.
 3. Every message body sent in that conversation is
    `nacl.secretbox(sessionKey, plaintext)` client-side before it's ever sent
    to Supabase. `scripts/verify-e2e.mjs` proves the stored row is genuinely
@@ -126,9 +145,12 @@ on Telegram's own Secret Chats:
   messages sent afterward are encrypted.
 - No key backup/sync — a new device generates its own keypair and can't
   decrypt another device's Secret Chat history.
-- Self-destruct is enforced by a live client sweep, not a server-side cron —
-  a message with an elapsed timer is deleted the next time either
-  participant's chat screen is open, not to-the-second everywhere.
+- Self-destruct is enforced BOTH by a live client sweep (immediate, while a
+  chat screen is open) and a server-side cron (`delete_expired_messages`,
+  `scripts/sql/032_expire_messages_cron.sql` and
+  `044_expire_messages_media_cleanup.sql`) that also removes the Storage
+  object a self-destructing photo/video/document pointed at, so expired
+  media doesn't linger in the bucket after its row is gone.
 - Calls use WebRTC's own transport encryption (DTLS-SRTP), separate from this
   and always on regardless of Secret Chat status.
 
@@ -167,14 +189,10 @@ is needed for it to work.
    server-side and must not become a way to exfiltrate what E2E encryption
    is specifically protecting.
 
-**Platform limitation, not a bug in this code:** remote push notifications
-are unavailable in Expo Go on Android from SDK 53 onward — Expo's own
-restriction. This means:
-- **iOS in Expo Go**: works as-is, no extra steps.
-- **Android**: needs one custom dev build (`eas build --profile development`
-  or `npx expo run:android`) instead of Expo Go. Everything else in the app
-  keeps working the same either way — this is the one feature gated by that
-  choice.
+**Platform note:** the app already requires a development build for the
+native WebRTC module (see "Running the app" above), which sidesteps Expo Go's
+own SDK 53+ restriction on Android remote push. Both platforms work the same
+in a dev/production build.
 
 `scripts/verify-push-notifications.mjs` verifies token RLS and that the
 webhook successfully reaches Expo's push API (confirmed via
@@ -204,10 +222,17 @@ Replies are generated **server-side**, never on the client:
 Call/block/self-destruct/E2E-encryption UI is hidden for this conversation in
 the chat screen — none of those apply to a bot contact.
 
-**Live-verified**: a new user gets the conversation + welcome message
-automatically, and a real message triggers a real Claude-generated reply,
-confirmed via `scripts/verify-ai-assistant.mjs` end to end through the full
-webhook → Edge Function → Claude API → insert pipeline.
+**Live-verified** (at the time this was written): a new user gets the
+conversation + welcome message automatically, and a real message triggers a
+real Claude-generated reply, confirmed via `scripts/verify-ai-assistant.mjs`
+end to end through the full webhook → Edge Function → Claude API → insert
+pipeline.
+
+**Currently degraded**: the configured Anthropic organization is on hold, so
+every reply falls back to "The assistant is unavailable right now…" instead
+of a real answer. The feature is hidden from chats/contacts/new-group/forward
+in the client (`src/lib/assistant.ts`) until this is resolved — see
+`APP_STORE_SUBMISSION.md` §3.1.
 
 ## Contact discovery ("Find friends")
 
@@ -347,8 +372,8 @@ SUPABASE_SERVICE_ROLE_KEY=<service-role-key> node scripts/verify-telegram-featur
   non-participant is blocked from both uploading and reading), delete
   permissions, typing broadcast.
 - `verify-calls.mjs` — `calls` RLS, incoming-call realtime notification, the
-  offer/answer/ICE round trip. Doesn't exercise the WebView's actual media
-  stream — that needs a physical device.
+  offer/answer/ICE round trip. Doesn't exercise the actual native WebRTC
+  media stream — that needs a physical device.
 - `verify-contact-discovery.mjs` — phone uniqueness, discovery query
   correctness.
 - `verify-e2e.mjs` — key wrap/unwrap, encrypt/decrypt, RLS on wrapped keys,
@@ -412,8 +437,8 @@ src/
                           useContactDiscovery, useAppLock, useBlockedUsers,
                           useCallLog, useParticipantNames
   lib/                    supabase client, uuid, media (Storage uploads incl.
-                          documents), webrtc (ICE/TURN config),
-                          webrtcBridgeHtml, e2e, passcode
+                          documents), webrtc (ICE/TURN config), webrtcModule,
+                          assistant, e2e, passcode
   theme/                  light/dark palettes, spacing, radii
   types/database.ts       generated from the live schema
 scripts/

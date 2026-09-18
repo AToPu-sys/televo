@@ -2,19 +2,20 @@ import { Ionicons } from "@expo/vector-icons";
 import { Directory, File, Paths } from "expo-file-system";
 import * as Sharing from "expo-sharing";
 import { useVideoPlayer, VideoView } from "expo-video";
-import { useEffect, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import { ActivityIndicator, Alert, Image, Pressable, StyleSheet, Text, View } from "react-native";
 
 import { useTheme } from "../hooks/useTheme";
 import type { ChatMessage } from "../hooks/useMessages";
 import {
   fetchDecryptedBytes,
-  fetchDecryptedMedia,
+  fetchDecryptedMediaFile,
   mimeForPath,
   parseMediaRef,
   signedChatMediaUrl,
 } from "../lib/media";
 import { useE2ee } from "../hooks/useE2ee";
+import { parseEnvelope } from "../lib/e2e";
 import { radius, spacing } from "../theme";
 
 type ReplyPreview = { senderName: string; text: string };
@@ -30,15 +31,22 @@ type MessageBubbleProps = {
   forwardedFrom?: ForwardAttribution | null;
   /** The other participant's last_read_at, for real read receipts. */
   peerLastReadAt?: string | null;
+  /** Re-attempts decrypting this one message — see useMessages'
+   * retryDecryption for why this exists: a message that failed to decrypt
+   * because this device's session-key row was stale used to be a dead end
+   * with no way back short of leaving and re-entering the chat, unlike a
+   * failed photo/video, which already had tap-to-retry. */
+  onRetryDecryption?: (messageId: string) => void;
 };
 
-export function MessageBubble({
+function MessageBubbleComponent({
   message,
   isOwn,
   onLongPress,
   replyPreview,
   forwardedFrom,
   peerLastReadAt,
+  onRetryDecryption,
 }: MessageBubbleProps) {
   const { theme } = useTheme();
 
@@ -106,12 +114,26 @@ export function MessageBubble({
 
         {message.decryptedBody !== undefined ? (
           message.decryptedBody === null ? (
-            <Text style={[styles.text, styles.undecryptable, { color: textColor }]}>
-              🔒 Unable to decrypt this message
-            </Text>
+            <Pressable
+              onPress={() => onRetryDecryption?.(message.id)}
+              accessibilityRole="button"
+              accessibilityLabel="Retry decrypting this message"
+            >
+              <Text style={[styles.text, styles.undecryptable, { color: textColor }]}>
+                🔒 Unable to decrypt this message — tap to retry
+              </Text>
+            </Pressable>
           ) : (
             <Text style={[styles.text, { color: textColor }]}>{message.decryptedBody}</Text>
           )
+        ) : message.body && parseEnvelope(message.body) ? (
+          // Belt-and-suspenders: the chat screen now withholds messages
+          // entirely until isEncrypted is known for certain (see
+          // app/chat/[id].tsx's combined `loading`), so this should be
+          // unreachable in practice. Kept so a raw ciphertext envelope can
+          // never render as if it were plaintext even if some future path
+          // feeds this component a message before decryption ran.
+          <Text style={[styles.text, styles.undecryptable, { color: textColor }]}>🔒 …</Text>
         ) : message.body ? (
           <Text style={[styles.text, { color: textColor }]}>{message.body}</Text>
         ) : null}
@@ -133,6 +155,40 @@ export function MessageBubble({
   );
 }
 
+/** Memoized with an explicit comparator.
+ *
+ * Without this, every keystroke in the composer re-rendered every visible
+ * bubble — and a bubble is not cheap: image bubbles resolve signed URLs and
+ * video bubbles hold a player instance, so a re-render can restart media
+ * work. The parent builds `replyPreview` and `forwardedFrom` as fresh object
+ * literals per row on every render, so referential equality alone would
+ * never hit; they are compared by the fields actually rendered instead.
+ *
+ * `message` is compared field-by-field rather than by identity for the same
+ * reason: useMessages replaces the array on every realtime event, and an
+ * unchanged message frequently arrives as a new object. */
+export const MessageBubble = memo(MessageBubbleComponent, (prev, next) => {
+  const a = prev.message;
+  const b = next.message;
+  return (
+    a.id === b.id &&
+    a.body === b.body &&
+    a.decryptedBody === b.decryptedBody &&
+    a.edited_at === b.edited_at &&
+    a.expires_at === b.expires_at &&
+    a.media_url === b.media_url &&
+    a.pending === b.pending &&
+    a.failed === b.failed &&
+    a.created_at === b.created_at &&
+    prev.isOwn === next.isOwn &&
+    prev.peerLastReadAt === next.peerLastReadAt &&
+    prev.onLongPress === next.onLongPress &&
+    prev.replyPreview?.text === next.replyPreview?.text &&
+    prev.replyPreview?.senderName === next.replyPreview?.senderName &&
+    prev.forwardedFrom?.senderName === next.forwardedFrom?.senderName
+  );
+});
+
 /**
  * chat-media is a private bucket, so a stored path has to be exchanged for a
  * signed URL before it can render. While a message is still uploading, the
@@ -152,6 +208,11 @@ function ChatImage({
   const isLocal = path.startsWith("file:") || path.startsWith("content:");
   const [uri, setUri] = useState<string | null>(isLocal ? path : null);
   const [failed, setFailed] = useState(false);
+  // Bumped to force a retry from the "Image unavailable" state — a failed
+  // load is very often transient (session token mid-refresh, a network
+  // blip) rather than the media actually being gone, so it shouldn't be a
+  // dead end with no way back short of leaving and re-entering the chat.
+  const [retryCount, setRetryCount] = useState(0);
 
   useEffect(() => {
     if (isLocal) {
@@ -167,35 +228,51 @@ function ChatImage({
     const { nonce } = parseMediaRef(path);
 
     const load = nonce
-      ? fetchDecryptedMedia(
-          path,
-          (ciphertext, mediaNonce) =>
-            decryptBytesForConversation(conversationId ?? "", ciphertext, mediaNonce),
-          mimeForPath(path)
+      ? fetchDecryptedMediaFile(path, (ciphertext, mediaNonce) =>
+          decryptBytesForConversation(conversationId ?? "", ciphertext, mediaNonce)
         )
       : signedChatMediaUrl(path);
 
     Promise.resolve(load)
       .then((resolved) => {
         if (!active) return;
-        if (resolved) setUri(resolved);
-        else setFailed(true);
+        if (resolved) {
+          setUri(resolved);
+          setFailed(false);
+        } else {
+          setFailed(true);
+        }
       })
-      .catch(() => {
-        if (active) setFailed(true);
+      .catch((error) => {
+        if (!active) return;
+        // eslint-disable-next-line no-console
+        console.error("[ChatImage] load failed:", error instanceof Error ? error.message : error, {
+          hasNonce: !!nonce,
+        });
+        setFailed(true);
       });
 
     return () => {
       active = false;
     };
-  }, [path, isLocal, conversationId, decryptBytesForConversation]);
+  }, [path, isLocal, conversationId, decryptBytesForConversation, retryCount]);
 
   if (failed) {
     return (
-      <View style={[styles.media, styles.mediaPlaceholder, { backgroundColor: theme.surfaceElevated }]}>
+      <Pressable
+        onPress={() => {
+          setFailed(false);
+          setRetryCount((count) => count + 1);
+        }}
+        style={[styles.media, styles.mediaPlaceholder, { backgroundColor: theme.surfaceElevated }]}
+        accessibilityRole="button"
+        accessibilityLabel="Retry loading image"
+      >
         <Ionicons name="image-outline" size={28} color={theme.textSecondary} />
-        <Text style={[styles.mediaError, { color: theme.textSecondary }]}>Image unavailable</Text>
-      </View>
+        <Text style={[styles.mediaError, { color: theme.textSecondary }]}>
+          Image unavailable — tap to retry
+        </Text>
+      </Pressable>
     );
   }
 
@@ -246,6 +323,7 @@ function ChatVideo({
   const isLocal = path.startsWith("file:") || path.startsWith("content:");
   const [uri, setUri] = useState<string | null>(isLocal ? path : null);
   const [failed, setFailed] = useState(false);
+  const [retryCount, setRetryCount] = useState(0);
 
   useEffect(() => {
     if (isLocal) {
@@ -257,28 +335,34 @@ function ChatVideo({
     const { nonce } = parseMediaRef(path);
 
     const load = nonce
-      ? fetchDecryptedMedia(
-          path,
-          (ciphertext, mediaNonce) =>
-            decryptBytesForConversation(conversationId ?? "", ciphertext, mediaNonce),
-          mimeForPath(path)
+      ? fetchDecryptedMediaFile(path, (ciphertext, mediaNonce) =>
+          decryptBytesForConversation(conversationId ?? "", ciphertext, mediaNonce)
         )
       : signedChatMediaUrl(path);
 
     Promise.resolve(load)
       .then((resolved) => {
         if (!active) return;
-        if (resolved) setUri(resolved);
-        else setFailed(true);
+        if (resolved) {
+          setUri(resolved);
+          setFailed(false);
+        } else {
+          setFailed(true);
+        }
       })
-      .catch(() => {
-        if (active) setFailed(true);
+      .catch((error) => {
+        if (!active) return;
+        // eslint-disable-next-line no-console
+        console.error("[ChatVideo] load failed:", error instanceof Error ? error.message : error, {
+          hasNonce: !!nonce,
+        });
+        setFailed(true);
       });
 
     return () => {
       active = false;
     };
-  }, [path, isLocal, conversationId, decryptBytesForConversation]);
+  }, [path, isLocal, conversationId, decryptBytesForConversation, retryCount]);
 
   // The player must be created unconditionally — hooks cannot sit behind the
   // early returns below. A null source simply leaves it idle until the URI

@@ -1,0 +1,9 @@
+{
+  "name": "expo-callkit",
+  "version": "2.0.0",
+  "description": "Reports Televo's calls to iOS CallKit so incoming/outgoing calls use the native system call screen, lock-screen UI, and Recents entry.",
+  "main": "src/index.ts",
+  "author": "Televo",
+  "license": "MIT",
+  "homepage": ""
+}

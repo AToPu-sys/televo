@@ -22,38 +22,82 @@ export function useTyping(
   useEffect(() => {
     if (!conversationId || !userId) return;
 
-    const channel = supabase.channel(`typing:${conversationId}`, {
-      config: { broadcast: { self: false } },
-    });
+    let cancelled = false;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
-    channel
-      .on("broadcast", { event: "typing" }, ({ payload }) => {
-        const senderId = payload?.userId as string | undefined;
-        const name = (payload?.displayName as string | undefined) ?? "Someone";
-        if (!senderId || senderId === userId) return;
+    const join = () => {
+      // private: true routes the join through Realtime Authorization (see
+      // 040_private_typing_channel.sql) instead of the channel being world-
+      // subscribable to anyone who knows the conversation id.
+      const channel = supabase.channel(`typing:${conversationId}`, {
+        config: { broadcast: { self: false }, private: true },
+      });
 
-        setTypingUsers((current) => ({ ...current, [senderId]: name }));
+      channel
+        .on("broadcast", { event: "typing" }, ({ payload }) => {
+          const senderId = payload?.userId as string | undefined;
+          const name = (payload?.displayName as string | undefined) ?? "Someone";
+          if (!senderId || senderId === userId) return;
 
-        // Each keystroke refreshes the expiry; the indicator clears on its own
-        // if the sender stops typing or drops off.
-        clearTimeout(timersRef.current[senderId]);
-        timersRef.current[senderId] = setTimeout(() => {
+          setTypingUsers((current) => ({ ...current, [senderId]: name }));
+
+          // Each keystroke refreshes the expiry; the indicator clears on its
+          // own if the sender stops typing or drops off.
+          clearTimeout(timersRef.current[senderId]);
+          timersRef.current[senderId] = setTimeout(() => {
+            setTypingUsers((current) => {
+              const next = { ...current };
+              delete next[senderId];
+              return next;
+            });
+          }, TYPING_TIMEOUT_MS);
+        })
+        // Explicit stop, sent the moment a message is actually delivered —
+        // without this the indicator only cleared on the 3s timeout, so
+        // sending well within that window (the common case) left "X is
+        // typing…" visible for up to 3s after the message had already
+        // arrived.
+        .on("broadcast", { event: "typing-stopped" }, ({ payload }) => {
+          const senderId = payload?.userId as string | undefined;
+          if (!senderId) return;
+          clearTimeout(timersRef.current[senderId]);
+          delete timersRef.current[senderId];
           setTypingUsers((current) => {
+            if (!(senderId in current)) return current;
             const next = { ...current };
             delete next[senderId];
             return next;
           });
-        }, TYPING_TIMEOUT_MS);
-      })
-      .subscribe();
+        })
+        .subscribe((status) => {
+          if (cancelled) return;
+          // A private channel can fail its first join attempt if it's
+          // opened within the first moment or two of the app's process
+          // (e.g. the chat screen is the very first thing shown after a
+          // notification-triggered cold launch) — the restored session's
+          // JWT may not have reached the Realtime socket's own auth yet.
+          // Retrying once covers that window; see the identical race
+          // documented on useCall.ts's joinSignalChannel.
+          if (status !== "CHANNEL_ERROR" && status !== "TIMED_OUT") return;
+          retryTimer = setTimeout(() => {
+            if (cancelled) return;
+            void supabase.removeChannel(channel);
+            join();
+          }, 800);
+        });
 
-    channelRef.current = channel;
+      channelRef.current = channel;
+    };
+
+    join();
 
     return () => {
+      cancelled = true;
+      if (retryTimer) clearTimeout(retryTimer);
       Object.values(timersRef.current).forEach(clearTimeout);
       timersRef.current = {};
       setTypingUsers({});
-      void supabase.removeChannel(channel);
+      if (channelRef.current) void supabase.removeChannel(channelRef.current);
       channelRef.current = null;
     };
   }, [conversationId, userId]);
@@ -72,6 +116,16 @@ export function useTyping(
     });
   }, [userId, displayName]);
 
+  const notifyStoppedTyping = useCallback(() => {
+    if (!channelRef.current || !userId) return;
+    lastSentRef.current = 0; // let the very next keystroke send immediately
+    void channelRef.current.send({
+      type: "broadcast",
+      event: "typing-stopped",
+      payload: { userId },
+    });
+  }, [userId]);
+
   const names = Object.values(typingUsers);
   const typingLabel =
     names.length === 0
@@ -80,5 +134,5 @@ export function useTyping(
         ? `${names[0]} is typing…`
         : `${names.length} people are typing…`;
 
-  return { typingLabel, notifyTyping };
+  return { typingLabel, notifyTyping, notifyStoppedTyping };
 }

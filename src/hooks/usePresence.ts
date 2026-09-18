@@ -18,7 +18,20 @@ export function usePresenceHeartbeat(userId: string | undefined) {
     if (!userId) return;
 
     const touch = () => {
-      void supabase.from("profiles").update({ last_seen_at: new Date().toISOString() }).eq("id", userId);
+      // .catch, not bare void: an update that rejects (a dropped network
+      // request, RLS momentarily unhappy right after sign-in before the
+      // fresh JWT has propagated) is an unhandled promise rejection
+      // otherwise — the same class of bug that made a failure in
+      // E2eeProvider's init silently reset the whole JS context with no
+      // Error Boundary to catch it. A stale last_seen_at is harmless; a
+      // silent app reset is not.
+      supabase
+        .from("profiles")
+        .update({ last_seen_at: new Date().toISOString() })
+        .eq("id", userId)
+        .then(({ error }) => {
+          if (error) console.error("[usePresenceHeartbeat] update failed:", error.message);
+        });
     };
 
     touch();

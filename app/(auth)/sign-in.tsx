@@ -4,6 +4,8 @@ import { useState } from "react";
 import { KeyboardAvoidingView, Linking, Platform, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 
 import { PRIVACY_URL, TERMS_URL } from "../../src/lib/legal";
+import { validatePassword } from "../../src/lib/password";
+import { isPlausiblePhone } from "../../src/lib/phone";
 import { SafeAreaView } from "react-native-safe-area-context";
 
 import { Button } from "../../src/components/Button";
@@ -12,10 +14,46 @@ import { useAuth } from "../../src/hooks/useAuth";
 import { useTheme } from "../../src/hooks/useTheme";
 import { spacing } from "../../src/theme";
 
+/** Translates a raw Supabase Auth error into what actually happened and, where
+ * there is one, the way out — shared by every call site that can throw one of
+ * these (handleSubmit's password/code/signup submission, and
+ * handleResendCode's resend), so a rate limit hit while resending a code
+ * reads the same "wait a minute" message as one hit on the original attempt,
+ * rather than the resend path showing Supabase's raw GoTrue text instead. */
+function describeAuthError(caught: unknown, awaitingEmailCode: boolean): string {
+  const raw = caught instanceof Error ? caught.message : "Something went wrong.";
+  // One account per phone number and per email is enforced by a unique
+  // index on profiles.phone and by Supabase Auth respectively, but both
+  // surface as raw database/API text ("duplicate key value violates unique
+  // constraint ...") that means nothing to a user and reads like a crash.
+  // Translate them into the actual situation and the way out.
+  const lowered = raw.toLowerCase();
+  // OTP failures come back as raw GoTrue text ("Token has expired or is
+  // invalid"), which reads like a crash rather than "check the code".
+  if (awaitingEmailCode && (lowered.includes("token") || lowered.includes("otp"))) {
+    return "That code is wrong or has expired. Check your email, or start over.";
+  }
+  if (lowered.includes("rate limit") || lowered.includes("too many")) {
+    return "Too many attempts. Wait a minute before trying again.";
+  }
+  if (lowered.includes("phone") && lowered.includes("duplicate")) {
+    return "That phone number is already used by another account. Sign in instead, or use a different number.";
+  }
+  if (
+    lowered.includes("already registered") ||
+    lowered.includes("already been registered") ||
+    (lowered.includes("email") && lowered.includes("duplicate"))
+  ) {
+    return "An account with this email already exists. Sign in instead, or reset your password.";
+  }
+  return raw;
+}
+
 export default function SignInScreen() {
   const { theme } = useTheme();
   const router = useRouter();
-  const { signInWithEmail, signUpWithEmail } = useAuth();
+  const { signUpWithEmail, resendConfirmation, verifyPasswordOnly, sendEmailCode, verifyEmailCode } =
+    useAuth();
 
   const [mode, setMode] = useState<"sign-in" | "sign-up">("sign-in");
   const [email, setEmail] = useState("");
@@ -26,16 +64,75 @@ export default function SignInScreen() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // Only offered once a confirmation mail was actually sent to this address —
+  // otherwise the button promises a resend of something that never existed.
+  const [awaitingConfirmation, setAwaitingConfirmation] = useState(false);
+  // Email-code step. The code is demanded BEFORE any session exists: asking
+  // for it after signInWithPassword would be theatre, since a valid password
+  // would already have produced a session an attacker could use.
+  const [awaitingEmailCode, setAwaitingEmailCode] = useState(false);
+  const [emailCode, setEmailCode] = useState("");
 
   const isSignUp = mode === "sign-up";
+
+  async function handleResend() {
+    setError(null);
+    setBusy(true);
+    try {
+      await resendConfirmation(email);
+      setNotice(`Confirmation link sent again to ${email.trim()}. Check your spam folder too.`);
+    } catch (caught) {
+      setError(describeAuthError(caught, false));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  /** Re-sends the sign-in code, for the awaitingEmailCode step specifically.
+   * Before this, the ONLY option once the code's email was lost, mistyped
+   * into, or simply took too long to arrive was "Use a different account" —
+   * which discards the whole sign-in and starts over from email+password,
+   * not a real resend. resendConfirmation (above) can't be reused here: it
+   * calls supabase.auth.resend({ type: "signup" }), which only exists for
+   * an unconfirmed signup — this step is a normal sign-in's second factor,
+   * so it goes back through sendEmailCode, the same call that sent the
+   * first one. */
+  async function handleResendCode() {
+    setError(null);
+    setBusy(true);
+    try {
+      await sendEmailCode(email);
+      setEmailCode("");
+      setNotice(`Sent a new code to ${email.trim()}.`);
+    } catch (caught) {
+      setError(describeAuthError(caught, true));
+    } finally {
+      setBusy(false);
+    }
+  }
 
   async function handleSubmit() {
     setError(null);
     setNotice(null);
 
-    if (!email.trim() || !password) {
+    if (awaitingEmailCode) {
+      if (emailCode.trim().length < 6) {
+        setError("Enter the 6-digit code from your email.");
+        return;
+      }
+    } else if (!email.trim() || !password) {
       setError("Email and password are required.");
       return;
+    }
+    // Sign-up previously accepted any non-empty password — see
+    // src/lib/password.ts for why that was the weakest link in the whole
+    // security model.
+    if (isSignUp) {
+      const passwordError = validatePassword(password);
+      if (passwordError) {
+        setError(passwordError);
+        return;
+      }
     }
     if (isSignUp && username.trim().length < 3) {
       setError("Username must be at least 3 characters (letters, numbers, _ or .).");
@@ -45,6 +142,14 @@ export default function SignInScreen() {
       setError("Username can only contain letters, numbers, underscores and dots.");
       return;
     }
+    // Required at signup, not optional: it's the only thing that lets a
+    // friend find this account via their phone's contacts (useContactDiscovery)
+    // instead of the app exposing an open directory of every user — the
+    // previous "browse everyone" contacts tab this replaces.
+    if (isSignUp && !isPlausiblePhone(phone)) {
+      setError("A phone number is required — it's how friends find you.");
+      return;
+    }
 
     setBusy(true);
     try {
@@ -52,18 +157,31 @@ export default function SignInScreen() {
         const { needsConfirmation } = await signUpWithEmail(email, password, {
           username: username.trim(),
           displayName: displayName.trim() || username.trim(),
-          phone: phone.trim() || undefined,
+          phone: phone.trim(),
         });
         if (needsConfirmation) {
-          setNotice("Check your email to confirm your account, then sign in.");
+          setNotice(
+            `We've sent a confirmation link to ${email.trim()}. Open it on this device to verify your account, then come back here and sign in.`
+          );
+          setAwaitingConfirmation(true);
           setMode("sign-in");
         }
+      } else if (awaitingEmailCode) {
+        // Second step: the emailed code is what actually creates the session.
+        await verifyEmailCode(email, emailCode);
       } else {
-        await signInWithEmail(email, password);
+        // First step: prove the password is right, then immediately drop that
+        // session and require the mailbox too. verifyPassword signs in and
+        // signs straight back out, so a correct password on its own never
+        // leaves a usable session behind.
+        await verifyPasswordOnly(email, password);
+        await sendEmailCode(email);
+        setAwaitingEmailCode(true);
+        setNotice(`We sent a 6-digit code to ${email.trim()}. Enter it to finish signing in.`);
       }
       // On success the root navigator redirects; nothing to do here.
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Something went wrong.");
+      setError(describeAuthError(caught, awaitingEmailCode));
     } finally {
       setBusy(false);
     }
@@ -105,15 +223,27 @@ export default function SignInScreen() {
               keyboardType="email-address"
               placeholder="you@example.com"
             />
-            <TextField
-              label="Password"
-              value={password}
-              onChangeText={setPassword}
-              secureTextEntry
-              autoCapitalize="none"
-              autoComplete={isSignUp ? "new-password" : "current-password"}
-              placeholder="••••••••"
-            />
+            {!awaitingEmailCode ? (
+              <TextField
+                label="Password"
+                value={password}
+                onChangeText={setPassword}
+                secureTextEntry
+                autoCapitalize="none"
+                autoComplete={isSignUp ? "new-password" : "current-password"}
+                placeholder="••••••••"
+              />
+            ) : (
+              <TextField
+                label="Email code"
+                value={emailCode}
+                onChangeText={setEmailCode}
+                keyboardType="number-pad"
+                autoComplete="one-time-code"
+                placeholder="123456"
+                hint="Check your inbox — the code expires shortly."
+              />
+            )}
 
             {isSignUp ? (
               <>
@@ -139,7 +269,7 @@ export default function SignInScreen() {
                   keyboardType="phone-pad"
                   autoComplete="tel"
                   placeholder="+1 415 555 2671"
-                  hint="Optional — lets friends find you from their contacts."
+                  hint="Required — lets friends find you from their contacts, and is never shown to anyone who doesn't already have it saved."
                 />
               </>
             ) : null}
@@ -175,10 +305,47 @@ export default function SignInScreen() {
             ) : null}
 
             <Button
-              title={isSignUp ? "Create account" : "Sign in"}
+              title={
+                isSignUp ? "Create account" : awaitingEmailCode ? "Verify and sign in" : "Continue"
+              }
               onPress={handleSubmit}
               loading={busy}
             />
+            {awaitingEmailCode ? (
+              <>
+                <Button
+                  title="Resend code"
+                  variant="ghost"
+                  onPress={() => void handleResendCode()}
+                  loading={busy}
+                />
+                <Button
+                  title="Use a different account"
+                  variant="ghost"
+                  onPress={() => {
+                    setAwaitingEmailCode(false);
+                    setEmailCode("");
+                    setNotice(null);
+                    setError(null);
+                  }}
+                />
+              </>
+            ) : null}
+            {!isSignUp ? (
+              <Button
+                title="Forgot password?"
+                variant="ghost"
+                onPress={() => router.push("/(auth)/forgot-password")}
+              />
+            ) : null}
+            {awaitingConfirmation && !isSignUp ? (
+              <Button
+                title="Resend confirmation email"
+                variant="ghost"
+                onPress={handleResend}
+                loading={busy}
+              />
+            ) : null}
             <Button
               title={isSignUp ? "I already have an account" : "Create a new account"}
               variant="ghost"

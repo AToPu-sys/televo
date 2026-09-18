@@ -2,7 +2,7 @@ import { Ionicons } from "@expo/vector-icons";
 import * as DocumentPicker from "expo-document-picker";
 import * as ImagePicker from "expo-image-picker";
 import { useLocalSearchParams, useRouter } from "expo-router";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -24,16 +24,18 @@ import { useAuth } from "../../src/hooks/useAuth";
 import { blockUser, isUserBlocked } from "../../src/hooks/useBlockedUsers";
 import { useCallManager } from "../../src/hooks/useCallManager";
 import { useConversation } from "../../src/hooks/useConversation";
-import { useE2ee } from "../../src/hooks/useE2ee";
+import { MissingSessionKeyError, useE2ee } from "../../src/hooks/useE2ee";
 import { useLastSeen } from "../../src/hooks/useLastSeen";
 import { useMessages, type ChatMessage } from "../../src/hooks/useMessages";
 import { useParticipantNames } from "../../src/hooks/useParticipantNames";
+import { ASSISTANT_USER_ID } from "../../src/lib/assistant";
+import { setCurrentConversationId } from "../../src/lib/currentChat";
+import { isPeerKeyVerified } from "../../src/lib/e2e";
 import { supabase } from "../../src/lib/supabase";
 import { useTheme } from "../../src/hooks/useTheme";
+import { useToast } from "../../src/hooks/useToast";
 import { useTyping } from "../../src/hooks/useTyping";
 import { radius, spacing } from "../../src/theme";
-
-const ASSISTANT_USER_ID = "00000000-0000-0000-0000-000000000001";
 
 const SELF_DESTRUCT_OPTIONS: { label: string; seconds: number | null }[] = [
   { label: "Off", seconds: null },
@@ -44,18 +46,77 @@ const SELF_DESTRUCT_OPTIONS: { label: string; seconds: number | null }[] = [
   { label: "1 week", seconds: 604800 },
 ];
 
+type ChatRow = { type: "message"; message: ChatMessage } | { type: "separator"; dateKey: string; label: string };
+
+function dayKey(iso: string): string {
+  const d = new Date(iso);
+  return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+}
+
+function dateSeparatorLabel(iso: string): string {
+  const date = new Date(iso);
+  const now = new Date();
+  const startOfDay = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  const diffDays = Math.round((startOfDay(now) - startOfDay(date)) / 86400000);
+  if (diffDays === 0) return "Today";
+  if (diffDays === 1) return "Yesterday";
+  return date.toLocaleDateString(undefined, {
+    day: "numeric",
+    month: "long",
+    year: date.getFullYear() === now.getFullYear() ? undefined : "numeric",
+  });
+}
+
+/** Interleaves a date-separator row wherever two adjacent messages (in this
+ * newest-first array) fall on different calendar days. `messages` is
+ * newest-first because the FlatList that consumes this is `inverted`, so a
+ * separator placed right after (in array order) the OLDEST message of a day
+ * ends up rendered visually ABOVE that message — exactly where a "September
+ * 14" divider belongs. */
+function dateSeparatedRows(messages: ChatMessage[]): ChatRow[] {
+  const rows: ChatRow[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i];
+    rows.push({ type: "message", message });
+    const next = messages[i + 1];
+    if (!next || dayKey(next.created_at) !== dayKey(message.created_at)) {
+      rows.push({ type: "separator", dateKey: dayKey(message.created_at), label: dateSeparatorLabel(message.created_at) });
+    }
+  }
+  return rows;
+}
+
 export default function ConversationScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const { theme } = useTheme();
   const { user } = useAuth();
   const router = useRouter();
+  const { show: showToast } = useToast();
+
+  // Lets useMessageNotifications (app/_layout.tsx) tell "a message arrived
+  // for the chat you're already looking at" apart from "a message arrived
+  // somewhere else" — the former should just play a sound, the latter should
+  // show a mini banner. Updated on every render (not just mount) so
+  // navigating from one chat straight to another (id changes, component
+  // stays mounted) still points at the right conversation; cleared on
+  // unmount so leaving chat screens entirely doesn't leave a stale "current
+  // chat" that suppresses every future banner.
+  useEffect(() => {
+    setCurrentConversationId(id ?? null);
+    return () => setCurrentConversationId(null);
+  }, [id]);
 
   const { conversation, loading: loadingConversation, refresh: refreshConversation } =
     useConversation(id, user?.id);
-  const isEncrypted = conversation?.isEncrypted ?? false;
+  // Stays undefined (rather than defaulting to false) until the conversation
+  // row has actually loaded. useMessages will not fetch on an undefined
+  // value, since guessing "false" for what turns out to be an encrypted chat
+  // would flash the raw {"ciphertext":...} envelope for a frame before
+  // re-fetching with the real value.
+  const isEncrypted = loadingConversation ? undefined : (conversation?.isEncrypted ?? false);
   const {
     messages,
-    loading,
+    loading: loadingMessages,
     peerLastReadAt,
     hasMore,
     loadOlder,
@@ -65,20 +126,94 @@ export default function ConversationScreen() {
     sendDocument,
     deleteMessage,
     markRead,
+    retryDecryption,
   } = useMessages(id, user?.id, isEncrypted, conversation?.selfDestructSeconds ?? null);
+  const loading = loadingConversation || loadingMessages;
+  // renderItem looked up `messages.find(...)` per row to resolve a reply
+  // quote, making it O(n) per row and effectively O(n²) over the list —
+  // visibly janky scrolling once a chat has a few hundred messages.
+  const messagesById = useMemo(() => {
+    const map = new Map<string, ChatMessage>();
+    for (const message of messages) map.set(message.id, message);
+    return map;
+  }, [messages]);
+  // One synthetic row per calendar day boundary, interleaved with the
+  // messages so the inverted list renders a "September 14" divider above the
+  // first message of each day (visually — since the list is inverted, that
+  // divider actually sits right AFTER that day's oldest message in `messages`,
+  // which is itself newest-first).
+  const rows = useMemo(() => dateSeparatedRows(messages), [messages]);
+  // The inline separators in `rows` mark day boundaries in the scrollback,
+  // but on a chat spanning only one day (the common case) that leaves
+  // exactly one separator, sitting above the very oldest message — nothing
+  // shows without scrolling all the way up. This mirrors it as a floating
+  // header pinned to the top of the viewport, always showing the date of
+  // whatever message is currently topmost on screen (the newest-of-the-
+  // visible-set in this inverted list, i.e. the FIRST entry FlatList reports
+  // as viewable), same as Telegram/WhatsApp.
+  const [pinnedDateLabel, setPinnedDateLabel] = useState<string | null>(null);
+  const onViewableItemsChanged = useRef(
+    ({ viewableItems }: { viewableItems: { item: ChatRow }[] }) => {
+      const topMessage = viewableItems.find((v) => v.item.type === "message")?.item;
+      if (topMessage?.type === "message") {
+        setPinnedDateLabel(dateSeparatorLabel(topMessage.message.created_at));
+      }
+    }
+  ).current;
+  const viewabilityConfig = useRef({ itemVisiblePercentThreshold: 0 }).current;
   const participantNames = useParticipantNames(id, user?.id);
   const { label: presenceLabel } = useLastSeen(user?.id, conversation?.otherUserId);
-  const { typingLabel, notifyTyping } = useTyping(
+  const { typingLabel, notifyTyping, notifyStoppedTyping } = useTyping(
     id,
     user?.id,
     user?.user_metadata?.display_name as string | undefined
   );
   const { placeCall, state: callState } = useCallManager();
-  const { startEncryptedChat } = useE2ee();
+  const {
+    startEncryptedChat,
+    peerKeyChanged,
+    acknowledgeKeyChange,
+    repairMissingSessionKeys,
+    hasWorkingSessionKey,
+    ready: e2eeReady,
+  } = useE2ee();
+  const keyChanged = isEncrypted && peerKeyChanged.has(id);
+  // Two encryption tiers, deliberately not both shown the same way: every
+  // chat is end-to-end encrypted the moment it can be (see the auto-encrypt
+  // effect below) with no icon at all, because it's the invisible baseline
+  // now, not a feature to advertise. A shield only appears once the safety
+  // number has been explicitly compared and confirmed out of band — that's
+  // the tier that actually rules out a man-in-the-middle, so it's the one
+  // worth signaling.
+  const [maxSecure, setMaxSecure] = useState(false);
+  useEffect(() => {
+    if (!isEncrypted || !conversation?.otherUserId) {
+      setMaxSecure(false);
+      return;
+    }
+    let active = true;
+    (async () => {
+      const { data } = await supabase
+        .from("profiles")
+        .select("e2e_public_key")
+        .eq("id", conversation.otherUserId!)
+        .single();
+      if (!active) return;
+      if (!data?.e2e_public_key) {
+        setMaxSecure(false);
+        return;
+      }
+      setMaxSecure(await isPeerKeyVerified(id, data.e2e_public_key));
+    })();
+    return () => {
+      active = false;
+    };
+    // keyChanged forces a re-check: acknowledging a key change should drop
+    // the shield until the NEW key is verified, not silently keep it lit.
+  }, [isEncrypted, conversation?.otherUserId, id, keyChanged]);
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
   const [attaching, setAttaching] = useState(false);
-  const [enablingEncryption, setEnablingEncryption] = useState(false);
   const [replyTarget, setReplyTarget] = useState<ChatMessage | null>(null);
   const [isBlocked, setIsBlocked] = useState(false);
   const [editTarget, setEditTarget] = useState<ChatMessage | null>(null);
@@ -90,23 +225,93 @@ export default function ConversationScreen() {
   const [headerSheetOpen, setHeaderSheetOpen] = useState(false);
   const [selfDestructSheetOpen, setSelfDestructSheetOpen] = useState(false);
   const isAssistantChat = conversation?.otherUserId === ASSISTANT_USER_ID;
+  // Group calls ring every member but only the first to answer connects and
+  // the rest keep ringing, so the call buttons are hidden for groups until
+  // that's fixed properly.
+  const canCall = !isAssistantChat && conversation?.kind !== "group";
 
-  async function handleEnableEncryption() {
-    // Groups are supported now too — the session key is wrapped to every
-    // member's public key, not just one other person's.
-    if (!id || !conversation) return;
-    setEnablingEncryption(true);
-    try {
-      await startEncryptedChat(id, conversation.otherUserId ?? undefined);
-      await refreshConversation();
-    } catch (caught) {
-      Alert.alert(
-        "Couldn't start Secret Chat",
-        caught instanceof Error ? caught.message : "Please try again."
-      );
-    } finally {
-      setEnablingEncryption(false);
-    }
+  // Security-first default: every chat — new or pre-existing — gets end-to-
+  // end encryption turned on automatically the moment it can be, with no
+  // button to press. is_encrypted is one-way (a DB trigger rejects turning
+  // it back off, see 016_harden_encryption_and_edit.sql), so this can only
+  // ever raise a conversation's protection, never lower it. Silent by
+  // design: this is a security upgrade, not a user decision, so there's
+  // nothing useful to ask permission for. It naturally no-ops for the
+  // assistant (no key pair to wrap to) and quietly retries next time the
+  // chat opens if the peer hasn't set up their key yet — startEncryptedChat
+  // already throws a clear "hasn't opened the app on a version that supports
+  // encryption yet" in that case, which is expected, not an error to surface.
+  const autoEncryptAttempted = useRef<string | null>(null);
+  useEffect(() => {
+    if (!id || !conversation || isAssistantChat) return;
+    if (isEncrypted || !e2eeReady) return;
+    if (autoEncryptAttempted.current === id) return;
+    autoEncryptAttempted.current = id;
+
+    void startEncryptedChat(id, conversation.otherUserId ?? undefined)
+      .then(() => refreshConversation())
+      .catch(() => {
+        // Expected when a participant hasn't published a public key yet —
+        // this chat gets encrypted automatically the next time it's opened
+        // after they have. No user-facing error for what isn't a failure.
+      });
+  }, [id, conversation, isAssistantChat, isEncrypted, e2eeReady, startEncryptedChat, refreshConversation]);
+
+  // Companion to the effect above: if the chat is ALREADY encrypted and this
+  // device can decrypt in it, opportunistically top up any participant who's
+  // missing their wrapped copy of the key (see repairMissingSessionKeys —
+  // it only ever adds a row for someone who has none, never touches an
+  // existing one, so it can't create the key mismatch a naive "just
+  // re-encrypt" fix would). This is what actually recovers a chat where a
+  // send previously failed with "No encryption key available": the NEXT
+  // device to open it (whichever one still holds the real key) fixes it for
+  // whoever is missing a copy.
+  //
+  useEffect(() => {
+    if (!id || !isEncrypted || !e2eeReady) return;
+    void repairMissingSessionKeys(id).catch((caught) => {
+      // eslint-disable-next-line no-console
+      console.error("[repairMissingSessionKeys] unexpected failure:", caught);
+    });
+  }, [id, isEncrypted, e2eeReady, repairMissingSessionKeys]);
+
+  // If NO device holds a working key at all — is_encrypted=true but every
+  // encrypted_session_keys row for this conversation is gone or unreadable
+  // (e.g. every participant's local keypair changed since the row was
+  // wrapped to their old public key), repairMissingSessionKeys can't help
+  // either: it also starts from loadSessionKey, which fails the same way.
+  // That state can only be recovered by starting encryption over from zero —
+  // safe here specifically because there is no readable key anywhere left to
+  // desync from, and startEncryptedChat's plain-insert guard still refuses
+  // to touch any row that happens to exist.
+  const reinitAttempted = useRef<string | null>(null);
+  useEffect(() => {
+    if (!id || !conversation || isAssistantChat || !isEncrypted || !e2eeReady) return;
+    if (reinitAttempted.current === id) return;
+
+    void hasWorkingSessionKey(id).then((hasKey) => {
+      if (hasKey || reinitAttempted.current === id) return;
+      reinitAttempted.current = id;
+      void startEncryptedChat(id, conversation.otherUserId ?? undefined).catch(() => {
+        // Same as the not-yet-encrypted path: expected if a participant
+        // hasn't published a key, not a user-facing failure.
+      });
+    });
+  }, [id, conversation, isAssistantChat, isEncrypted, e2eeReady, hasWorkingSessionKey, startEncryptedChat]);
+
+  function handleDisableEncryptionBlocked() {
+    // A Secret Chat is deliberately one-way (scripts/sql/016_harden_encryption
+    // _and_edit.sql, "AUDIT FIX 1"): a server trigger rejects flipping
+    // is_encrypted back to false. That fix exists because without it, a peer
+    // could silently downgrade the OTHER person's chat to plaintext — the
+    // victim's next message would go out unencrypted with no warning beyond
+    // a lock icon quietly disappearing. Turning that off on request would
+    // reopen exactly that hole, so this explains the trade-off instead of
+    // trying (and failing at the database) to disable it.
+    Alert.alert(
+      "Secret Chats can't be turned off",
+      "Once end-to-end encryption is on for a chat, it stays on — for both of you. This is intentional: without it, either person could silently downgrade the other's chat back to plaintext with no warning. To go back to a regular chat, start a new conversation instead."
+    );
   }
 
   function handleCall(kind: "audio" | "video") {
@@ -123,7 +328,7 @@ export default function ConversationScreen() {
 
   useEffect(() => {
     if (!user?.id || conversation?.kind !== "direct" || !conversation.otherUserId) return;
-    isUserBlocked(user.id, conversation.otherUserId).then(setIsBlocked);
+    isUserBlocked(user.id, conversation.otherUserId).then(setIsBlocked).catch(() => setIsBlocked(false));
   }, [user?.id, conversation?.kind, conversation?.otherUserId]);
 
   // Blocking is bidirectional server-side, so once either side blocks, every
@@ -133,7 +338,7 @@ export default function ConversationScreen() {
 
   function handleBlockToggle() {
     if (!user?.id || !conversation?.otherUserId) return;
-    const name = conversation.title;
+    const name = conversation.title || "this person";
 
     if (isBlocked) {
       Alert.alert(`Unblock ${name}?`, undefined, [
@@ -211,7 +416,11 @@ export default function ConversationScreen() {
         onPress: () => {
           router.push({
             pathname: "/verify-safety-number" as never,
-            params: { peerId: conversation.otherUserId!, peerName: conversation.title },
+            params: {
+              peerId: conversation.otherUserId!,
+              peerName: conversation.title || "this person",
+              conversationId: id,
+            },
           });
         },
       });
@@ -223,6 +432,12 @@ export default function ConversationScreen() {
         label: "Self-Destruct Timer",
         icon: "timer-outline",
         onPress: handleOpenSelfDestructMenu,
+      });
+      options.push({
+        key: "disable-encryption",
+        label: "Turn off Secret Chat",
+        icon: "lock-open-outline",
+        onPress: handleDisableEncryptionBlocked,
       });
     }
     if (conversation?.kind === "direct") {
@@ -247,8 +462,29 @@ export default function ConversationScreen() {
         await editMessage(editTarget.id, body);
         setEditTarget(null);
       } else {
-        await sendMessage(body, replyTarget?.id ?? null);
+        try {
+          await sendMessage(body, replyTarget?.id ?? null);
+        } catch (caught) {
+          // This device has no wrapped copy of the conversation's session
+          // key, so it cannot encrypt (some other device holds the real
+          // key). Minting a NEW key here would desync everyone who already
+          // has the real one — the repairMissingSessionKeys effect above is
+          // the actual fix, and it runs the moment any device that DOES hold
+          // the key opens this chat. Nothing safe to retry from this side
+          // right now, so surface a specific reason instead of a generic
+          // failed bubble with no explanation.
+          if (caught instanceof MissingSessionKeyError) {
+            showToast({
+              kind: "error",
+              message: "Can't send yet",
+              detail:
+                "This device is still catching up on this chat's encryption. Ask the other person to open this chat once.",
+            });
+          }
+          throw caught;
+        }
         setReplyTarget(null);
+        notifyStoppedTyping();
       }
     } catch {
       // useMessages marks the bubble as failed; restore the text so the user
@@ -287,7 +523,23 @@ export default function ConversationScreen() {
       try {
         await sendImage(asset.uri, asset.type === "video" ? "video" : "image");
       } catch (caught) {
-        Alert.alert("Upload failed", caught instanceof Error ? caught.message : "Please try again.");
+        // Toast rather than Alert: an upload failure is transient and
+        // recoverable, and a modal here blocks the conversation to deliver
+        // news the user can act on without leaving the screen.
+        if (caught instanceof MissingSessionKeyError) {
+          showToast({
+            kind: "error",
+            message: "Can't send yet",
+            detail:
+              "This device is still catching up on this chat's encryption. Ask the other person to open this chat once.",
+          });
+        } else {
+          showToast({
+            kind: "error",
+            message: "Upload failed",
+            detail: caught instanceof Error ? caught.message : "Please try again.",
+          });
+        }
       } finally {
         setAttaching(false);
       }
@@ -309,7 +561,23 @@ export default function ConversationScreen() {
       try {
         await sendDocument(asset.uri, asset.name, asset.size ?? 0);
       } catch (caught) {
-        Alert.alert("Upload failed", caught instanceof Error ? caught.message : "Please try again.");
+        // Toast rather than Alert: an upload failure is transient and
+        // recoverable, and a modal here blocks the conversation to deliver
+        // news the user can act on without leaving the screen.
+        if (caught instanceof MissingSessionKeyError) {
+          showToast({
+            kind: "error",
+            message: "Can't send yet",
+            detail:
+              "This device is still catching up on this chat's encryption. Ask the other person to open this chat once.",
+          });
+        } else {
+          showToast({
+            kind: "error",
+            message: "Upload failed",
+            detail: caught instanceof Error ? caught.message : "Please try again.",
+          });
+        }
       } finally {
         setAttaching(false);
       }
@@ -318,9 +586,12 @@ export default function ConversationScreen() {
     }
   }
 
-  function handleMessageLongPress(message: ChatMessage) {
+  // useCallback, not a plain function: this is passed to every MessageBubble,
+  // and a new identity each render defeats the bubble's memo comparator —
+  // which would re-render the whole visible list on every keystroke.
+  const handleMessageLongPress = useCallback((message: ChatMessage) => {
     setMessageSheetTarget(message);
-  }
+  }, []);
 
   // App Store Guideline 1.2 requires a way to report offensive content in
   // any app with user-generated content. Snapshots the body because the
@@ -337,7 +608,7 @@ export default function ConversationScreen() {
 
     Alert.alert(
       "Report message",
-      "Tell us what's wrong. Reports are reviewed within 24 hours.",
+      "Tell us what's wrong. We review every report and act on it.",
       [
         ...reasons.map((reason) => ({
           text: reason.label,
@@ -350,14 +621,24 @@ export default function ConversationScreen() {
                 message_id: message.id,
                 conversation_id: message.conversation_id,
                 reason: reason.key,
-                reported_content: message.decryptedBody ?? message.body ?? null,
+                // Only ever the PLAINTEXT the reporter actually saw. Gating on
+                // `isEncrypted` (the conversation), not on
+                // `decryptedBody === undefined`: undefined also means "this
+                // IS an encrypted chat, but the async decorateWithDecryption
+                // pass over a just-arrived realtime row hasn't resolved yet"
+                // — a narrow but real window where `body` is still the raw
+                // ciphertext envelope. Falling through to it there reintroduced
+                // the exact leak this fallback exists to prevent. See the
+                // identical reply-quote / edit-target rule elsewhere in this
+                // file for the same distinction.
+                reported_content: isEncrypted ? (message.decryptedBody ?? null) : message.body,
               })
               .then(({ error }) => {
                 Alert.alert(
                   error ? "Couldn't send report" : "Report sent",
                   error
                     ? error.message
-                    : "Thanks. We'll review this within 24 hours. You can also block this person."
+                    : "Thanks — this has been sent to us for review. You can also block this person."
                 );
               });
           },
@@ -443,7 +724,12 @@ export default function ConversationScreen() {
     return options;
   }
 
-  const title = conversation?.title ?? "Chat";
+  // || not ??: useConversation briefly publishes an empty-string title for a
+  // direct chat (profile name/avatar arrive in a later, non-blocking
+  // follow-up — see its own comment) — an empty string is falsy but not
+  // nullish, so `?? "Chat"` would have let it straight through blank instead
+  // of falling back for that one render.
+  const title = conversation?.title || "Chat";
 
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: theme.chatBackground }]}>
@@ -461,55 +747,60 @@ export default function ConversationScreen() {
         >
           <Ionicons name="chevron-back" size={28} color={theme.accent} />
         </Pressable>
-        <Avatar name={title} uri={conversation?.avatarUrl ?? null} size={38} />
-        <View style={styles.headerText}>
-          <View style={styles.headerTitleRow}>
-            {isEncrypted ? (
-              <Ionicons name="lock-closed" size={13} color={theme.online} style={styles.lockIcon} />
+        <Pressable
+          style={styles.headerIdentity}
+          disabled={!conversation?.otherUserId || isAssistantChat}
+          onPress={() => {
+            if (conversation?.otherUserId) {
+              router.push({
+                pathname: "/user-profile" as never,
+                params: { userId: conversation.otherUserId, conversationId: id },
+              });
+            }
+          }}
+          accessibilityRole="button"
+          accessibilityLabel={`View ${title}'s profile`}
+        >
+          <Avatar name={title} uri={conversation?.avatarUrl ?? null} size={38} />
+          <View style={styles.headerText}>
+            <View style={styles.headerTitleRow}>
+              {maxSecure ? (
+                <Ionicons
+                  name="shield-checkmark"
+                  size={13}
+                  color={theme.online}
+                  style={styles.lockIcon}
+                />
+              ) : null}
+              <Text style={[styles.headerTitle, { color: theme.text }]} numberOfLines={1}>
+                {loadingConversation ? "…" : title}
+              </Text>
+            </View>
+            {typingLabel ? (
+              <Text style={[styles.headerSubtitle, { color: theme.accent }]} numberOfLines={1}>
+                {typingLabel}
+              </Text>
+            ) : presenceLabel ? (
+              <Text
+                style={[
+                  styles.headerSubtitle,
+                  { color: presenceLabel === "online" ? theme.online : theme.textSecondary },
+                ]}
+                numberOfLines={1}
+              >
+                {presenceLabel}
+              </Text>
+            ) : conversation?.subtitle ? (
+              <Text style={[styles.headerSubtitle, { color: theme.textSecondary }]} numberOfLines={1}>
+                {conversation.subtitle}
+              </Text>
             ) : null}
-            <Text style={[styles.headerTitle, { color: theme.text }]} numberOfLines={1}>
-              {loadingConversation ? "…" : title}
-            </Text>
           </View>
-          {typingLabel ? (
-            <Text style={[styles.headerSubtitle, { color: theme.accent }]} numberOfLines={1}>
-              {typingLabel}
-            </Text>
-          ) : presenceLabel ? (
-            <Text
-              style={[
-                styles.headerSubtitle,
-                { color: presenceLabel === "online" ? theme.online : theme.textSecondary },
-              ]}
-              numberOfLines={1}
-            >
-              {presenceLabel}
-            </Text>
-          ) : conversation?.subtitle ? (
-            <Text style={[styles.headerSubtitle, { color: theme.textSecondary }]} numberOfLines={1}>
-              {conversation.subtitle}
-            </Text>
-          ) : null}
-        </View>
-        {conversation && !isEncrypted && !isAssistantChat ? (
-          <Pressable
-            onPress={handleEnableEncryption}
-            disabled={enablingEncryption}
-            accessibilityRole="button"
-            accessibilityLabel="Start Secret Chat (end-to-end encrypted)"
-            hitSlop={10}
-            style={styles.headerAction}
-          >
-            {enablingEncryption ? (
-              <ActivityIndicator color={theme.accent} />
-            ) : (
-              <Ionicons name="lock-open-outline" size={22} color={theme.accent} />
-            )}
-          </Pressable>
-        ) : null}
+        </Pressable>
         {/* A bot has no voice/video, nothing to block, and no self-destruct
-            menu worth showing — only calling/block/encryption are hidden. */}
-        {!isAssistantChat ? (
+            menu worth showing — only calling/block/encryption are hidden.
+            Group calls are hidden too (see canCall above). */}
+        {canCall ? (
           <>
             <Pressable
               onPress={() => handleCall("audio")}
@@ -529,16 +820,18 @@ export default function ConversationScreen() {
             >
               <Ionicons name="videocam-outline" size={25} color={theme.accent} />
             </Pressable>
-            <Pressable
-              onPress={handleHeaderMenu}
-              accessibilityRole="button"
-              accessibilityLabel="Chat options"
-              hitSlop={10}
-              style={styles.headerAction}
-            >
-              <Ionicons name="ellipsis-vertical" size={20} color={theme.accent} />
-            </Pressable>
           </>
+        ) : null}
+        {!isAssistantChat ? (
+          <Pressable
+            onPress={handleHeaderMenu}
+            accessibilityRole="button"
+            accessibilityLabel="Chat options"
+            hitSlop={10}
+            style={styles.headerAction}
+          >
+            <Ionicons name="ellipsis-vertical" size={20} color={theme.accent} />
+          </Pressable>
         ) : null}
       </View>
 
@@ -547,18 +840,56 @@ export default function ConversationScreen() {
         behavior={Platform.OS === "ios" ? "padding" : undefined}
         keyboardVerticalOffset={Platform.OS === "ios" ? 0 : 0}
       >
+        {keyChanged ? (
+          <View style={[styles.keyChangedBanner, { backgroundColor: theme.danger }]}>
+            <Ionicons name="warning-outline" size={16} color="#FFFFFF" />
+            <Text style={styles.keyChangedText}>
+              {title}'s encryption key changed. This can happen after a reinstall — or it can mean
+              someone intercepted this chat.
+            </Text>
+            <Pressable
+              onPress={() => {
+                if (conversation?.otherUserId) {
+                  router.push({
+                    pathname: "/verify-safety-number" as never,
+                    params: { peerId: conversation.otherUserId, peerName: title, conversationId: id },
+                  });
+                }
+              }}
+              hitSlop={8}
+            >
+              <Text style={styles.keyChangedAction}>Verify</Text>
+            </Pressable>
+            <Pressable onPress={() => acknowledgeKeyChange(id)} hitSlop={8}>
+              <Ionicons name="close" size={18} color="#FFFFFF" />
+            </Pressable>
+          </View>
+        ) : null}
+
         {loading ? (
           <View style={styles.center}>
             <ActivityIndicator size="large" color={theme.accent} />
           </View>
         ) : (
-          <FlatList
+          <View style={styles.flex}>
+            {pinnedDateLabel ? (
+              <View style={styles.pinnedDateWrap} pointerEvents="none">
+                <View style={[styles.dateSeparatorPill, { backgroundColor: theme.surfaceElevated }]}>
+                  <Text style={[styles.dateSeparatorText, { color: theme.textSecondary }]}>
+                    {pinnedDateLabel}
+                  </Text>
+                </View>
+              </View>
+            ) : null}
+            <FlatList
             // Newest-first data rendered bottom-up, so new messages appear at
             // the bottom without manual scrolling.
             inverted
-            data={messages}
-            keyExtractor={(item) => item.id}
+            data={rows}
+            keyExtractor={(row) => (row.type === "separator" ? `sep-${row.dateKey}` : row.message.id)}
             contentContainerStyle={styles.list}
+            onViewableItemsChanged={onViewableItemsChanged}
+            viewabilityConfig={viewabilityConfig}
             // The list is inverted, so "end" is the OLDEST message — this is
             // what loads older history instead of hitting a wall at 50.
             onEndReached={() => void loadOlder()}
@@ -575,21 +906,44 @@ export default function ConversationScreen() {
                 </Text>
               </View>
             }
-            renderItem={({ item }) => {
-              const repliedTo = item.reply_to_id
-                ? messages.find((candidate) => candidate.id === item.reply_to_id)
-                : null;
+            // Virtualization tuning. The defaults render a large window and
+            // never release offscreen rows, which on a long history means
+            // hundreds of live bubbles — each holding image/video state.
+            windowSize={9}
+            maxToRenderPerBatch={10}
+            initialNumToRender={14}
+            updateCellsBatchingPeriod={40}
+            removeClippedSubviews
+            renderItem={({ item: row }) => {
+              if (row.type === "separator") {
+                return (
+                  <View style={styles.dateSeparator} pointerEvents="none">
+                    <View style={[styles.dateSeparatorPill, { backgroundColor: theme.surfaceElevated }]}>
+                      <Text style={[styles.dateSeparatorText, { color: theme.textSecondary }]}>
+                        {row.label}
+                      </Text>
+                    </View>
+                  </View>
+                );
+              }
+              const item = row.message;
+              const repliedTo = item.reply_to_id ? messagesById.get(item.reply_to_id) : null;
               const replyPreview = repliedTo
                 ? {
                     senderName: participantNames[repliedTo.sender_id] ?? "Someone",
                     text:
-                      repliedTo.decryptedBody ??
-                      repliedTo.body ??
-                      (repliedTo.kind === "image"
-                        ? "Photo"
-                        : repliedTo.kind === "document"
-                          ? (repliedTo.document_name ?? "Document")
-                          : "Message"),
+                      // decryptedBody is undefined for a plaintext message (use
+                      // body), null when this device couldn't decrypt it — in
+                      // that case `body` is still the raw ciphertext envelope,
+                      // so it must never be shown as if it were text.
+                      repliedTo.decryptedBody !== undefined
+                        ? (repliedTo.decryptedBody ?? "🔒 Unable to decrypt")
+                        : (repliedTo.body ??
+                          (repliedTo.kind === "image"
+                            ? "Photo"
+                            : repliedTo.kind === "document"
+                              ? (repliedTo.document_name ?? "Document")
+                              : "Message")),
                   }
                 : null;
 
@@ -605,10 +959,12 @@ export default function ConversationScreen() {
                   replyPreview={replyPreview}
                   forwardedFrom={forwardedFrom}
                   peerLastReadAt={peerLastReadAt}
+                  onRetryDecryption={retryDecryption}
                 />
               );
             }}
-          />
+            />
+          </View>
         )}
 
         {replyTarget || editTarget ? (
@@ -619,12 +975,21 @@ export default function ConversationScreen() {
                 {editTarget ? "Editing message" : "Reply"}
               </Text>
               <Text style={[styles.replyPreview, { color: theme.textSecondary }]} numberOfLines={1}>
-                {(editTarget ?? replyTarget)?.decryptedBody ??
-                  (editTarget ?? replyTarget)?.body ??
-                  (((editTarget ?? replyTarget)?.kind === "image" && "Photo") ||
-                    ((editTarget ?? replyTarget)?.kind === "document" &&
-                      (editTarget ?? replyTarget)?.document_name) ||
-                    "Message")}
+                {(() => {
+                  const target = editTarget ?? replyTarget;
+                  // Same rule as the reply-quote above: never fall through to
+                  // the raw ciphertext envelope in `body` for an encrypted
+                  // message that failed to decrypt.
+                  if (target?.decryptedBody !== undefined) {
+                    return target?.decryptedBody ?? "🔒 Unable to decrypt";
+                  }
+                  return (
+                    target?.body ??
+                    ((target?.kind === "image" && "Photo") ||
+                      (target?.kind === "document" && target?.document_name) ||
+                      "Message")
+                  );
+                })()}
               </Text>
             </View>
             <Pressable
@@ -694,8 +1059,8 @@ export default function ConversationScreen() {
             ]}
           >
             <Ionicons
-              name="send"
-              size={18}
+              name="arrow-up"
+              size={20}
               color={draft.trim() ? "#FFFFFF" : theme.textSecondary}
             />
           </Pressable>
@@ -747,6 +1112,15 @@ export default function ConversationScreen() {
 const styles = StyleSheet.create({
   container: { flex: 1 },
   flex: { flex: 1 },
+  keyChangedBanner: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+  },
+  keyChangedText: { flex: 1, color: "#FFFFFF", fontSize: 12.5, lineHeight: 16 },
+  keyChangedAction: { color: "#FFFFFF", fontWeight: "700", fontSize: 13 },
   header: {
     flexDirection: "row",
     alignItems: "center",
@@ -755,6 +1129,7 @@ const styles = StyleSheet.create({
     paddingVertical: spacing.sm,
     borderBottomWidth: StyleSheet.hairlineWidth,
   },
+  headerIdentity: { flex: 1, flexDirection: "row", alignItems: "center", gap: spacing.sm },
   headerText: { flex: 1 },
   headerTitleRow: { flexDirection: "row", alignItems: "center" },
   headerTitle: { fontSize: 17, fontWeight: "600" },
@@ -804,4 +1179,25 @@ const styles = StyleSheet.create({
   replyLabel: { fontSize: 13, fontWeight: "600" },
   replyPreview: { fontSize: 13 },
   olderLoader: { paddingVertical: spacing.md },
+  dateSeparator: {
+    alignItems: "center",
+    paddingVertical: spacing.sm,
+  },
+  dateSeparatorPill: {
+    paddingHorizontal: spacing.md,
+    paddingVertical: 4,
+    borderRadius: radius.pill,
+  },
+  dateSeparatorText: {
+    fontSize: 12,
+    fontWeight: "600",
+  },
+  pinnedDateWrap: {
+    position: "absolute",
+    top: spacing.sm,
+    left: 0,
+    right: 0,
+    alignItems: "center",
+    zIndex: 1,
+  },
 });

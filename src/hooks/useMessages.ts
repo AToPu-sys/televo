@@ -1,8 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { uploadChatDocument, uploadChatMedia } from "../lib/media";
+import { uploadChatDocument, uploadChatMedia,
+  parseMediaRef,
+} from "../lib/media";
 import { supabase } from "../lib/supabase";
 import type { Database } from "../types/database";
+import { randomUUID } from "../lib/uuid";
+import { playMessageSentSound } from "./useMessageNotifications";
 import { useE2ee } from "./useE2ee";
 
 type MessageRow = Database["public"]["Tables"]["messages"]["Row"];
@@ -34,9 +38,31 @@ function isEncryptedEnvelope(body: string): boolean {
 export function useMessages(
   conversationId: string | undefined,
   userId: string | undefined,
-  isEncrypted: boolean = false,
+  // undefined means "not known yet" (the owning conversation row is still
+  // loading) — load() is held off until this settles to a real boolean, so
+  // messages are never fetched on a guessed encryption state. See the
+  // loadRunIdRef comment below for why a wrong guess used to flash "🔒 …".
+  //
+  // Deliberately NO `= false` default here. app/chat/[id].tsx passes
+  // `undefined` explicitly while the conversation row is still loading —
+  // and a JS default parameter substitutes its default for ANY `undefined`
+  // argument, including an explicit one. With `= false` on this parameter,
+  // `isEncryptedInput` was silently coerced to `false` before this
+  // function's body ever ran, so the `isEncryptedInput === undefined` guard
+  // below could never be true — the "hold off until it's known" gate was
+  // dead code. load() ran immediately on the first render with a guessed
+  // `false`, decorateWithDecryption's early return left the raw ciphertext
+  // envelope in `body`, and MessageBubble rendered its "🔒 …" fallback for
+  // that one frame before the real value arrived and re-triggered load().
+  // That flash-of-🔒 is the exact bug this parameter's own comment already
+  // claimed was fixed. Leaving the parameter genuinely optional (no default)
+  // means an explicit `undefined` argument stays `undefined` inside the
+  // function, and only a caller that omits the argument entirely falls back
+  // to the isEncrypted local below.
+  isEncryptedInput: boolean | undefined,
   selfDestructSeconds: number | null = null
 ) {
+  const isEncrypted = isEncryptedInput ?? false;
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -49,6 +75,25 @@ export function useMessages(
   // checkmark unconditionally, which simply lied to the user.
   const [peerLastReadAt, setPeerLastReadAt] = useState<string | null>(null);
   const loadingOlderRef = useRef(false);
+  // False until the channel's first SUBSCRIBED; distinguishes the initial
+  // join (no refetch needed) from a reconnect (refetch required).
+  const hasSubscribedRef = useRef(false);
+  // Incremented at the start of every load() call; each call captures its
+  // own id and checks it's still current before writing state. `load`'s
+  // identity changes whenever `isEncrypted` does (via decorateWithDecryption
+  // below), and `isEncrypted` genuinely flips false -> true on every visit
+  // to a Secret Chat (useConversation has no cache, so it always starts
+  // `false` for one render before the real value loads) — which re-fires
+  // the effect that calls load() a second time. The FIRST (isEncrypted:
+  // false) call skips decryption entirely (see decorateWithDecryption's
+  // early return) and is therefore structurally faster than the SECOND
+  // (isEncrypted: true) call, which awaits real decryption per message.
+  // With no ordering guarantee, the first call's setMessages/setLoading(
+  // false) could land after the second call started but before it
+  // finished — showing raw ciphertext envelopes with decryptedBody still
+  // undefined for one frame, which MessageBubble renders as "🔒 …". This
+  // guard makes only the LAST-STARTED call ever allowed to write state.
+  const loadRunIdRef = useRef(0);
   const { encryptForConversation, decryptForConversation, encryptBytesForConversation } = useE2ee();
 
   const decorateWithDecryption = useCallback(
@@ -74,9 +119,13 @@ export function useMessages(
   );
 
   const load = useCallback(async () => {
+    const runId = ++loadRunIdRef.current;
+
     if (!conversationId) {
-      setMessages([]);
-      setLoading(false);
+      if (runId === loadRunIdRef.current) {
+        setMessages([]);
+        setLoading(false);
+      }
       return;
     }
 
@@ -88,13 +137,16 @@ export function useMessages(
       .limit(PAGE_SIZE);
 
     if (queryError) {
-      setError(queryError.message);
+      if (runId === loadRunIdRef.current) setError(queryError.message);
     } else {
       const rows = data ?? [];
-      setMessages(await decorateWithDecryption(rows));
-      setHasMore(rows.length === PAGE_SIZE);
+      const decorated = await decorateWithDecryption(rows);
+      if (runId === loadRunIdRef.current) {
+        setMessages(decorated);
+        setHasMore(rows.length === PAGE_SIZE);
+      }
     }
-    setLoading(false);
+    if (runId === loadRunIdRef.current) setLoading(false);
   }, [conversationId, decorateWithDecryption]);
 
   /** Loads the next page of older messages. Without this, anything past the
@@ -131,9 +183,10 @@ export function useMessages(
   }, [conversationId, hasMore, messages, decorateWithDecryption]);
 
   useEffect(() => {
+    if (isEncryptedInput === undefined) return;
     setLoading(true);
     void load();
-  }, [load]);
+  }, [load, isEncryptedInput]);
 
   useEffect(() => {
     if (!conversationId) return;
@@ -210,7 +263,19 @@ export function useMessages(
           setMessages((current) => current.filter((message) => message.id !== removed.id));
         }
       )
-      .subscribe();
+      .subscribe((status) => {
+        // Realtime is a WebSocket: a Wi-Fi→cellular handover, a tunnel or a
+        // spell in the background drops it, and supabase-js silently
+        // re-joins. Broadcast and postgres_changes have NO replay, so every
+        // INSERT during that gap is lost forever — messages simply never
+        // appeared until the chat was closed and reopened. Refetching on each
+        // (re)subscribe closes that hole; the first SUBSCRIBED is skipped
+        // because load() has just run.
+        if (status === "SUBSCRIBED") {
+          if (hasSubscribedRef.current) void load();
+          hasSubscribedRef.current = true;
+        }
+      });
 
     return () => {
       void supabase.removeChannel(channel);
@@ -222,7 +287,7 @@ export function useMessages(
       const trimmed = body.trim();
       if (!trimmed || !conversationId || !userId) return;
 
-      const optimisticId = `optimistic-${Date.now()}`;
+      const optimisticId = `optimistic-${randomUUID()}`;
       optimisticIds.current.add(optimisticId);
 
       const expiresAt = selfDestructSeconds
@@ -265,7 +330,18 @@ export function useMessages(
           expires_at: expiresAt,
         });
         if (insertError) throw insertError;
+        playMessageSentSound();
       } catch (error) {
+        // Every send failure used to look identical — a red bubble with no
+        // trace of WHY (network error, RLS rejection, missing encryption
+        // key). That made it impossible to tell a real bug from a network
+        // blip from a race condition without adding logging after the fact.
+        // eslint-disable-next-line no-console
+        console.error(
+          "[sendMessage] failed:",
+          error instanceof Error ? error.message : error,
+          { conversationId, isEncrypted }
+        );
         // Leave the bubble in place but mark it failed, so the text isn't lost.
         setMessages((current) =>
           current.map((message) =>
@@ -293,25 +369,38 @@ export function useMessages(
         : trimmed;
 
       // Optimistic edit: `body` mirrors what's stored, `decryptedBody` is
-      // what gets rendered.
+      // what gets rendered. Kept so a failed server write can be rolled back
+      // instead of leaving the bubble showing an edit that never actually
+      // saved — previously a failure here left the wrong text on screen
+      // indefinitely, until some unrelated realtime event or reload happened
+      // to overwrite it with the true server state.
+      let previous: ChatMessage | undefined;
       setMessages((current) =>
-        current.map((message) =>
-          message.id === messageId
-            ? {
-                ...message,
-                body: storedBody,
-                decryptedBody: isEncrypted ? trimmed : undefined,
-                edited_at: new Date().toISOString(),
-              }
-            : message
-        )
+        current.map((message) => {
+          if (message.id !== messageId) return message;
+          previous = message;
+          return {
+            ...message,
+            body: storedBody,
+            decryptedBody: isEncrypted ? trimmed : undefined,
+            edited_at: new Date().toISOString(),
+          };
+        })
       );
 
       const { error } = await supabase
         .from("messages")
         .update({ body: storedBody, edited_at: new Date().toISOString() })
         .eq("id", messageId);
-      if (error) throw error;
+      if (error) {
+        if (previous) {
+          const restored = previous;
+          setMessages((current) =>
+            current.map((message) => (message.id === messageId ? restored : message))
+          );
+        }
+        throw error;
+      }
     },
     [conversationId, isEncrypted, encryptForConversation]
   );
@@ -322,9 +411,15 @@ export function useMessages(
 
   const sendImage = useCallback(
     async (localUri: string, kind: "image" | "video" = "image") => {
+      // Self-destruct applies to media too. These paths hardcoded null, so a
+      // user who switched disappearing messages on and sent a photo got a
+      // permanent photo — the UI promised something the code did not do.
+      const expiresAt = selfDestructSeconds
+        ? new Date(Date.now() + selfDestructSeconds * 1000).toISOString()
+        : null;
       if (!conversationId || !userId) return;
 
-      const optimisticId = `optimistic-${Date.now()}`;
+      const optimisticId = `optimistic-${randomUUID()}`;
       const optimistic: ChatMessage = {
         id: optimisticId,
         conversation_id: conversationId,
@@ -339,7 +434,7 @@ export function useMessages(
         edited_at: null,
         forwarded_from_message_id: null,
         forwarded_from_sender_id: null,
-        expires_at: null,
+        expires_at: expiresAt,
         document_name: null,
         document_size_bytes: null,
         created_at: new Date().toISOString(),
@@ -360,7 +455,14 @@ export function useMessages(
           media_url: path,
         });
         if (insertError) throw insertError;
+        playMessageSentSound();
       } catch (error) {
+        // eslint-disable-next-line no-console
+        console.error(
+          "[sendImage] failed:",
+          error instanceof Error ? error.message : error,
+          { conversationId, isEncrypted }
+        );
         setMessages((current) =>
           current.map((message) =>
             message.id === optimisticId ? { ...message, pending: false, failed: true } : message
@@ -369,14 +471,20 @@ export function useMessages(
         throw error;
       }
     },
-    [conversationId, userId, isEncrypted, encryptBytesForConversation]
+    [conversationId, userId, isEncrypted, encryptBytesForConversation, selfDestructSeconds]
   );
 
   const sendDocument = useCallback(
     async (localUri: string, name: string, sizeBytes: number) => {
+      // Self-destruct applies to media too. These paths hardcoded null, so a
+      // user who switched disappearing messages on and sent a photo got a
+      // permanent photo — the UI promised something the code did not do.
+      const expiresAt = selfDestructSeconds
+        ? new Date(Date.now() + selfDestructSeconds * 1000).toISOString()
+        : null;
       if (!conversationId || !userId) return;
 
-      const optimisticId = `optimistic-${Date.now()}`;
+      const optimisticId = `optimistic-${randomUUID()}`;
       const optimistic: ChatMessage = {
         id: optimisticId,
         conversation_id: conversationId,
@@ -390,7 +498,7 @@ export function useMessages(
         edited_at: null,
         forwarded_from_message_id: null,
         forwarded_from_sender_id: null,
-        expires_at: null,
+        expires_at: expiresAt,
         document_name: name,
         document_size_bytes: sizeBytes,
         created_at: new Date().toISOString(),
@@ -414,7 +522,14 @@ export function useMessages(
           document_size_bytes: sizeBytes,
         });
         if (insertError) throw insertError;
+        playMessageSentSound();
       } catch (error) {
+        // eslint-disable-next-line no-console
+        console.error(
+          "[sendDocument] failed:",
+          error instanceof Error ? error.message : error,
+          { conversationId, isEncrypted }
+        );
         setMessages((current) =>
           current.map((message) =>
             message.id === optimisticId ? { ...message, pending: false, failed: true } : message
@@ -423,15 +538,42 @@ export function useMessages(
         throw error;
       }
     },
-    [conversationId, userId, isEncrypted, encryptBytesForConversation]
+    [conversationId, userId, isEncrypted, encryptBytesForConversation, selfDestructSeconds]
   );
 
-  const deleteMessage = useCallback(async (messageId: string) => {
-    // Optimistically remove; the realtime DELETE event is a no-op afterwards.
-    setMessages((current) => current.filter((message) => message.id !== messageId));
-    const { error } = await supabase.from("messages").delete().eq("id", messageId);
-    if (error) throw error;
-  }, []);
+  const deleteMessage = useCallback(
+    async (messageId: string) => {
+      // Delete the stored object BEFORE the row, because the row is the only
+      // record of where the object lives — dropping it first orphans the file
+      // in Storage forever. Nothing removed chat media at all previously, so
+      // every deleted photo, every deleted conversation and every
+      // self-destructed image left its ciphertext in the bucket permanently:
+      // a cost that only grows, and for account deletion a failure to
+      // actually delete the user's data.
+      const target = messages.find((message) => message.id === messageId);
+      if (target?.media_url) {
+        const { path } = parseMediaRef(target.media_url);
+        // Local file: :// means the upload never completed, so there is
+        // nothing on the server to remove.
+        if (!path.includes("://")) {
+          const { error: storageError } = await supabase.storage
+            .from("chat-media")
+            .remove([path]);
+          // Not fatal: a missing object (already removed, or never uploaded)
+          // must not stop the message itself from being deleted.
+          if (storageError) {
+            console.warn("[deleteMessage] could not remove media:", storageError.message);
+          }
+        }
+      }
+
+      // Optimistically remove; the realtime DELETE event is a no-op afterwards.
+      setMessages((current) => current.filter((message) => message.id !== messageId));
+      const { error } = await supabase.from("messages").delete().eq("id", messageId);
+      if (error) throw error;
+    },
+    [messages]
+  );
 
   const markRead = useCallback(async () => {
     if (!conversationId || !userId) return;
@@ -512,6 +654,34 @@ export function useMessages(
     };
   }, [conversationId, userId]);
 
+  // Re-attempts decrypting ONE already-loaded message. decorateWithDecryption
+  // only ever runs at load() time and for freshly-arrived realtime rows — a
+  // message that failed to decrypt because this device's
+  // encrypted_session_keys row was stale (see useE2ee's loadSessionKey,
+  // which now deletes such a row and lets repairMissingSessionKeys
+  // re-deposit a working one) stayed stuck showing "Unable to decrypt"
+  // forever in an already-open chat: the repair happens on the NEXT chat
+  // open, not retroactively for rows already rendered on screen. Unlike
+  // ChatImage/ChatVideo (which already had a tap-to-retry), text messages
+  // had no retry path at all — this is that path.
+  const retryDecryption = useCallback(
+    async (messageId: string) => {
+      if (!isEncrypted || !conversationId) return;
+      const target = messages.find((message) => message.id === messageId);
+      if (!target || target.kind !== "text" || !target.body) return;
+      if (!isEncryptedEnvelope(target.body)) return;
+
+      const decrypted = await decryptForConversation(conversationId, target.body);
+      if (decrypted === null) return; // Still not fixed — nothing to update.
+      setMessages((current) =>
+        current.map((message) =>
+          message.id === messageId ? { ...message, decryptedBody: decrypted } : message
+        )
+      );
+    },
+    [isEncrypted, conversationId, messages, decryptForConversation]
+  );
+
   return {
     messages,
     loading,
@@ -526,5 +696,6 @@ export function useMessages(
     deleteMessage,
     markRead,
     refresh: load,
+    retryDecryption,
   };
 }

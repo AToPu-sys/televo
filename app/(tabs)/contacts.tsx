@@ -1,6 +1,6 @@
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -15,6 +15,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 
 import { Avatar } from "../../src/components/Avatar";
 import { useAuth } from "../../src/hooks/useAuth";
+import { supabase } from "../../src/lib/supabase";
 import { findOrCreateDirectChat, useContacts, type Contact } from "../../src/hooks/useContacts";
 import { useTheme } from "../../src/hooks/useTheme";
 import { radius, spacing } from "../../src/theme";
@@ -37,6 +38,58 @@ export default function ContactsScreen() {
     );
   }, [contacts, query]);
 
+  // Searching only filtered the already-loaded list, i.e. people you had
+  // already messaged — so a new contact could not be found at all unless
+  // they happened to be in your phone's address book. find_user is an
+  // EXACT-match server lookup by @username or phone number (prefix search
+  // over profiles would be an enumeration hole), so anyone can be reached by
+  // knowing their handle.
+  const [remoteResults, setRemoteResults] = useState<Contact[]>([]);
+  const [searching, setSearching] = useState(false);
+
+  useEffect(() => {
+    const term = query.trim();
+    // Nothing to look up, or already present in the local list.
+    if (term.length < 3 || filtered.length > 0) {
+      setRemoteResults([]);
+      return;
+    }
+
+    let cancelled = false;
+    setSearching(true);
+    // Debounced: this fires per keystroke otherwise, and each one is a round
+    // trip on a mobile connection.
+    const timer = setTimeout(() => {
+      void supabase
+        .rpc("find_user", { term })
+        .then(({ data, error }) => {
+          if (cancelled) return;
+          setSearching(false);
+          if (error || !data) {
+            setRemoteResults([]);
+            return;
+          }
+          setRemoteResults(
+            data.map((row) => ({
+              id: row.id,
+              displayName: row.display_name,
+              username: String(row.username),
+              avatarUrl: row.avatar_url,
+              bio: row.bio,
+            }))
+          );
+        });
+    }, 350);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [query, filtered.length]);
+
+  // Local matches first; server results only fill in when there are none.
+  const results = filtered.length > 0 ? filtered : remoteResults;
+
   async function handleStartChat(contact: Contact) {
     if (!user?.id || startingWith) return;
     setStartingWith(contact.id);
@@ -56,7 +109,7 @@ export default function ContactsScreen() {
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]} edges={["top"]}>
       <View style={[styles.header, { borderBottomColor: theme.border }]}>
-        <Text style={[styles.headerTitle, { color: theme.text }]}>People on Televo</Text>
+        <Text style={[styles.headerTitle, { color: theme.text }]}>Contacts</Text>
       </View>
 
       <View style={styles.searchWrapper}>
@@ -65,20 +118,23 @@ export default function ContactsScreen() {
           <TextInput
             value={query}
             onChangeText={setQuery}
-            placeholder="Search by name or @username"
+            placeholder="Search @username or phone number"
             placeholderTextColor={theme.textSecondary}
             style={[styles.searchInput, { color: theme.text }]}
             accessibilityLabel="Search contacts"
             autoCapitalize="none"
           />
         </View>
-        {/* This lists everyone registered on Televo, not your phone's address
-            book — no contacts permission is used or needed here. Use "Find
-            friends" in Settings to match against your real phone contacts. */}
-        <Text style={[styles.hint, { color: theme.textSecondary }]}>
-          Everyone registered on Televo. To find people from your phone's
-          contacts instead, use Find friends in Settings.
-        </Text>
+        <Pressable
+          onPress={() => router.push("/find-friends" as never)}
+          accessibilityRole="button"
+          style={styles.findFriendsRow}
+        >
+          <Ionicons name="person-add-outline" size={18} color={theme.accent} />
+          <Text style={[styles.findFriendsText, { color: theme.accent }]}>
+            Find friends from your phone contacts
+          </Text>
+        </Pressable>
       </View>
 
       {loading ? (
@@ -92,7 +148,7 @@ export default function ContactsScreen() {
         </View>
       ) : (
         <FlatList
-          data={filtered}
+          data={results}
           keyExtractor={(item) => item.id}
           ItemSeparatorComponent={() => (
             <View style={[styles.separator, { backgroundColor: theme.border }]} />
@@ -101,15 +157,21 @@ export default function ContactsScreen() {
             <View style={styles.center}>
               <Ionicons name="people-outline" size={56} color={theme.textSecondary} />
               <Text style={[styles.emptyTitle, { color: theme.text }]}>
-                {query ? "No matches" : "No other users yet"}
+                {query ? "No matches" : "No contacts yet"}
               </Text>
               <Text style={[styles.emptyBody, { color: theme.textSecondary }]}>
-                {query
-                  ? "Try a different name or username."
-                  : "Once someone else signs up they'll appear here."}
+                {searching
+                  ? "Searching…"
+                  : query
+                    ? "No one found. A username or phone number has to match exactly."
+                    : "People you've messaged show up here. Use Find friends above to discover people from your phone's contacts."}
               </Text>
             </View>
           }
+          windowSize={9}
+          maxToRenderPerBatch={10}
+          initialNumToRender={12}
+          removeClippedSubviews
           renderItem={({ item }) => (
             <Pressable
               accessibilityRole="button"
@@ -160,7 +222,15 @@ const styles = StyleSheet.create({
     height: 38,
   },
   searchInput: { flex: 1, fontSize: 16, paddingVertical: 0 },
-  hint: { fontSize: 12, marginTop: spacing.sm, marginHorizontal: spacing.xs, lineHeight: 16 },
+  findFriendsRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.xs,
+    marginTop: spacing.sm,
+    marginHorizontal: spacing.xs,
+    paddingVertical: spacing.xs,
+  },
+  findFriendsText: { fontSize: 13, fontWeight: "600" },
   row: {
     flexDirection: "row",
     alignItems: "center",

@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 
 import { supabase } from "../lib/supabase";
 import type { Database } from "../types/database";
@@ -14,6 +14,21 @@ export function useIncomingCalls(
   userId: string | undefined,
   onIncoming: (call: CallRow) => void
 ) {
+  // The subscription must not be torn down and rebuilt every render, but the
+  // handler it calls MUST be the current one. Keeping the callback in a ref
+  // gives both: a subscription keyed only on userId, always dispatching to
+  // the latest closure.
+  //
+  // This previously pinned the FIRST render's callback, which was a real bug,
+  // not just a style issue: that closure captured useCall's first-render
+  // members, which in turn captured useE2ee's keyPair while it was still
+  // null (it loads asynchronously from SecureStore). The callee therefore
+  // answered every incoming call with a crypto context that could not
+  // decrypt anything — the caller's encrypted offer was silently dropped,
+  // so Accept never had an offer to answer and the phone rang forever.
+  const onIncomingRef = useRef(onIncoming);
+  onIncomingRef.current = onIncoming;
+
   useEffect(() => {
     if (!userId) return;
 
@@ -26,7 +41,7 @@ export function useIncomingCalls(
           const call = payload.new as CallRow;
           // Don't ring yourself when you're the one placing the call.
           if (call.caller_id !== userId && call.status === "ringing") {
-            onIncoming(call);
+            onIncomingRef.current(call);
           }
         }
       )
@@ -35,7 +50,5 @@ export function useIncomingCalls(
     return () => {
       void supabase.removeChannel(channel);
     };
-    // onIncoming is expected to be stable (wrapped in useCallback by the caller).
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [userId]);
 }

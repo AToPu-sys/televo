@@ -1,0 +1,9 @@
+{
+  "name": "expo-speaker-toggle",
+  "version": "1.0.0",
+  "description": "Switches the active call's audio output between earpiece and loudspeaker on iOS.",
+  "main": "src/index.ts",
+  "author": "Televo",
+  "license": "MIT",
+  "homepage": ""
+}

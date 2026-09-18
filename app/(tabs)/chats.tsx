@@ -1,6 +1,6 @@
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
-import { useMemo, useState } from "react";
+import { memo, useCallback, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   FlatList,
@@ -26,6 +26,15 @@ export default function ChatsScreen() {
   const { chats, loading, error, refresh } = useChats(user?.id);
   const [query, setQuery] = useState("");
   const [refreshing, setRefreshing] = useState(false);
+
+  // Stable identities: an inline arrow here is a new prop every render,
+  // which makes FlatList re-render every row and defeats ChatRow's memo.
+  const renderChatRow = useCallback(
+    ({ item, index }: { item: ChatSummary; index: number }) => (
+      <ChatRow chat={item} index={index} />
+    ),
+    []
+  );
 
   const filtered = useMemo(() => {
     const term = query.trim().toLowerCase();
@@ -128,14 +137,21 @@ export default function ChatsScreen() {
               </Text>
             </View>
           }
-          renderItem={({ item }) => <ChatRow chat={item} />}
+          renderItem={renderChatRow}
+          // Same reasoning as the message list: default virtualization keeps
+          // every row ever scrolled past mounted, and each row subscribes to
+          // theme context and holds an avatar.
+          windowSize={9}
+          maxToRenderPerBatch={10}
+          initialNumToRender={12}
+          removeClippedSubviews
         />
       )}
     </SafeAreaView>
   );
 }
 
-function ChatRow({ chat }: { chat: ChatSummary }) {
+function ChatRowComponent({ chat, index }: { chat: ChatSummary; index: number }) {
   const { theme } = useTheme();
   const router = useRouter();
 
@@ -164,6 +180,14 @@ function ChatRow({ chat }: { chat: ChatSummary }) {
           ) : null}
         </View>
         <View style={styles.rowBottom}>
+          {chat.lastMessageIsOwn && chat.lastMessageRead !== null ? (
+            <Ionicons
+              name={chat.lastMessageRead ? "checkmark-done" : "checkmark"}
+              size={16}
+              color={chat.lastMessageRead ? theme.accent : theme.textSecondary}
+              style={styles.readIcon}
+            />
+          ) : null}
           <Text style={[styles.rowPreview, { color: theme.textSecondary }]} numberOfLines={1}>
             {chat.lastMessage ?? "No messages yet"}
           </Text>
@@ -179,6 +203,23 @@ function ChatRow({ chat }: { chat: ChatSummary }) {
     </Pressable>
   );
 }
+
+/** Memoized: useChats replaces the whole array on every realtime event, so
+ * an untouched row would otherwise re-render on every message in any chat.
+ * Compared on the fields the row actually draws. */
+const ChatRow = memo(
+  ChatRowComponent,
+  (prev, next) =>
+    prev.index === next.index &&
+    prev.chat.id === next.chat.id &&
+    prev.chat.title === next.chat.title &&
+    prev.chat.avatarUrl === next.chat.avatarUrl &&
+    prev.chat.lastMessage === next.chat.lastMessage &&
+    prev.chat.lastMessageAt === next.chat.lastMessageAt &&
+    prev.chat.lastMessageIsOwn === next.chat.lastMessageIsOwn &&
+    prev.chat.lastMessageRead === next.chat.lastMessageRead &&
+    prev.chat.unreadCount === next.chat.unreadCount
+);
 
 function formatTimestamp(iso: string) {
   const date = new Date(iso);
@@ -229,6 +270,7 @@ const styles = StyleSheet.create({
   rowTime: { fontSize: 12, marginLeft: spacing.sm },
   rowBottom: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
   rowPreview: { flex: 1, fontSize: 14 },
+  readIcon: { marginRight: 4 },
   badge: {
     minWidth: 22,
     height: 22,

@@ -1,3 +1,6 @@
+import { Directory, File, Paths } from "expo-file-system";
+
+import { MissingSessionKeyError } from "../hooks/useE2ee";
 import { supabase } from "./supabase";
 import { randomUUID } from "./uuid";
 
@@ -72,7 +75,7 @@ export async function uploadChatMedia(
     const encrypted = await encryptor(new Uint8Array(buffer));
     if (!encrypted) {
       // Refuse rather than silently fall back to an unencrypted upload.
-      throw new Error("This Secret Chat has no encryption key yet, so the file wasn't sent.");
+      throw new MissingSessionKeyError();
     }
     payload = toArrayBuffer(encrypted.ciphertext);
     nonce = encrypted.nonce;
@@ -111,7 +114,7 @@ export async function uploadChatDocument(
   if (encryptor) {
     const encrypted = await encryptor(new Uint8Array(buffer));
     if (!encrypted) {
-      throw new Error("This Secret Chat has no encryption key yet, so the file wasn't sent.");
+      throw new MissingSessionKeyError();
     }
     payload = toArrayBuffer(encrypted.ciphertext);
     nonce = encrypted.nonce;
@@ -187,7 +190,18 @@ export async function fetchDecryptedBytes(
   return await decryptor(new Uint8Array(await data.arrayBuffer()), nonce);
 }
 
-/** Downloads encrypted media and returns a data URI the app can render. */
+/** Downloads encrypted media and returns a data URI the app can render.
+ *
+ * Only safe for SMALL payloads. A `data:` URI embeds the entire file as
+ * base64 text inside a single JS string handed to a native component prop —
+ * a real photo from a modern iPhone camera is routinely 3-8MB, which becomes
+ * a 4-10MB string. That doesn't throw or reject anything (toBase64 runs
+ * fine, the promise resolves with a valid URI), so nothing here ever saw a
+ * failure — but React Native's Image silently failed to decode/display a
+ * URI that large, which is exactly what "Image unavailable — tap to retry"
+ * looked like for every full-size photo: deterministic on every retry,
+ * because the size never changes. Use fetchDecryptedMediaFile instead for
+ * anything that isn't known to be small (a thumbnail, an icon). */
 export async function fetchDecryptedMedia(
   ref: string,
   decryptor: (ciphertext: Uint8Array, nonce: string) => Promise<Uint8Array | null>,
@@ -203,6 +217,39 @@ export async function fetchDecryptedMedia(
   if (!plain) return null;
 
   return `data:${mimeType ?? mimeForPath(path)};base64,${toBase64(plain)}`;
+}
+
+/** Downloads encrypted media, decrypts it, and writes the plaintext to a
+ * cache file, returning a `file://` URI — the fix for fetchDecryptedMedia's
+ * data-URI size cliff above. A full-resolution photo or any video is
+ * comfortably handled: the bytes are written to disk once, and every native
+ * component (Image, expo-video's VideoView) already knows how to stream a
+ * file:// URI regardless of size, the same way it handles a signed HTTPS URL
+ * for non-encrypted media. */
+export async function fetchDecryptedMediaFile(
+  ref: string,
+  decryptor: (ciphertext: Uint8Array, nonce: string) => Promise<Uint8Array | null>
+): Promise<string | null> {
+  const { path, nonce } = parseMediaRef(ref);
+  if (!nonce) return null;
+
+  const { data, error } = await supabase.storage.from("chat-media").download(path);
+  if (error || !data) return null;
+
+  const plain = await decryptor(new Uint8Array(await data.arrayBuffer()), nonce);
+  if (!plain) return null;
+
+  const extension = extensionFor(path, "jpg");
+  const folder = new Directory(Paths.cache, "decrypted-media");
+  if (!folder.exists) folder.create({ intermediates: true });
+  // A fresh UUID name per call, not the storage key — the same encrypted
+  // ref can be decrypted more than once (component remount, retry), and
+  // reusing a name would collide with expo-file-system's own File.create.
+  const target = new File(folder, `${randomUUID()}.${extension}`);
+  target.create();
+  target.write(plain);
+
+  return target.uri;
 }
 
 /**

@@ -1,12 +1,25 @@
 import { Ionicons } from "@expo/vector-icons";
 import { useEffect, useState } from "react";
-import { Pressable, StyleSheet, Text, View } from "react-native";
+import { Modal, Pressable, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
 import { useAppLock } from "../hooks/useAppLock";
-import { isBiometricUnlockEnabled } from "../lib/passcode";
+import {
+  getBiometricKind,
+  getLockoutStatus,
+  isBiometricUnlockEnabled,
+  type BiometricKind,
+} from "../lib/passcode";
 import { useTheme } from "../hooks/useTheme";
 import { spacing } from "../theme";
+import { FaceIdIcon } from "./FaceIdIcon";
+
+const IONICON_FALLBACK: Record<BiometricKind, keyof typeof Ionicons.glyphMap> = {
+  face: "finger-print", // unreachable — face renders FaceIdIcon below instead
+  fingerprint: "finger-print",
+  iris: "finger-print",
+  generic: "finger-print",
+};
 
 const PASSCODE_LENGTH = 4;
 // Standard phone keypad layout: 1-9 in order, then 0 centered on its own row.
@@ -24,15 +37,38 @@ export function PasscodeScreen() {
   const [entered, setEntered] = useState("");
   const [error, setError] = useState(false);
   const [biometricsAvailable, setBiometricsAvailable] = useState(false);
+  const [biometricKind, setBiometricKind] = useState<BiometricKind>("fingerprint");
+  // Persisted lockout after repeated wrong PINs (see getLockoutStatus) — a
+  // 4-digit PIN is only 10,000 combinations, so without this an automated
+  // tap script could brute-force it in minutes against exactly the "stolen
+  // unlocked-but-locked phone" scenario this screen exists to guard.
+  const [retryAt, setRetryAt] = useState<number | null>(null);
+  const [now, setNow] = useState(Date.now());
 
   useEffect(() => {
-    isBiometricUnlockEnabled().then(setBiometricsAvailable);
+    isBiometricUnlockEnabled().then(setBiometricsAvailable).catch(() => setBiometricsAvailable(false));
+    getBiometricKind().then(setBiometricKind).catch(() => setBiometricKind("fingerprint"));
+    getLockoutStatus()
+      .then((status) => setRetryAt(status.locked ? status.retryAt : null))
+      .catch(() => setRetryAt(null));
     // Try biometrics immediately on mount, mirroring Telegram/most apps.
     void unlockWithBiometrics();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Ticks once a second only while locked out, so the countdown updates and
+  // the pad re-enables itself the moment the lockout expires.
+  useEffect(() => {
+    if (!retryAt) return;
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [retryAt]);
+
+  const lockedOut = !!retryAt && retryAt > now;
+  const lockoutSecondsLeft = lockedOut ? Math.ceil((retryAt! - now) / 1000) : 0;
+
   async function handleDigit(digit: number) {
+    if (lockedOut) return;
     if (entered.length >= PASSCODE_LENGTH) return;
     const next = entered + String(digit);
     setEntered(next);
@@ -43,6 +79,8 @@ export function PasscodeScreen() {
       if (!success) {
         setError(true);
         setTimeout(() => setEntered(""), 400);
+        const status = await getLockoutStatus();
+        setRetryAt(status.locked ? status.retryAt : null);
       }
     }
   }
@@ -52,89 +90,112 @@ export function PasscodeScreen() {
     setError(false);
   }
 
+  // A native Modal, not a sibling View: rendered inline it was just another
+  // element in the layout tree with flex:1, so it only covered the space its
+  // parent happened to give it — the status bar area, and anything drawn
+  // outside the navigator, stayed visible behind it. A lock screen that
+  // doesn't cover the whole display isn't a lock screen. Modal puts it in
+  // its own window, edge to edge, above everything including the call
+  // overlay.
   return (
-    <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]}>
-      <View style={styles.content}>
-        <Ionicons name="lock-closed" size={40} color={theme.accent} />
-        <Text style={[styles.title, { color: theme.text }]}>Enter Passcode</Text>
+    <Modal visible animationType="fade" statusBarTranslucent presentationStyle="overFullScreen" transparent>
+      {/* The background sits on the outer View, not the SafeAreaView, so the
+          colour reaches under the notch and home indicator instead of
+          leaving unpainted bands there. */}
+      <View style={[styles.container, { backgroundColor: theme.background }]}>
+        <SafeAreaView style={styles.container}>
+          <View style={styles.content}>
+            <Ionicons name="lock-closed" size={40} color={theme.accent} />
+            <Text style={[styles.title, { color: theme.text }]}>Enter Passcode</Text>
+            {lockedOut ? (
+              <Text style={[styles.lockoutText, { color: theme.danger }]}>
+                Too many attempts. Try again in {lockoutSecondsLeft}s.
+              </Text>
+            ) : null}
 
-        <View style={styles.dots}>
-          {Array.from({ length: PASSCODE_LENGTH }).map((_, index) => (
-            <View
-              key={index}
-              style={[
-                styles.dot,
-                {
-                  borderColor: error ? theme.danger : theme.accent,
-                  backgroundColor:
-                    index < entered.length ? (error ? theme.danger : theme.accent) : "transparent",
-                },
-              ]}
-            />
-          ))}
-        </View>
+            <View style={styles.dots}>
+              {Array.from({ length: PASSCODE_LENGTH }).map((_, index) => (
+                <View
+                  key={index}
+                  style={[
+                    styles.dot,
+                    {
+                      borderColor: error ? theme.danger : theme.accent,
+                      backgroundColor:
+                        index < entered.length ? (error ? theme.danger : theme.accent) : "transparent",
+                    },
+                  ]}
+                />
+              ))}
+            </View>
 
-        <View style={styles.pad}>
-          {KEYPAD_ROWS.map((row) => (
-            <View key={row.join(",")} style={styles.padRow}>
-              {row.map((digit) => (
+            <View style={[styles.pad, lockedOut && styles.padDisabled]} pointerEvents={lockedOut ? "none" : "auto"}>
+              {KEYPAD_ROWS.map((row) => (
+                <View key={row.join(",")} style={styles.padRow}>
+                  {row.map((digit) => (
+                    <Pressable
+                      key={digit}
+                      onPress={() => handleDigit(digit)}
+                      accessibilityRole="button"
+                      accessibilityLabel={`${digit}`}
+                      style={({ pressed }) => [
+                        styles.key,
+                        { backgroundColor: pressed ? theme.surfaceElevated : "transparent" },
+                      ]}
+                    >
+                      <Text style={[styles.keyText, { color: theme.text }]}>{digit}</Text>
+                    </Pressable>
+                  ))}
+                </View>
+              ))}
+
+              <View style={styles.padRow}>
+                {biometricsAvailable ? (
+                  <Pressable
+                    onPress={() => void unlockWithBiometrics()}
+                    accessibilityRole="button"
+                    accessibilityLabel="Unlock with biometrics"
+                    style={styles.key}
+                  >
+                    {biometricKind === "face" ? (
+                      <FaceIdIcon size={28} color={theme.accent} />
+                    ) : (
+                      <Ionicons name={IONICON_FALLBACK[biometricKind]} size={28} color={theme.accent} />
+                    )}
+                  </Pressable>
+                ) : (
+                  <View style={styles.key} />
+                )}
+
                 <Pressable
-                  key={digit}
-                  onPress={() => handleDigit(digit)}
+                  onPress={() => handleDigit(0)}
                   accessibilityRole="button"
-                  accessibilityLabel={`${digit}`}
+                  accessibilityLabel="0"
                   style={({ pressed }) => [
                     styles.key,
                     { backgroundColor: pressed ? theme.surfaceElevated : "transparent" },
                   ]}
                 >
-                  <Text style={[styles.keyText, { color: theme.text }]}>{digit}</Text>
+                  <Text style={[styles.keyText, { color: theme.text }]}>0</Text>
                 </Pressable>
-              ))}
+
+                <Pressable
+                  onPress={handleBackspace}
+                  accessibilityRole="button"
+                  accessibilityLabel="Backspace"
+                  style={({ pressed }) => [
+                    styles.key,
+                    { backgroundColor: pressed ? theme.surfaceElevated : "transparent" },
+                  ]}
+                >
+                  <Ionicons name="backspace-outline" size={26} color={theme.text} />
+                </Pressable>
+              </View>
             </View>
-          ))}
-
-          <View style={styles.padRow}>
-            {biometricsAvailable ? (
-              <Pressable
-                onPress={() => void unlockWithBiometrics()}
-                accessibilityRole="button"
-                accessibilityLabel="Unlock with biometrics"
-                style={styles.key}
-              >
-                <Ionicons name="finger-print" size={28} color={theme.accent} />
-              </Pressable>
-            ) : (
-              <View style={styles.key} />
-            )}
-
-            <Pressable
-              onPress={() => handleDigit(0)}
-              accessibilityRole="button"
-              accessibilityLabel="0"
-              style={({ pressed }) => [
-                styles.key,
-                { backgroundColor: pressed ? theme.surfaceElevated : "transparent" },
-              ]}
-            >
-              <Text style={[styles.keyText, { color: theme.text }]}>0</Text>
-            </Pressable>
-
-            <Pressable
-              onPress={handleBackspace}
-              accessibilityRole="button"
-              accessibilityLabel="Backspace"
-              style={({ pressed }) => [
-                styles.key,
-                { backgroundColor: pressed ? theme.surfaceElevated : "transparent" },
-              ]}
-            >
-              <Ionicons name="backspace-outline" size={26} color={theme.text} />
-            </Pressable>
           </View>
-        </View>
+        </SafeAreaView>
       </View>
-    </SafeAreaView>
+    </Modal>
   );
 }
 
@@ -145,6 +206,8 @@ const styles = StyleSheet.create({
   dots: { flexDirection: "row", gap: spacing.md, marginVertical: spacing.lg },
   dot: { width: 14, height: 14, borderRadius: 7, borderWidth: 2 },
   pad: { gap: spacing.sm },
+  padDisabled: { opacity: 0.35 },
+  lockoutText: { fontSize: 14, fontWeight: "500", marginTop: -spacing.md },
   padRow: { flexDirection: "row", justifyContent: "center", gap: spacing.sm },
   key: {
     width: 80,

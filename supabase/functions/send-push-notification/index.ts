@@ -138,5 +138,48 @@ Deno.serve(async (req) => {
     return new Response("push send failed", { status: 502 });
   }
 
+  // Expo answers 200 even when it rejected every individual notification —
+  // the per-message verdict is in the response body, not the HTTP status.
+  // Without reading it, a completely undeliverable push (no APNs key
+  // uploaded, token belonging to a deleted install) was indistinguishable
+  // from a delivered one, and this function reported "ok" for both. That is
+  // exactly how "messages send but no notification ever arrives" stayed
+  // invisible: every layer looked healthy.
+  const result = (await response.json().catch(() => null)) as
+    | { data?: { status: string; message?: string; details?: { error?: string } }[] }
+    | null;
+
+  const tickets = result?.data ?? [];
+  const failures = tickets.filter((ticket) => ticket.status === "error");
+
+  if (failures.length > 0) {
+    console.error(
+      `Expo rejected ${failures.length}/${tickets.length} notifications:`,
+      failures.map((f) => `${f.details?.error ?? "unknown"}: ${f.message ?? ""}`).join(" | ")
+    );
+
+    // DeviceNotRegistered is permanent: the app was uninstalled or the token
+    // was reissued, and Expo will reject this token forever. Dropping it here
+    // keeps the table from filling with dead tokens that are retried on
+    // every single message.
+    const deadTokens = tickets
+      .map((ticket, index) => ({ ticket, token: tokens[index] }))
+      .filter(({ ticket }) => ticket.details?.error === "DeviceNotRegistered")
+      .map(({ token }) => token);
+
+    if (deadTokens.length > 0) {
+      await admin.from("push_tokens").delete().in("expo_push_token", deadTokens);
+    }
+
+    // Surfaced as a failure so it shows up in net._http_response instead of
+    // being silently swallowed as "ok".
+    if (failures.length === tickets.length) {
+      return new Response(
+        `all pushes rejected: ${failures[0].details?.error ?? "unknown"}`,
+        { status: 502 }
+      );
+    }
+  }
+
   return new Response("ok", { status: 200 });
 });

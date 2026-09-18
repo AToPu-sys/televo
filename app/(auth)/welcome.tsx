@@ -18,8 +18,11 @@ export default function WelcomeScreen() {
           <Ionicons name="chatbubbles" size={56} color="#FFFFFF" />
         </View>
         <Text style={[styles.title, { color: theme.text }]}>Televo</Text>
+        <Text style={[styles.tagline, { color: theme.accent }]}>
+          Fast · Secure · Simple
+        </Text>
         <Text style={[styles.subtitle, { color: theme.textSecondary }]}>
-          Fast, simple messaging. Sign in to pick up where you left off.
+          End-to-end encrypted messages and calls.
         </Text>
       </View>
 
@@ -41,6 +44,13 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   title: { fontSize: 30, fontWeight: "700" },
+  tagline: {
+    fontSize: 15,
+    fontWeight: "600",
+    letterSpacing: 1.2,
+    textTransform: "uppercase",
+    marginTop: spacing.xs,
+  },
   subtitle: { fontSize: 16, textAlign: "center", lineHeight: 22, paddingHorizontal: spacing.lg },
   actions: { gap: spacing.md, paddingBottom: spacing.lg },
 });

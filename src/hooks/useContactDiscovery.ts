@@ -2,6 +2,7 @@ import * as Contacts from "expo-contacts";
 import * as Crypto from "expo-crypto";
 import { useCallback, useState } from "react";
 
+import { normalizePhone } from "../lib/phone";
 import { supabase } from "../lib/supabase";
 
 export type DiscoveredFriend = {
@@ -11,18 +12,6 @@ export type DiscoveredFriend = {
   avatarUrl: string | null;
   contactName: string;
 };
-
-/**
- * Normalizes to digits with a leading + so both sides hash the same string.
- * Numbers stored without a country code can't be matched this way, which is
- * the deliberate tradeoff for not shipping every user's phone number to
- * every client (see below).
- */
-function normalizePhone(raw: string): string {
-  const digits = raw.replace(/[^\d]/g, "");
-  if (!digits) return "";
-  return `+${digits}`;
-}
 
 async function sha256Hex(value: string): Promise<string> {
   return Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, value);

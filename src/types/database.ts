@@ -435,6 +435,7 @@ export type Database = {
           nonce: string
           recipient_id: string
           sender_public_key: string
+          kem_ciphertext: string | null
         }
         Insert: {
           conversation_id: string
@@ -443,6 +444,7 @@ export type Database = {
           nonce: string
           recipient_id: string
           sender_public_key: string
+          kem_ciphertext?: string | null
         }
         Update: {
           conversation_id?: string
@@ -451,6 +453,7 @@ export type Database = {
           nonce?: string
           recipient_id?: string
           sender_public_key?: string
+          kem_ciphertext?: string | null
         }
         Relationships: [
           {
@@ -647,6 +650,7 @@ export type Database = {
           default_activity_visibility: Database["public"]["Enums"]["activity_visibility"]
           display_name: string
           e2e_public_key: string | null
+          e2e_kyber_public_key: string | null
           id: string
           language: string
           last_seen_at: string | null
@@ -666,6 +670,7 @@ export type Database = {
           default_activity_visibility?: Database["public"]["Enums"]["activity_visibility"]
           display_name: string
           e2e_public_key?: string | null
+          e2e_kyber_public_key?: string | null
           id: string
           language?: string
           last_seen_at?: string | null
@@ -685,6 +690,7 @@ export type Database = {
           default_activity_visibility?: Database["public"]["Enums"]["activity_visibility"]
           display_name?: string
           e2e_public_key?: string | null
+          e2e_kyber_public_key?: string | null
           id?: string
           language?: string
           last_seen_at?: string | null
@@ -718,6 +724,30 @@ export type Database = {
           created_at?: string
           device_name?: string | null
           expo_push_token?: string
+          updated_at?: string
+          user_id?: string
+        }
+        Relationships: []
+      }
+      voip_push_tokens: {
+        Row: {
+          apns_token: string
+          created_at: string
+          device_name: string | null
+          updated_at: string
+          user_id: string
+        }
+        Insert: {
+          apns_token: string
+          created_at?: string
+          device_name?: string | null
+          updated_at?: string
+          user_id: string
+        }
+        Update: {
+          apns_token?: string
+          created_at?: string
+          device_name?: string | null
           updated_at?: string
           user_id?: string
         }
@@ -820,6 +850,46 @@ export type Database = {
         Returns: boolean
       }
       delete_own_account: { Args: never; Returns: undefined }
+      find_user: {
+        Args: { term: string }
+        Returns: {
+          id: string
+          username: string
+          display_name: string
+          avatar_url: string | null
+          bio: string | null
+        }[]
+      }
+      chat_list_summary: {
+        Args: Record<string, never>
+        Returns: {
+          conversation_id: string
+          last_message_body: string | null
+          last_message_kind: Database["public"]["Enums"]["message_kind"]
+          last_message_at: string | null
+          last_message_sender_id: string
+          unread_count: number
+        }[]
+      }
+      claim_voip_push_token: {
+        Args: { p_token: string; p_device_name?: string | null }
+        Returns: undefined
+      }
+      claim_expo_push_token: {
+        Args: { p_token: string; p_device_name?: string | null }
+        Returns: undefined
+      }
+      deposit_session_key_if_missing: {
+        Args: {
+          p_conversation_id: string
+          p_recipient_id: string
+          p_sender_public_key: string
+          p_encrypted_key: string
+          p_nonce: string
+          p_kem_ciphertext?: string | null
+        }
+        Returns: boolean
+      }
       get_activity_streak: { Args: { profile_id: string }; Returns: number }
       get_challenge_leaderboard: {
         Args: { challenge_id_input: string }

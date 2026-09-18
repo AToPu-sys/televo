@@ -4,10 +4,11 @@ import { useEffect, useState } from "react";
 import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
+import { Button } from "../src/components/Button";
 import { useAuth } from "../src/hooks/useAuth";
 import { useE2ee } from "../src/hooks/useE2ee";
 import { useTheme } from "../src/hooks/useTheme";
-import { computeSafetyNumber } from "../src/lib/e2e";
+import { computeSafetyNumber, setPeerKeyVerified } from "../src/lib/e2e";
 import { supabase } from "../src/lib/supabase";
 import { radius, spacing } from "../src/theme";
 
@@ -25,10 +26,16 @@ export default function VerifySafetyNumberScreen() {
   const router = useRouter();
   const { user } = useAuth();
   const { publicKey } = useE2ee();
-  const { peerId, peerName } = useLocalSearchParams<{ peerId: string; peerName: string }>();
+  const { peerId, peerName, conversationId } = useLocalSearchParams<{
+    peerId: string;
+    peerName: string;
+    conversationId?: string;
+  }>();
 
   const [safetyNumber, setSafetyNumber] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [peerPublicKey, setPeerPublicKey] = useState<string | null>(null);
+  const [confirmed, setConfirmed] = useState(false);
 
   useEffect(() => {
     if (!publicKey || !peerId) return;
@@ -48,6 +55,7 @@ export default function VerifySafetyNumberScreen() {
         return;
       }
 
+      setPeerPublicKey(data.e2e_public_key);
       setSafetyNumber(await computeSafetyNumber(publicKey, data.e2e_public_key));
     })();
 
@@ -55,6 +63,12 @@ export default function VerifySafetyNumberScreen() {
       active = false;
     };
   }, [publicKey, peerId]);
+
+  async function handleConfirmMatch() {
+    if (!conversationId || !peerPublicKey) return;
+    await setPeerKeyVerified(conversationId, peerPublicKey);
+    setConfirmed(true);
+  }
 
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]}>
@@ -91,6 +105,19 @@ export default function VerifySafetyNumberScreen() {
               sending anything sensitive. Numbers also change if either of you reinstalls the app
               or switches device, which is normal.
             </Text>
+
+            {conversationId ? (
+              confirmed ? (
+                <View style={styles.confirmedRow}>
+                  <Ionicons name="checkmark-circle" size={20} color={theme.online} />
+                  <Text style={[styles.confirmedText, { color: theme.online }]}>
+                    Marked as maximally secure
+                  </Text>
+                </View>
+              ) : (
+                <Button title="Numbers match" onPress={handleConfirmMatch} />
+              )
+            ) : null}
           </>
         )}
       </ScrollView>
@@ -116,4 +143,6 @@ const styles = StyleSheet.create({
   numberBox: { padding: spacing.lg, borderRadius: radius.md, width: "100%" },
   number: { fontSize: 20, letterSpacing: 2, textAlign: "center", lineHeight: 32, fontVariant: ["tabular-nums"] },
   footnote: { fontSize: 13, textAlign: "center", lineHeight: 18 },
+  confirmedRow: { flexDirection: "row", alignItems: "center", gap: spacing.xs },
+  confirmedText: { fontSize: 14, fontWeight: "600" },
 });

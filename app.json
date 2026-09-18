@@ -22,10 +22,12 @@
           "audio",
           "voip",
           "remote-notification"
-        ],
-        "ITSAppUsesEncryptionExemption": true
+        ]
       },
-      "buildNumber": "1"
+      "buildNumber": "1",
+      "associatedDomains": [
+        "applinks:gettelevo.space"
+      ]
     },
     "android": {
       "package": "com.televo.app",
@@ -74,8 +76,9 @@
     "extra": {
       "router": {},
       "eas": {
-        "projectId": "328fc95c-6a04-4d2e-af72-b03ebb42f52b"
+        "projectId": "dbc1a325-ce23-4fe9-93df-f1786be38aa0"
       }
-    }
+    },
+    "owner": "bek523627273727"
   }
 }

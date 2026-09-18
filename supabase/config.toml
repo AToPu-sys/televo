@@ -20,3 +20,62 @@ entrypoint = "./functions/send-push-notification/index.ts"
 # Specifies static files to be bundled with the function. Supports glob patterns.
 # For example, if you want to serve static HTML pages in your function:
 # static_files = [ "./functions/send-push-notification/*.html" ]
+
+[auth]
+additional_redirect_urls = ["televo://", "televo://**", "exp://**", "https://gettelevo.space/**"]
+minimum_password_length = 10
+site_url = "https://gettelevo.space"
+
+[auth.email]
+enable_confirmations = true
+max_frequency = "1m0s"
+
+# Custom SMTP via Resend, so auth emails arrive from @gettelevo.space instead
+# of Supabase's own shared mail.app.supabase.io sender — the free-tier
+# default mailer that visibly said "supabase.co" wherever the sender/reply
+# address was shown. gettelevo.space is a VERIFIED sending domain in Resend
+# (SPF/DKIM/MX added via Cloudflare, confirmed 2026-09-18) — this is live,
+# not aspirational. RESEND_SMTP_PASSWORD (pushed as a Supabase Auth secret,
+# not read from this repo's own .env — see the `env()` reference below) is a
+# Resend API key used as the SMTP password, same key format as
+# RESEND_API_KEY used elsewhere; Supabase secrets are write-only, so if this
+# ever needs rotating there is no "read it back" path — generate a fresh key
+# in Resend and re-push.
+[auth.email.smtp]
+enabled = true
+host = "smtp.resend.com"
+port = 465
+user = "resend"
+pass = "env(RESEND_SMTP_PASSWORD)"
+admin_email = "noreply@gettelevo.space"
+sender_name = "Televo"
+
+# The default Supabase magic-link template links ONLY to
+# {{ .ConfirmationURL }} — no {{ .Token }} anywhere in it — which is why
+# the 6-digit code the sign-in screen promises ("We sent a 6-digit code…",
+# app/(auth)/sign-in.tsx) never actually appeared in the email: the app's
+# copy assumed a code that the template never included. This was invisible
+# before Custom SMTP was wired up (the free-tier default mailer's templates
+# cannot be edited at all, so there was nothing to fix short of changing the
+# app's own copy to match link-only delivery) — now that a custom template
+# CAN be declared, this closes the gap the other way: the email includes
+# BOTH the code and the link, so verifyOtp's code path (what the app
+# actually calls) and a same-device link tap both work from the one email.
+[auth.email.template.magic_link]
+subject = "Your Televo sign-in code"
+content_path = "./supabase/templates/magic_link.html"
+
+[auth.mfa.totp]
+enroll_enabled = true
+verify_enabled = true
+
+[db.pooler]
+default_pool_size = 15
+max_client_conn = 200
+
+[storage.analytics]
+enabled = true
+max_namespaces = 10
+
+[storage.image_transformation]
+enabled = true

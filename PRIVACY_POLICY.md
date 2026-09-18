@@ -1,6 +1,6 @@
 # Televo Privacy Policy
 
-_Last updated: 2 September 2026_
+_Last updated: 14 September 2026_
 
 This policy describes what Televo collects, why, and what control you have.
 It is written to match what the app actually does — every item below
@@ -11,11 +11,13 @@ corresponds to real behaviour in the code.
 **Account information.** Your email address (used to sign in), a username, and
 a display name. Optionally a profile photo and a short bio, if you add them.
 
-**Phone number (optional).** Only if you enter one in Settings. It is used for
-one purpose: letting people who already have your number in their address book
-find you. Your number is never shown to other users and cannot be read in bulk
-— matching happens by comparing cryptographic hashes, so another user only
-ever confirms a number they already had.
+**Phone number.** Required when you create an account. It is used for one
+purpose: letting people who already have your number in their address book
+find you on Televo. Your number is never shown to other users and cannot be
+read in bulk — matching happens by comparing cryptographic hashes, so another
+user only ever confirms a number they already had. You can update or remove it
+afterward in Settings — removing it only stops future contact matching; it
+does not delete your account.
 
 **Messages and media.** The messages, photos and files you send are stored so
 they can be delivered and so you can see your history. In a **Secret Chat**,
@@ -76,7 +78,7 @@ data from them.
 ## Contact
 
 Questions, privacy requests, or content reports:
-**ryvvoofficial@gmail.com**
+**ssirojov@gmail.com**
 
 We respond to privacy requests within 30 days and review content reports
 within 24 hours.

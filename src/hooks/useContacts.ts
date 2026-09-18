@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 
+import { ASSISTANT_USER_ID } from "../lib/assistant";
 import { supabase } from "../lib/supabase";
 import { randomUUID } from "../lib/uuid";
 
@@ -11,20 +12,77 @@ export type Contact = {
   bio: string | null;
 };
 
-/** Every other user on the instance — the directory you can start a chat from. */
+/**
+ * People the user already knows: everyone they have an existing conversation
+ * with. This used to query every profile on the instance with no filtering
+ * at all — a brand-new account immediately saw the entire user directory,
+ * including people who had never messaged them and weren't in their phone
+ * contacts. Finding someone NEW is find-friends.tsx's job (phone-number
+ * matching via useContactDiscovery, which never exposes the full directory
+ * either) — this list is deliberately "who I already talk to," matching how
+ * WhatsApp/Telegram's contacts tab works.
+ */
 export function useContacts(userId: string | undefined) {
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
+    if (!userId) {
+      setContacts([]);
+      setLoading(false);
+      return;
+    }
     setError(null);
+
+    const { data: participantRows, error: participantsError } = await supabase
+      .from("conversation_participants")
+      .select("conversation_id, conversations!inner(kind)")
+      .eq("user_id", userId);
+
+    if (participantsError) {
+      setError(participantsError.message);
+      setLoading(false);
+      return;
+    }
+
+    const directConversationIds = (participantRows ?? [])
+      .filter((row) => row.conversations.kind === "direct")
+      .map((row) => row.conversation_id);
+
+    if (directConversationIds.length === 0) {
+      setContacts([]);
+      setLoading(false);
+      return;
+    }
+
+    const { data: otherParticipants, error: othersError } = await supabase
+      .from("conversation_participants")
+      .select("user_id")
+      .in("conversation_id", directConversationIds)
+      .neq("user_id", userId);
+
+    if (othersError) {
+      setError(othersError.message);
+      setLoading(false);
+      return;
+    }
+
+    const otherIds = Array.from(new Set((otherParticipants ?? []).map((row) => row.user_id))).filter(
+      (id) => id !== ASSISTANT_USER_ID
+    );
+
+    if (otherIds.length === 0) {
+      setContacts([]);
+      setLoading(false);
+      return;
+    }
 
     const { data, error: queryError } = await supabase
       .from("profiles")
       .select("id, display_name, username, avatar_url, bio")
-      .order("display_name", { ascending: true })
-      .limit(200);
+      .in("id", otherIds)
+      .order("display_name", { ascending: true });
 
     if (queryError) {
       setError(queryError.message);
@@ -33,15 +91,13 @@ export function useContacts(userId: string | undefined) {
     }
 
     setContacts(
-      (data ?? [])
-        .filter((profile) => profile.id !== userId)
-        .map((profile) => ({
-          id: profile.id,
-          displayName: profile.display_name,
-          username: String(profile.username),
-          avatarUrl: profile.avatar_url,
-          bio: profile.bio,
-        }))
+      (data ?? []).map((profile) => ({
+        id: profile.id,
+        displayName: profile.display_name,
+        username: String(profile.username),
+        avatarUrl: profile.avatar_url,
+        bio: profile.bio,
+      }))
     );
     setLoading(false);
   }, [userId]);
@@ -100,17 +156,26 @@ export async function findOrCreateDirectChat(userId: string, otherUserId: string
   // Order matters under RLS: the insert policy allows adding yourself, or
   // adding anyone once you're already a participant. So add self first, then
   // the other person — a single batched insert can fail the second row.
+  // If either insert below fails, the conversation row above is orphaned
+  // (only the creator a participant, or no participants at all) — best-effort
+  // clean it up rather than leaving dead rows behind on every network blip.
   const { error: selfError } = await supabase
     .from("conversation_participants")
     .insert({ conversation_id: conversationId, user_id: userId });
 
-  if (selfError) throw selfError;
+  if (selfError) {
+    void supabase.from("conversations").delete().eq("id", conversationId);
+    throw selfError;
+  }
 
   const { error: otherError } = await supabase
     .from("conversation_participants")
     .insert({ conversation_id: conversationId, user_id: otherUserId });
 
-  if (otherError) throw otherError;
+  if (otherError) {
+    void supabase.from("conversations").delete().eq("id", conversationId);
+    throw otherError;
+  }
 
   return conversationId;
 }
@@ -131,7 +196,10 @@ export async function createGroupChat(userId: string, title: string, memberIds: 
     .from("conversation_participants")
     .insert({ conversation_id: conversationId, user_id: userId, is_admin: true });
 
-  if (selfError) throw selfError;
+  if (selfError) {
+    void supabase.from("conversations").delete().eq("id", conversationId);
+    throw selfError;
+  }
 
   const others = memberIds.filter((id) => id !== userId);
   if (others.length > 0) {
@@ -141,7 +209,10 @@ export async function createGroupChat(userId: string, title: string, memberIds: 
         user_id: id,
       }))
     );
-    if (membersError) throw membersError;
+    if (membersError) {
+      void supabase.from("conversations").delete().eq("id", conversationId);
+      throw membersError;
+    }
   }
 
   return conversationId;
