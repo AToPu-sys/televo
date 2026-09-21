@@ -43,6 +43,15 @@ export function useConversation(conversationId: string | undefined, userId: stri
       .single();
 
     if (error || !data) {
+      // Previously silent — a query failure here (session not fully
+      // established yet, RLS denying the row, a network blip) left
+      // `conversation` null with zero trace anywhere, which looked
+      // identical to "this chat genuinely doesn't exist" from every call
+      // site downstream. Logged so a report like "every chat shows Unable
+      // to decrypt" can actually be diagnosed instead of guessed at.
+      if (error) {
+        console.error("[useConversation] load failed:", error.message, { conversationId });
+      }
       setLoading(false);
       return;
     }

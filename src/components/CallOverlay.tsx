@@ -9,6 +9,7 @@ import type { CallState } from "../hooks/useCall";
 import { useConnectingTone } from "../hooks/useConnectingTone";
 import { useRinger } from "../hooks/useRinger";
 import { useTheme } from "../hooks/useTheme";
+import { HAS_NO_TURN } from "../lib/webrtc";
 import { spacing } from "../theme";
 import { Avatar } from "./Avatar";
 import { CallButton } from "./CallButton";
@@ -98,6 +99,31 @@ export function CallOverlay({
     setElapsedSeconds(0);
     const interval = setInterval(() => {
       setElapsedSeconds(Math.floor((Date.now() - startedAt) / 1000));
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [state.phase, mediaConfirmed]);
+
+  // How long this call has been trying to connect. Used only to soften the
+  // status text after a few seconds — see statusLabel.
+  //
+  // Why it exists: once a relay is in play, ICE legitimately needs several
+  // seconds to settle on a working candidate pair. call_diagnostics caught
+  // three real calls hung up at 8, 13 and 14 seconds while still
+  // negotiating — nothing wrong with any of them, the users simply saw a
+  // motionless "Connecting…" and assumed it had failed. The one call that
+  // was left alone connected over relay and worked. Telling the user it is
+  // still working, rather than showing a frozen label, is the difference.
+  const [connectingSeconds, setConnectingSeconds] = useState(0);
+  useEffect(() => {
+    const negotiating =
+      state.phase === "connecting" || (state.phase === "active" && !mediaConfirmed);
+    if (!negotiating) {
+      setConnectingSeconds(0);
+      return;
+    }
+    const startedAt = Date.now();
+    const interval = setInterval(() => {
+      setConnectingSeconds(Math.floor((Date.now() - startedAt) / 1000));
     }, 1000);
     return () => clearInterval(interval);
   }, [state.phase, mediaConfirmed]);
@@ -264,7 +290,7 @@ export function CallOverlay({
               hitSlop={12}
             >
               <Text style={[styles.status, { color: showVideo ? "#FFFFFF" : theme.textSecondary }]}>
-                {statusLabel(state, elapsedSeconds, mediaConfirmed)}
+                {statusLabel(state, elapsedSeconds, mediaConfirmed, connectingSeconds)}
               </Text>
             </Pressable>
           </View>
@@ -341,20 +367,33 @@ function formatDuration(totalSeconds: number): string {
   return hours > 0 ? `${hours}:${pad(minutes)}:${pad(seconds)}` : `${minutes}:${pad(seconds)}`;
 }
 
-function statusLabel(state: CallState, elapsedSeconds: number, mediaConfirmed: boolean) {
+/** Past this many seconds of negotiation, the label admits it is taking a
+ * while. Below it, a plain "Connecting…" is honest and unalarming; above it,
+ * silence reads as failure and people hang up on calls that were about to
+ * connect (three such calls measured on 2026-09-19, abandoned at 8-14s). */
+const SLOW_CONNECT_SECONDS = 5;
+
+function statusLabel(
+  state: CallState,
+  elapsedSeconds: number,
+  mediaConfirmed: boolean,
+  connectingSeconds: number
+) {
+  const connectingText =
+    connectingSeconds >= SLOW_CONNECT_SECONDS ? "Still connecting…" : "Connecting…";
   switch (state.phase) {
     case "outgoing":
       return "Ringing…";
     case "incoming":
       return "Incoming call…";
     case "connecting":
-      return "Connecting…";
+      return connectingText;
     case "active":
       // "active" alone only means SDP/ICE/DTLS finished — a dead TURN relay
       // reports the same phase while carrying no actual media. Keep showing
       // "Connecting…" until getStats() confirms real packets are arriving
       // (mediaConfirmed), so the UI stops lying that a silent call is fine.
-      if (!mediaConfirmed) return "Connecting…";
+      if (!mediaConfirmed) return connectingText;
       // Shows "Connected" for the first second (elapsedSeconds is still 0
       // before the interval's first tick), then switches to the running
       // duration — this is what "должно быть время звонка... сначала
@@ -366,7 +405,15 @@ function statusLabel(state: CallState, elapsedSeconds: number, mediaConfirmed: b
         : state.reason === "missed"
           ? "Missed"
           : state.reason === "failed"
-            ? "Call failed"
+            ? // Names the actual cause when it is known, instead of a bare
+              // "Call failed" that looks like a bug in the app. With no TURN
+              // relay configured (see HAS_NO_TURN in lib/webrtc), a call can
+              // only connect when the two networks can reach each other
+              // directly — on mobile data that is a coin flip, and when it
+              // loses there is nothing the app could have done differently.
+              HAS_NO_TURN
+              ? "Couldn't connect — network blocked"
+              : "Call failed"
             : "Call ended";
     default:
       return "";

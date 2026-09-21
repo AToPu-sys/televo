@@ -23,6 +23,15 @@ export type ChatSummary = {
   /** Whether the other participant has read the last message. Direct chats
    * only — "read" has no single answer in a group. */
   lastMessageRead: boolean | null;
+  /** Whether this is a Secret Chat (end-to-end encrypted). Shown as a lock
+   * next to the chat name in the list — without this, the ONLY place a
+   * Secret Chat was visually distinguishable from a regular one was the 🔒
+   * that appears inside a message bubble, and only ever when decryption had
+   * ALREADY failed. That reads as an error indicator, not "this conversation
+   * type is different", which is why a user could look at their own chat
+   * list and not be able to tell which chats were even encrypted in the
+   * first place. */
+  isEncrypted: boolean;
 };
 
 /**
@@ -39,7 +48,30 @@ export function useChats(userId: string | undefined) {
   // Distinguishes the first join from a reconnect — see the subscribe handler.
   const hasSubscribedRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
-  const { decryptForConversation, ready: e2eeReady } = useE2ee();
+  const { decryptForConversation, ready: e2eeReady, repairAllSessionKeys } = useE2ee();
+
+  // Top up any peer who is missing their wrapped copy of a session key, in
+  // every encrypted chat this device holds a key for.
+  //
+  // A participant with no key row cannot repair it themselves — repair
+  // starts from loadSessionKey, which is exactly what fails for them, so
+  // only a peer who still holds the key can re-deposit it. Until now the
+  // only trigger was opening that specific chat (app/chat/[id].tsx), which
+  // meant a conversation could stay unreadable for one side indefinitely
+  // while looking completely normal to the other. Running it here means
+  // simply opening the app repairs everything this device can reach.
+  //
+  // Once per mount, after the keypair is loaded. See repairAllSessionKeys
+  // for the cost argument (a no-op RPC per conversation in steady state).
+  const sweptRef = useRef(false);
+  useEffect(() => {
+    if (!userId || !e2eeReady || sweptRef.current) return;
+    sweptRef.current = true;
+    void repairAllSessionKeys().catch((caught) => {
+      // eslint-disable-next-line no-console
+      console.error("[useChats] session key sweep failed:", caught);
+    });
+  }, [userId, e2eeReady, repairAllSessionKeys]);
 
   const load = useCallback(async () => {
     if (!userId) {
@@ -69,7 +101,16 @@ export function useChats(userId: string | undefined) {
         )
       `
       )
-      .eq("user_id", userId);
+      .eq("user_id", userId)
+      // "Delete for me" (048_delete_chat.sql) sets this on the caller's own
+      // participant row only — the other participant's row, and every
+      // message, is untouched. Excluding it here is the entire client-side
+      // effect of that delete: the chat simply stops appearing in this
+      // list. A NEW message arriving un-hides it again (see the realtime
+      // handler below, which clears deleted_at on receipt), so this filter
+      // alone would otherwise permanently hide a chat someone messages you
+      // in again after you'd deleted it.
+      .is("deleted_at", null);
 
     if (queryError) {
       setError(queryError.message);
@@ -242,6 +283,7 @@ export function useChats(userId: string | undefined) {
         unreadCount,
         lastMessageIsOwn,
         lastMessageRead,
+        isEncrypted: conversation.is_encrypted,
       };
     });
 
@@ -304,6 +346,20 @@ export function useChats(userId: string | undefined) {
           const conversationId = (payload.new as { conversation_id?: string } | null)
             ?.conversation_id;
           if (!conversationId) return;
+          // A new message in a chat this device had "deleted for me" (048_
+          // delete_chat.sql) un-hides it, same as Telegram/WhatsApp — a
+          // deleted chat isn't a standing preference to never see this
+          // person again, it's "I'm done with the history up to now."
+          // Best-effort: RLS already scopes this to rows this user can
+          // update, and a failure here just leaves the chat hidden (the
+          // same state it was already correctly in) rather than breaking
+          // anything, so no error handling beyond letting it fail silently.
+          void supabase
+            .from("conversation_participants")
+            .update({ deleted_at: null })
+            .eq("conversation_id", conversationId)
+            .eq("user_id", userId)
+            .not("deleted_at", "is", null);
           scheduleReload();
         }
       )

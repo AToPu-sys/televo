@@ -55,9 +55,32 @@ public class CallKitAppDelegateSubscriber: ExpoAppDelegateSubscriber {
   /// Done at launch rather than per call because a PushKit cold launch
   /// reaches `didActivate` before any JS exists to configure it.
   private func takeManualControlOfWebRtcAudio() {
-    let session = RTCAudioSession.sharedInstance()
-    session.useManualAudio = true
-    session.isAudioEnabled = false
+    // DISABLED 2026-09-20 — reverted to WebRTC's own audio management.
+    //
+    // useManualAudio = true was introduced on 2026-09-18 (aae427d, "rewrite
+    // CallKit") to stop WebRTC's audio device module from activating the
+    // AVAudioSession underneath CallKit. It does prevent that specific
+    // race — but it also means WebRTC NEVER enables audio on its own, so
+    // every call's sound depends on an explicit enableWebRtcAudio(true)
+    // landing from exactly the right place at exactly the right time.
+    //
+    // Measured cost of that trade: average answered-call duration collapsed
+    // from 128-153s on 09-12/09-13 (real conversations) to 13-21s on
+    // 09-18/09-19, and a full day of work on 09-20 could not make audio
+    // survive a call reliably. Every fix closed one path to silence and
+    // left others open — a route correction spent too early, a flag leaking
+    // between calls, a track object replaced by renegotiation, a bridge
+    // remount disabling the unit.
+    //
+    // With manual audio off, WebRTC's audio device module activates the
+    // session itself whenever a track starts, which is how calls behaved
+    // when they last worked. CallKit still reports calls, still shows its
+    // system UI, and still wakes the app from a VoIP push — only the audio
+    // ownership goes back to WebRTC.
+    //
+    // The code that fed manual audio (enableWebRtcAudio, the keepAudioAlive
+    // watchdog, forceRepairAudioRoute) is left in place but becomes inert:
+    // isAudioEnabled is ignored by WebRTC when useManualAudio is false.
   }
 }
 

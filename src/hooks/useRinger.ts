@@ -60,7 +60,18 @@ export function useRinger(active: boolean, mode: "incoming" | "outgoing") {
       try {
         // Keep ringing even if the phone's silent switch is on — an incoming
         // call is exactly the case where that matters.
-        await setAudioModeAsync({ playsInSilentMode: true });
+        //
+        // allowsRecording matters on the OUTGOING path specifically. This
+        // hook is active for phase "outgoing" too (CallOverlay.tsx), which
+        // is the same moment acquireMedia opens the microphone and
+        // configureForVoiceCall sets the call audio session. Without
+        // allowsRecording this call put the session into a playback-only
+        // category, so the ringback and the call session fought over it
+        // while the mic was opening — and because this runs inside an async
+        // IIFE, it could land AFTER the mic was already live and quietly
+        // drop the session out of playAndRecord. That is one of the ways a
+        // call reached "Connected" carrying no audio at all.
+        await setAudioModeAsync({ playsInSilentMode: true, allowsRecording: true });
 
         const player = createAudioPlayer(require("../../assets/ringtone.wav"));
 

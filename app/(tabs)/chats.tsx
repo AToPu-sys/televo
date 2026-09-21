@@ -170,9 +170,25 @@ function ChatRowComponent({ chat, index }: { chat: ChatSummary; index: number })
       <Avatar name={chat.title} uri={chat.avatarUrl} />
       <View style={styles.rowBody}>
         <View style={styles.rowTop}>
-          <Text style={[styles.rowTitle, { color: theme.text }]} numberOfLines={1}>
-            {chat.title}
-          </Text>
+          <View style={styles.rowTitleWrap}>
+            {chat.isEncrypted ? (
+              // Secret Chat indicator, shown here rather than only inside a
+              // failed-decrypt message bubble — that was the ONLY place a
+              // Secret Chat was visually distinct from a regular one before,
+              // and only when something had already gone wrong. This marks
+              // the chat's TYPE at a glance in the list itself, matching
+              // Telegram's own placement.
+              <Ionicons
+                name="lock-closed"
+                size={13}
+                color={theme.accent}
+                style={styles.encryptedIcon}
+              />
+            ) : null}
+            <Text style={[styles.rowTitle, { color: theme.text }]} numberOfLines={1}>
+              {chat.title}
+            </Text>
+          </View>
           {chat.lastMessageAt ? (
             <Text style={[styles.rowTime, { color: theme.textSecondary }]}>
               {formatTimestamp(chat.lastMessageAt)}
@@ -266,7 +282,14 @@ const styles = StyleSheet.create({
   },
   rowBody: { flex: 1, gap: 2 },
   rowTop: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
-  rowTitle: { flex: 1, fontSize: 16, fontWeight: "600" },
+  // flex: 1 moved here from rowTitle (below) — this wrapper now holds both
+  // the optional lock icon and the title text, and needs to be the thing
+  // that stretches to push the timestamp to the right edge, not the Text
+  // alone, or a chat without the icon would size differently from one with
+  // it.
+  rowTitleWrap: { flex: 1, flexDirection: "row", alignItems: "center" },
+  encryptedIcon: { marginRight: 4 },
+  rowTitle: { fontSize: 16, fontWeight: "600" },
   rowTime: { fontSize: 12, marginLeft: spacing.sm },
   rowBottom: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
   rowPreview: { flex: 1, fontSize: 14 },

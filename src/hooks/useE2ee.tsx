@@ -79,12 +79,20 @@ type E2eeContextValue = {
    * desync anyone who already has a working copy. No-ops if this device
    * doesn't hold the key either. Safe to call every time a chat opens. */
   repairMissingSessionKeys: (conversationId: string) => Promise<void>;
+  /** Repairs every encrypted conversation at once — see the implementation
+   * for why the per-chat version alone leaves chats permanently broken. */
+  repairAllSessionKeys: () => Promise<void>;
   /** True if this device can currently decrypt in this conversation — i.e.
    * loadSessionKey succeeds. Used to detect the rare case where a
    * conversation is flagged encrypted but no participant has a readable key
    * row left at all (e.g. every local keypair changed since the rows were
    * wrapped), which needs re-initializing from zero rather than repairing. */
   hasWorkingSessionKey: (conversationId: string) => Promise<boolean>;
+  /** True if ANY participant has a wrapped session-key row for this
+   * conversation — regardless of whether THIS device can open it. The
+   * correct gate before minting a replacement key from zero: see its own
+   * definition for the incident this exists to prevent. */
+  anySessionKeyExists: (conversationId: string) => Promise<boolean>;
   /** Encrypts one call-signaling message (SDP/ICE) directly to a peer's
    * public key. Used so a call's offer/answer/ICE candidates — which carry
    * real IP addresses — aren't sent as plain JSON over Realtime broadcast.
@@ -204,16 +212,29 @@ export function E2eeProvider({
     async (conversationId: string): Promise<Uint8Array | null> => {
       const cached = sessionKeys.current.get(conversationId);
       if (cached) return cached;
-      if (!userId || !keyPair) return null;
+      if (!userId || !keyPair) {
+        console.warn("[useE2ee] loadSessionKey: no userId/keyPair yet", {
+          conversationId,
+          hasUserId: !!userId,
+          hasKeyPair: !!keyPair,
+        });
+        return null;
+      }
 
-      const { data } = await supabase
+      const { data, error: queryError } = await supabase
         .from("encrypted_session_keys")
         .select("encrypted_key, nonce, sender_public_key, kem_ciphertext")
         .eq("conversation_id", conversationId)
         .eq("recipient_id", userId)
         .maybeSingle();
 
-      if (!data) return null;
+      if (queryError) {
+        console.error("[useE2ee] loadSessionKey: query failed", queryError.message, { conversationId });
+      }
+      if (!data) {
+        console.warn("[useE2ee] loadSessionKey: no session-key row for this device", { conversationId, userId });
+        return null;
+      }
 
       // Detect a peer key swap BEFORE trusting it to unwrap anything — a
       // reinstall/new device and a MITM key substitution look identical from
@@ -237,6 +258,10 @@ export function E2eeProvider({
         keyPair.kyberSecretKey
       );
       if (!unwrapped) {
+        console.warn(
+          "[useE2ee] loadSessionKey: row exists but this device's keypair cannot unwrap it — deleting stale row",
+          { conversationId, userId }
+        );
         // A row EXISTS but this device's current keypair cannot open it —
         // permanently, not transiently. This happens after a reinstall or a
         // new device: getOrCreateDeviceKeyPair() mints a fresh keypair, but
@@ -377,8 +402,33 @@ export function E2eeProvider({
       // used to surface a red primary-key/RLS error even though the
       // conversation ended up perfectly encrypted by the winner. The RPC
       // skips a row that already exists (returns false) instead of failing,
-      // so the loser of that race silently converges on the winner's key.
-      let ownRowInserted = false;
+      // so the loser of that race silently converges on the winner's key —
+      // in theory. In practice this only checked THIS device's own row,
+      // which is not the same claim.
+      //
+      // Real incident this caused (2026-09-19): two participants opened the
+      // same never-encrypted 1:1 chat within moments of each other. Device A
+      // deposited its own row first (won), then deposited a row FOR B — but
+      // B had, in the same window, already deposited its OWN row first, so
+      // A's deposit-for-B silently no-op'd on the conflict. Symmetrically, B
+      // deposited its own row (won) and its deposit-for-A lost to A's
+      // earlier row. Both devices then checked only `profile.id === userId`
+      // — which was true for BOTH of them, since each device's OWN row
+      // really did win its own race — so both concluded "I won" and both
+      // cached and sent under their own, DIFFERENT session key from then on.
+      // Neither side's `loadSessionKey` fallback below ever ran, because it
+      // was gated on the wrong condition. Every message either side sent
+      // was permanently unreadable by the other, symmetrically, with no
+      // error surfaced anywhere — indistinguishable from a healthy chat
+      // until someone actually read a reply.
+      //
+      // The only claim that's actually safe to trust is "every row in this
+      // batch was newly inserted" — if even one row (ANY recipient's, not
+      // just this device's own) lost its conflict, some other device's key
+      // is already the real one for at least part of this conversation, and
+      // this device's freshly generated key must be discarded in favor of
+      // it, not just when its own row specifically lost.
+      let allRowsInserted = true;
       for (const profile of profiles ?? []) {
         const wrapped = await wrapSessionKey(
           sessionKey,
@@ -394,19 +444,22 @@ export function E2eeProvider({
             p_sender_public_key: keyPair.publicKey,
             p_encrypted_key: wrapped.encryptedKey,
             p_nonce: wrapped.nonce,
-            p_kem_ciphertext: wrapped.kemCiphertext,
+            p_kem_ciphertext: wrapped.kemCiphertext ?? undefined,
           }
         );
         if (depositError) throw depositError;
-        if (profile.id === userId) ownRowInserted = inserted === true;
+        if (inserted !== true) allRowsInserted = false;
       }
 
-      // If this device's own row already existed, another device won the race
-      // and every message in this chat is encrypted under ITS key, not the
-      // one generated above. Caching the local key here would make this
-      // device encrypt with a key nobody else can unwrap. Load the real one
-      // instead; the generated key is simply discarded.
-      if (!ownRowInserted) {
+      // If ANY row in this batch already existed — this device's own row or
+      // anyone else's — another device's key may already be (partly or
+      // fully) in effect for this conversation. Load the real one from the
+      // database instead of trusting the one generated locally; the
+      // generated key is simply discarded. See allRowsInserted's comment for
+      // the incident this replaces the narrower (and wrong) own-row-only
+      // check that used to be here.
+      if (!allRowsInserted) {
+        sessionKeys.current.delete(conversationId);
         await loadSessionKey(conversationId);
         return;
       }
@@ -513,7 +566,7 @@ export function E2eeProvider({
             p_sender_public_key: keyPair.publicKey,
             p_encrypted_key: wrapped.encryptedKey,
             p_nonce: wrapped.nonce,
-            p_kem_ciphertext: wrapped.kemCiphertext,
+            p_kem_ciphertext: wrapped.kemCiphertext ?? undefined,
           });
           if (error) {
             // eslint-disable-next-line no-console
@@ -536,6 +589,54 @@ export function E2eeProvider({
     [userId, keyPair, loadSessionKey]
   );
 
+  /**
+   * Runs repairMissingSessionKeys across EVERY encrypted conversation this
+   * device takes part in, rather than only the one currently on screen.
+   *
+   * Why this is needed on top of the per-chat repair: a participant whose
+   * wrapped key row is missing cannot fix it themselves — repair starts
+   * from loadSessionKey, which is exactly what fails for them. Only a peer
+   * who still holds the key can re-deposit it. With repair wired solely to
+   * the chat screen, that peer had to happen to OPEN that specific
+   * conversation, so a chat stayed unreadable indefinitely for the affected
+   * side while looking perfectly normal to the other.
+   *
+   * Measured 2026-09-19: three 1:1 conversations were in exactly this
+   * state, all with the same participant missing a row after a keypair
+   * rotation (profiles.e2e_public_key updated 17:54 that day, while the
+   * peers' rows dated from 2026-09-05). Each would only have healed when
+   * that particular peer next opened that particular thread.
+   *
+   * Sweeping from the chat LIST closes that gap: opening the app is enough
+   * for a device to top up everyone it can, in every thread it holds a key
+   * for. Cost is one select plus one deposit RPC per genuinely missing
+   * recipient — the RPC is SECURITY DEFINER and skips recipients who
+   * already have a row server-side, so the steady-state cost is a single
+   * cheap no-op call per conversation.
+   */
+  const repairAllSessionKeys = useCallback(async () => {
+    if (!userId || !keyPair) return;
+    const { data: rows, error } = await supabase
+      .from("conversation_participants")
+      .select("conversation_id, conversations!inner(is_encrypted)")
+      .eq("user_id", userId)
+      .eq("conversations.is_encrypted", true);
+    if (error || !rows) return;
+
+    // Sequential rather than Promise.all: this runs at app open, competing
+    // with the chat list's own queries, and a burst of parallel wraps (each
+    // one an X25519 + ML-KEM operation) on the JS thread is visible as a
+    // stutter on the list it is running behind.
+    for (const row of rows) {
+      try {
+        await repairMissingSessionKeys(row.conversation_id);
+      } catch {
+        // Per-conversation failure must not stop the sweep — the whole
+        // point is to repair as many as possible from whoever can.
+      }
+    }
+  }, [userId, keyPair, repairMissingSessionKeys]);
+
   const hasWorkingSessionKey = useCallback(
     async (conversationId: string): Promise<boolean> => {
       const key = await loadSessionKey(conversationId);
@@ -543,6 +644,57 @@ export function E2eeProvider({
     },
     [loadSessionKey]
   );
+
+  /** True if ANY participant — not just this device — has a wrapped session
+   * key row for this conversation. Distinct from hasWorkingSessionKey, which
+   * only answers "can THIS device decrypt," and was, until 2026-09-19, the
+   * ONLY check app/chat/[id].tsx's "reinit from zero" effect made before
+   * generating a brand new session key. That effect's own comment claimed
+   * doing so was "safe... because there is no readable key anywhere left to
+   * desync from" — which this device genuinely cannot know from
+   * hasWorkingSessionKey alone. The real incident this caused: a device that
+   * lost its local keypair (a reinstall — see src/lib/e2e.ts) opens an
+   * already-encrypted 1:1 chat, hasWorkingSessionKey correctly says false
+   * for THIS device, the effect concludes "nobody has a key" and calls
+   * startEncryptedChat, which mints and deposits a NEW session key. The
+   * other participant's row — deposited days earlier under the real,
+   * still-working shared key — is untouched (deposit_session_key_if_missing
+   * only ever ADDS a missing row, never overwrites one that exists), so the
+   * two participants end up on two different, mutually undecryptable keys.
+   * Every message either side sends afterward is permanently unreadable by
+   * the other. This is exactly the "Unable to decrypt for everyone, not
+   * just me" report from 2026-09-19, and it reproduced identically after
+   * being manually repaired in the database, because the underlying trigger
+   * — a device opening a chat whose OWN copy of the key is gone — was still
+   * there. The correct question before minting a replacement key is "does
+   * ANY row exist for this conversation," which this function answers by
+   * reading encrypted_session_keys directly rather than trying to unwrap
+   * anything.
+   *
+   * Goes through the any_session_key_exists RPC (050_any_session_key_exists
+   * _rpc.sql), not a direct table query: encrypted_session_keys' own SELECT
+   * policy restricts every row to `recipient_id = auth.uid()` — correct for
+   * reading the key material itself, but it means a plain
+   * `.from("encrypted_session_keys").select(...)` from here would see ONLY
+   * this device's own row and never the other participant's, making this
+   * function behave identically to hasWorkingSessionKey for exactly the
+   * device this exists to fix. The RPC is SECURITY DEFINER specifically to
+   * see past that per-row restriction, while still only ever returning a
+   * boolean — never the wrapped key — to the client. */
+  const anySessionKeyExists = useCallback(async (conversationId: string): Promise<boolean> => {
+    const { data, error } = await supabase.rpc("any_session_key_exists", {
+      p_conversation_id: conversationId,
+    });
+    if (error) {
+      console.error("[useE2ee] any_session_key_exists failed:", error.message, { conversationId });
+      // Fail closed toward NOT reinitializing: an RPC error is far more
+      // likely to be transient (network, a cold Postgres connection) than
+      // proof that zero rows exist, and wrongly minting a replacement key
+      // here is exactly the desync this function exists to prevent.
+      return true;
+    }
+    return data === true;
+  }, []);
 
   const encryptSignalToPeer = useCallback(
     (
@@ -646,7 +798,9 @@ export function E2eeProvider({
       peerKeyChanged,
       acknowledgeKeyChange,
       repairMissingSessionKeys,
+      repairAllSessionKeys,
       hasWorkingSessionKey,
+      anySessionKeyExists,
       encryptSignalToPeer,
       decryptSignalFromPeer,
       startCallKem,
@@ -663,7 +817,9 @@ export function E2eeProvider({
       peerKeyChanged,
       acknowledgeKeyChange,
       repairMissingSessionKeys,
+      repairAllSessionKeys,
       hasWorkingSessionKey,
+      anySessionKeyExists,
       encryptSignalToPeer,
       decryptSignalFromPeer,
       startCallKem,

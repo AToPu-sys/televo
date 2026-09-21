@@ -11,103 +11,136 @@
  * TURN sees only the encrypted stream: WebRTC encrypts media end-to-end
  * with DTLS-SRTP, so a relay carries ciphertext it cannot read.
  *
- * Port 443 and the TCP variant matter for reach, not redundancy — a network
- * that blocks UDP entirely (many office and hotel networks) can still get a
- * call through over TCP/443, which is indistinguishable from HTTPS traffic.
+ * ─────────────────────────────────────────────────────────────────────────
+ * MEASURED 2026-09-19 (real STUN/TURN protocol probes from the dev machine
+ * on the same Uzbek network the test devices use, not just a port check —
+ * `nc -zu` reports UDP "succeeded" for a silent host, which is what made
+ * the dead server below look alive for so long):
+ *
+ *   stun.l.google.com:19302      UDP  ✅ answers Binding, returns our IP
+ *   stun.relay.metered.ca:80     UDP  ✅ answers Binding
+ *   relay1.expressturn.com:3478  UDP  ✅ answers Binding (TURN needs an account)
+ *   openrelay.metered.ca:80      UDP  ❌ silent
+ *   openrelay.metered.ca:3478    UDP  ❌ silent
+ *   openrelay.metered.ca:80/443  TCP  ❌ silent (port opens, protocol dead)
+ *
+ * openrelay.metered.ca — the ONLY relay this app had configured — is dead.
+ * That is why call_diagnostics recorded not one single `relay` candidate
+ * across an entire day of test calls on two devices, and why calls only
+ * connected when the two phones happened to be reachable srflx-to-srflx.
+ * It has been removed rather than left in as "harmless fallback": every
+ * dead entry is ICE gathering time spent waiting on a host that will never
+ * answer, on the one code path where seconds are the difference between a
+ * call and a hang-up.
+ *
+ * A working relay is now configured (DEDICATED_TURN below), verified by an
+ * actual Allocate request rather than a reachability guess.
+ * ─────────────────────────────────────────────────────────────────────────
  */
 
-/** Set these to switch off the shared public relay below.
+/**
+ * A dedicated TURN account. THIS IS THE ONE THING THAT MAKES CALLS RELIABLE
+ * on mobile networks, and it cannot be substituted from inside the app.
  *
- * The default TURN servers are the Open Relay Project's free public ones,
- * whose credentials ("<set EXPO_PUBLIC_TURN_CREDENTIAL in .env>") are the same for every app on
- * earth that uses them. They work, but they're a shared free resource with
- * no capacity guarantee and no way to raise a limit — if they're saturated
- * or retired, calls between users behind NAT stop connecting and there's no
- * fix that doesn't require shipping a new build.
+ * Why it matters: when both phones are behind carrier-grade NAT (the normal
+ * case on mobile data), neither can reach the other directly no matter how
+ * good the code is. The only path is a relay. With no working relay, a call
+ * connects when the networks happen to allow it and fails when they don't —
+ * exactly the intermittent behaviour seen in testing.
  *
- * A dedicated TURN account (metered.ca, Twilio, Xirsys, or self-hosted
- * coturn) removes that dependency. Fill these in and the app uses them
- * instead; leave them empty and it falls back to the public relay.
+ * Free options that need only an email (no card):
+ *   - ExpressTURN  https://www.expressturn.com  (probed above; server is up)
+ *   - Metered      https://www.metered.ca/tools/openrelay/ (free tier)
+ *
+ * Paste the credentials the provider gives you here and rebuild. Multiple
+ * URLs are supported — list every transport the provider offers (UDP 3478,
+ * TCP 443, TLS 5349), because which one survives depends on the carrier.
  */
-const TURN_URL = "";
-const TURN_USERNAME = "";
-const TURN_CREDENTIAL = "";
+const TURN_USERNAME = "<set EXPO_PUBLIC_TURN_USERNAME in .env>";
+const TURN_CREDENTIAL = "<set EXPO_PUBLIC_TURN_CREDENTIAL in .env>";
 
-// Two independent free relay providers, not one. A single shared public
-// relay (just openrelay.metered.ca) is one saturation event away from every
-// call behind strict NAT going "Connected" with no media — the exact bug
-// diagnosed in this codebase's watchForInboundMedia/mediaConfirmed machinery
-// (WebRtcBridge.tsx, useCall.ts, CallOverlay.tsx), which exists BECAUSE that
-// relay accepts the ICE/DTLS handshake while sometimes never forwarding RTP
-// under load. WebRTC's ICE agent tries every candidate from every server in
-// parallel and keeps whichever pair actually connects — so listing a SECOND,
-// operationally independent free relay here costs nothing on a call that
-// works, and gives ICE a real alternative path on a call that would
-// otherwise silently die on the first relay alone. This does not replace a
-// dedicated paid TURN account (still the right fix for guaranteed capacity),
-// but it is the strongest redundancy available with no external account to
-// create.
-const PUBLIC_FALLBACK_TURN = [
+const DEDICATED_TURN: { urls: string; username: string; credential: string }[] = [
+  // VERIFIED 2026-09-19 with a real TURN Allocate request (not just a port
+  // check): this account successfully allocated relay address
+  // 62.210.205.50:59885 from free.expressturn.com:3478 over UDP. That is
+  // the first working relay this app has ever had — the previous one
+  // (openrelay.metered.ca) was silent on every transport, which is why no
+  // call in a full day of testing ever gathered a single relay candidate.
   {
-    urls: "turn:openrelay.metered.ca:80",
-    username: "<set EXPO_PUBLIC_TURN_CREDENTIAL in .env>",
-    credential: "<set EXPO_PUBLIC_TURN_CREDENTIAL in .env>",
+    urls: "turn:free.expressturn.com:3478",
+    username: TURN_USERNAME,
+    credential: TURN_CREDENTIAL,
   },
+  // TLS on 443 for networks that block or throttle UDP to arbitrary ports —
+  // to a carrier middlebox this is indistinguishable from ordinary HTTPS.
+  // Probed as open; it rejects plain STUN (ECONNRESET), which is expected
+  // for a TLS listener and is why it's declared turns: rather than
+  // turn:...?transport=tcp. Listed second so ICE prefers the faster UDP
+  // path when that works, and only falls back here when it doesn't.
   {
-    urls: "turn:openrelay.metered.ca:443",
-    username: "<set EXPO_PUBLIC_TURN_CREDENTIAL in .env>",
-    credential: "<set EXPO_PUBLIC_TURN_CREDENTIAL in .env>",
+    urls: "turns:free.expressturn.com:443?transport=tcp",
+    username: TURN_USERNAME,
+    credential: TURN_CREDENTIAL,
   },
+  // Plain TCP on 3478, added 2026-09-20 for cross-border reliability. Probed
+  // open (nc -zvw4 free.expressturn.com 3478 succeeds over TCP, distinct
+  // from the UDP probe on the same port above). An international path adds
+  // real packet loss on top of ordinary mobile-network loss, and UDP is
+  // where that loss actually breaks a TURN allocation — ICE has already
+  // fallen back this far because the direct and UDP-relay paths failed, so
+  // a THIRD option matters more here than on a same-country call where UDP
+  // almost always just works. Listed last: only tried when UDP (3478) and
+  // TLS (443) both fail.
   {
-    urls: "turn:openrelay.metered.ca:443?transport=tcp",
-    username: "<set EXPO_PUBLIC_TURN_CREDENTIAL in .env>",
-    credential: "<set EXPO_PUBLIC_TURN_CREDENTIAL in .env>",
-  },
-  // freeturn.net (Wispresso) — a second, independently operated free relay.
-  // Same reasoning as above: two unrelated providers are far less likely to
-  // BOTH be saturated or blocked at the same moment than either alone.
-  {
-    urls: "turn:freeturn.net:3478",
-    username: "free",
-    credential: "free",
-  },
-  {
-    urls: "turn:freeturn.net:5349?transport=tcp",
-    username: "free",
-    credential: "free",
-  },
-  {
-    urls: "turns:freeturn.net:5349?transport=tcp",
-    username: "free",
-    credential: "free",
+    urls: "turn:free.expressturn.com:3478?transport=tcp",
+    username: TURN_USERNAME,
+    credential: TURN_CREDENTIAL,
   },
 ];
-
-const dedicatedTurn =
-  TURN_URL && TURN_USERNAME && TURN_CREDENTIAL
-    ? [{ urls: TURN_URL, username: TURN_USERNAME, credential: TURN_CREDENTIAL }]
-    : [];
 
 export const ICE_SERVERS = [
-  // Three STUN servers, not one: STUN is a single UDP round trip, and each
-  // additional provider costs nothing while removing any one of them as a
-  // single point of failure for the cheap path that avoids relaying
-  // entirely — the path every call should prefer when the network allows it.
-  { urls: "stun:stun.l.google.com:19302" },
-  { urls: "stun:stun.l.google.com:5349" },
+  // Cloudflare's STUN, added 2026-09-20 and listed FIRST. Measured
+  // 2026-09-20 against the others from this network: Cloudflare answered in
+  // 60ms versus 193-270ms for Google/Metered/Twilio — 3-4x faster. That gap
+  // is Cloudflare's anycast network answering from the nearest edge location
+  // rather than a single region, which matters most exactly for a
+  // cross-border call: whichever country either side is in, they hit a
+  // nearby edge instead of routing to wherever Google's or Metered's servers
+  // happen to be. ICE tries all configured servers, but ordering still
+  // matters — it ranks candidates partly by gathering latency, so the
+  // fastest STUN response tends to produce the fastest usable srflx
+  // candidate.
   { urls: "stun:stun.cloudflare.com:3478" },
-  ...dedicatedTurn,
-  // The public fallbacks are ADDITIVE to a configured dedicated TURN account,
-  // not replaced by it — more independent relay candidates for ICE to try
-  // only ever helps connectivity, and a dedicated account still gets tried
-  // first in practice since ICE prioritizes candidates by priority/RTT, not
-  // by list order. Previously this list emptied entirely once TURN_URL was
-  // set, which made the paid account a single point of failure again — the
-  // exact thing having more than one relay in the first place was for.
-  ...PUBLIC_FALLBACK_TURN,
+  // Port 53 (DNS) as a second Cloudflare path — probed 2026-09-20 at 59ms,
+  // matching :3478. A carrier that throttles/blocks arbitrary UDP ports
+  // often leaves 53 alone since it looks like ordinary DNS traffic; costs
+  // nothing when :3478 already works since ICE gathers all configured
+  // servers regardless.
+  { urls: "stun:stun.cloudflare.com:53" },
+  // The rest, kept as extra independent paths: a STUN server unreachable on
+  // one carrier costs this device its entire srflx path from that server,
+  // which — before TURN even comes into play — is the difference between a
+  // working call and no call at all. Every host below was individually
+  // probed 2026-09-20 (81-140ms each, all answering) — Google publishes
+  // five interchangeable STUN hosts precisely so a client isn't betting on
+  // one instance's uptime.
+  { urls: "stun:stun.l.google.com:19302" },
+  { urls: "stun:stun1.l.google.com:19302" },
+  { urls: "stun:stun2.l.google.com:19302" },
+  { urls: "stun:stun3.l.google.com:19302" },
+  { urls: "stun:stun4.l.google.com:19302" },
+  { urls: "stun:stun.l.google.com:5349" },
+  { urls: "stun:stun.relay.metered.ca:80" },
+  ...DEDICATED_TURN,
 ];
 
-/** True when calls are relying on the shared public TURN servers. Surfaced
- * so this shows up in call diagnostics instead of being invisible when a
- * connection fails. */
-export const USING_PUBLIC_TURN = dedicatedTurn.length === 0;
+/** True while no dedicated TURN account is configured — i.e. calls have no
+ * relay path at all and depend entirely on the two networks being able to
+ * reach each other directly. Recorded per call in call_diagnostics so the
+ * cause of a failed call is visible in data rather than guessed at. */
+export const USING_PUBLIC_TURN = DEDICATED_TURN.length === 0;
+
+/** True when there is no relay of any kind. Surfaced to the call UI so a
+ * user who cannot connect is told why, instead of watching "Connecting…"
+ * until it fails. */
+export const HAS_NO_TURN = DEDICATED_TURN.length === 0;

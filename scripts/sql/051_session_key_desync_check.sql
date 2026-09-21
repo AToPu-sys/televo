@@ -1,0 +1,32 @@
+-- Removed: session_key_is_desynced.
+--
+-- This function briefly existed and was WRONG. It flagged a conversation as
+-- desynced whenever encrypted_session_keys held rows wrapped by more than
+-- one sender_public_key — on the theory that the whole conversation shares
+-- one session key, so every row should have been wrapped by whichever
+-- device generated it.
+--
+-- That premise is false, because repairMissingSessionKeys (useE2ee.tsx)
+-- exists and is the normal healing path: when a participant is missing
+-- their wrapped copy, ANY peer that can still decrypt loads the real
+-- session key and re-wraps THAT SAME KEY under its own keypair. The new
+-- row therefore legitimately carries a different sender_public_key while
+-- containing the identical session key. Observed live on 2026-09-19:
+-- conversation a44e8667 had three rows from Bekhruz and one written by
+-- Shakha for a participant who had none — a correctly repaired chat that
+-- this check reported as broken.
+--
+-- Only ONE code path mints a new session key (generateSessionKey, called
+-- solely in startEncryptedChat), and it already refuses to keep a freshly
+-- generated key when any row in its batch turned out to pre-exist
+-- (allRowsInserted). A real desync is not visible in sender_public_key at
+-- all: the wrapped key material is opaque to the server, and only a device
+-- holding the recipient private key can tell whether two rows carry the
+-- same key. Detecting it server-side would require storing a non-secret
+-- fingerprint of the session key alongside each row, which no migration
+-- currently does.
+--
+-- Dropped rather than left in place: a check that reports healthy
+-- conversations as broken is worse than no check, since acting on it means
+-- deleting rows that were correct.
+drop function if exists public.session_key_is_desynced(uuid);

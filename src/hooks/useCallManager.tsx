@@ -95,7 +95,7 @@ export function CallManagerProvider({ children }: { children: ReactNode }) {
       // its own.
       const { error } = await supabase.rpc("claim_voip_push_token", {
         p_token: token,
-        p_device_name: Device.deviceName ?? null,
+        p_device_name: Device.deviceName ?? undefined,
       });
       if (!error || cancelled) return;
 
@@ -157,6 +157,27 @@ export function CallManagerProvider({ children }: { children: ReactNode }) {
   // plaintext on one side only.
   const e2eeReadyRef = useRef(e2eeReady);
   e2eeReadyRef.current = e2eeReady;
+  // The call id handleIncoming has already started processing — set
+  // SYNCHRONOUSLY at the top of that function, before any `await`.
+  //
+  // Real incident this fixes (2026-09-19): the same incoming call reaches
+  // handleIncoming through two independent paths — a VoIP push (cold
+  // launch, reports to CallKit natively before JS runs) and the Realtime
+  // "ringing" row INSERT — and the function's own comment already
+  // acknowledged this as expected, guarding against it via
+  // `call.state.phase !== "idle" && call.state.phase !== "ended"`. That
+  // guard reads `call.state`, which only updates on a React commit AFTER
+  // `listenForOffer` has already run several `await`s deep (resolvePeer,
+  // waitForE2ee can each take real time). If both paths fire within that
+  // window, both read phase as still "idle" and BOTH proceed to call
+  // `call.listenForOffer(incomingCall)` — subscribing to the same
+  // `call:${callId}` signaling channel twice. The caller's single offer
+  // then reaches TWO handlers, each independently creating and sending its
+  // own SDP answer: the caller applies the first answer fine, then the
+  // second `setRemoteDescription` fails with "Called in wrong state:
+  // stable" and the call drops. A plain ref set before any await closes
+  // the race a state-derived check structurally cannot.
+  const incomingCallHandledRef = useRef<string | null>(null);
 
   const waitForE2ee = useCallback(async () => {
     if (e2eeReadyRef.current) return true;
@@ -384,6 +405,13 @@ export function CallManagerProvider({ children }: { children: ReactNode }) {
       // Without the native module there is no way to answer, so ringing would
       // only offer an Accept button that cannot work.
       if (!callsSupported()) return;
+      // Synchronous dedup, checked and set BEFORE any await below (the
+      // busyState/phase check a few lines down runs too, but that one reads
+      // React state that hasn't committed yet on a fast double-fire — see
+      // incomingCallHandledRef's own comment for the exact race this closes
+      // that the phase check alone cannot).
+      if (incomingCallHandledRef.current === incomingCall.id) return;
+      incomingCallHandledRef.current = incomingCall.id;
       // Already busy: ignore rather than clobber. This used to run
       // unconditionally, so a second call (or two people ringing each other
       // at once) tore down the in-progress call's signaling channel and left
@@ -633,6 +661,12 @@ export function CallManagerProvider({ children }: { children: ReactNode }) {
     if (state.phase === "ended") {
       const callId = reportedCallIdRef.current;
       reportedCallIdRef.current = null;
+      // Clears the dedup guard so a genuinely new incoming call — including
+      // a new call that happens to reuse this same id is impossible, but a
+      // NEXT call is not — is handled normally rather than silently
+      // dropped by incomingCallHandledRef still pointing at the call that
+      // just ended.
+      incomingCallHandledRef.current = null;
       if (callId && !endedViaCallKitRef.current) {
         endCallKitCall(callId, state.reason);
       }

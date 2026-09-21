@@ -1,10 +1,14 @@
-import { reportMuteState } from "expo-callkit";
+import { onCallKitAudioSessionInterruption, reportMuteState } from "expo-callkit";
 import { resetAudioRoute, setSpeakerphoneOn } from "expo-speaker-toggle";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import type { BridgeEvent, WebRtcBridgeHandle } from "../components/WebRtcBridge";
+import {
+  clearCallKitAudioSessionWait,
+  markNextCallAsAnsweredViaCallKit,
+} from "../components/WebRtcBridge";
 import { supabase } from "../lib/supabase";
-import { ICE_SERVERS } from "../lib/webrtc";
+import { ICE_SERVERS, USING_PUBLIC_TURN } from "../lib/webrtc";
 import type { Database } from "../types/database";
 import { useE2ee } from "./useE2ee";
 import type { SignalEnvelope } from "../lib/e2e";
@@ -116,6 +120,29 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
     // eslint-disable-next-line no-console
     console.log(`[call trace] ${label}${detail ? ` — ${detail}` : ""}`);
   }, []);
+  // Diagnostic only — see CallKitDelegate's init and onAudioSessionInterruption's
+  // own comment. Subscribed for the whole component lifetime (not gated on
+  // being mid-call) since an interruption that lands JUST before a call
+  // starts is exactly as relevant as one mid-call, and there is no
+  // meaningful per-call teardown needed for a listener this cheap.
+  //
+  // Added 2026-09-21 after real calls (Bek <-> Shakha) showed audio flowing
+  // normally for the first several seconds, then outbound/inbound packet
+  // counts freezing solid for the rest of the call with NOTHING else in the
+  // trace to explain it — no ICE restart, no route event, no track state
+  // change. A system audio interruption is the one thing that can do
+  // exactly that, and until now it was invisible: this makes it a fact in
+  // the next call's trace instead of a remaining hypothesis.
+  useEffect(() => {
+    const sub = onCallKitAudioSessionInterruption(({ type, reason, wasSuspended, shouldResume }) => {
+      trace(
+        "audio session interruption",
+        `type=${type} reason=${reason} wasSuspended=${wasSuspended} shouldResume=${shouldResume}`
+      );
+    });
+    return () => sub.remove();
+  }, [trace]);
+
   /** Formats the trace as readable text — call time deltas in ms from the
    * first entry, so it reads as a timeline. */
   const getDiagnosticsReport = useCallback(() => {
@@ -180,6 +207,31 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
   // The call id answerCall has already run for — see its guard. Cleared in
   // cleanup() so the next call can be answered normally.
   const answeredCallIdRef = useRef<string | null>(null);
+  // True once this call ever reached phase "active", on EITHER side —
+  // answeredCallIdRef above only ever gets set on the callee. Used by
+  // flushCallDiagnostics to decide whether a call that ended with no
+  // explicit outcome (media-flowing/media-timeout never fired before a
+  // manual hangup) is still worth a row: "was connected, then ended for an
+  // unknown reason" is itself a diagnosis, unlike "never got past ringing."
+  const wasActiveRef = useRef(false);
+  // Defense in depth against a duplicate "answer" signal for the SAME call
+  // (the root cause was fixed at the source in useCallManager's
+  // incomingCallHandledRef, 2026-09-19, but a signal duplicate could in
+  // principle also arrive from a network-level redelivery, not just a
+  // double-answered call). Applying a second remote answer to a peer
+  // connection already in "stable" state throws "Called in wrong state:
+  // stable" and drops the call — this makes a duplicate a silent no-op
+  // instead.
+  //
+  // Cleared whenever THIS side starts an ICE restart (see the three
+  // restart-ice call sites). A restart makes the callee produce a genuinely
+  // new answer for the same call.id, and keying the guard on call.id alone
+  // meant that answer was discarded as a "duplicate" — so the caller
+  // re-gathered candidates, the callee answered, and the caller ignored it,
+  // leaving the connection stuck in "connecting" until someone hung up. The
+  // 2026-09-19 traces show exactly this: a second answer arriving at
+  // 14372ms that never moved the connection state.
+  const answerAppliedForCallIdRef = useRef<string | null>(null);
   // Set when the user taps Accept before the caller's offer has arrived.
   // Accept used to just re-ping the caller and return, so the offer would
   // land a moment later and sit unused — the button appeared dead and you had
@@ -199,6 +251,50 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
   // when the peer announces it has joined the channel (see "callee-ready").
   const sentCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
   const roleRef = useRef<"caller" | "callee" | null>(null);
+  // How many ICE restarts this call has already attempted, capped so a
+  // genuinely dead network ends the call instead of looping forever.
+  //
+  // Raised from a single boolean to a count of 2 on 2026-09-19: one restart
+  // has to cover BOTH failure shapes (connectionState "failed", and
+  // "connected but no RTP"), so a call that burned its only retry on the
+  // first had nothing left for the second. Each restart is a fresh
+  // candidate gathering pass, and with a working relay now configured the
+  // second attempt has a real chance rather than being a formality.
+  const iceRestartCountRef = useRef(0);
+  /** True between sending a restart-ice and the next connected/media-flowing.
+   *
+   * Three independent handlers can each decide to restart for the same call
+   * within seconds of each other: "connection-state: failed",
+   * "negotiation-stalled" (9s, from the bridge's own timer) and
+   * "media-timeout" (12s, from watchForInboundMedia). Before this, two of
+   * them landing meant two restart offers, two renegotiate-answers from the
+   * callee, and the caller applying only the first — leaving its remote
+   * description matched to restart #1 while the callee's local description
+   * matched restart #2, which is a permanently stuck "connecting".
+   *
+   * stallRestartedRef already prevented a second STALL restart, but not a
+   * stall restart followed by a media-timeout restart. */
+  const restartInFlightRef = useRef(false);
+  // Raised from 2 to 3, 2026-09-20, for cross-border reliability: an
+  // international path has more candidate pairs that can individually fail
+  // (longer route, more middleboxes), so it costs an extra ~9-12s of
+  // "Connecting…" in the worst case but gives ICE a third fresh gathering
+  // pass before giving up on a call the user is still holding the phone up
+  // for.
+  const MAX_ICE_RESTARTS = 3;
+  /** True once any restart has happened — for diagnostics labelling. */
+  const iceRestartedRef = { get current() { return iceRestartCountRef.current > 0; } };
+  // Latest connection stats from the bridge, held until the call ends so
+  // they can be written to call_diagnostics with the final outcome — the
+  // stats arrive mid-call, but the outcome is only known at teardown.
+  const callStatsRef = useRef<Extract<BridgeEvent, { type: "call-stats" }> | null>(null);
+  // Set at teardown so the diagnostics row records what actually happened
+  // rather than inferring it from state that cleanup() has already reset.
+  const callOutcomeRef = useRef<string | null>(null);
+  // cleanup() is declared above the function that writes diagnostics (which
+  // needs userId and trace), so it is reached through a ref rather than
+  // reordering the file around a single call.
+  const flushCallDiagnosticsRef = useRef<(() => void) | null>(null);
   const startingRef = useRef(false);
   // listenForOffer() needs answerCall(), which is declared below it. A ref
   // breaks the ordering cycle without reshuffling the file.
@@ -229,6 +325,34 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
 
   const sendCommand = useCallback((command: object) => {
     if (bridgeRef.current) {
+      // Sent directly, so it must NOT also sit in the replay queue.
+      //
+      // Both paths could fire for one command: it was queued while
+      // bridgeRef was still null, and then the "ready" handler flushed the
+      // queue while this same command was ALSO delivered directly once the
+      // ref appeared. The callee then ran create-answer twice, and the
+      // second run's createPeer() closed the connection the first run's
+      // media was already bound to — one second of audio, then silence
+      // (measured Bek → Shakha, 2026-09-20).
+      const queue = pendingCommandsRef.current;
+      const type = (command as { type?: string }).type;
+      // Only for the commands that START a call. Those are identified by
+      // their type alone — there is exactly one create-answer per call — so
+      // dropping an older queued copy is always right.
+      //
+      // Scoped deliberately: ice-candidate, set-mic and set-camera all
+      // carry a distinct payload per message, and filtering those by type
+      // would silently discard a queued candidate when a different one is
+      // sent directly, losing it permanently (the sentCandidates replay
+      // re-sends to the PEER, never to the local bridge).
+      if (
+        queue.length > 0 &&
+        (type === "create-offer" || type === "create-answer" || type === "start-local")
+      ) {
+        pendingCommandsRef.current = queue.filter(
+          (queued) => (queued as { type?: string }).type !== type
+        );
+      }
       bridgeRef.current.send(command);
       return;
     }
@@ -243,19 +367,65 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
 
   /** Opens the local mic/camera, deferring until the bridge exists. */
   const requestLocalMedia = useCallback(
-    (video: boolean) => {
-      sendCommand({ type: "start-local", video });
+    (video: boolean, iceServers?: typeof ICE_SERVERS) => {
+      // iceServers is passed ONLY by the caller (startCall). It makes the
+      // bridge build the peer connection immediately and begin gathering
+      // ICE while the camera is still opening — see start-local's branch in
+      // WebRtcBridge for the measurements behind this. The callee must NOT
+      // pass it: create-answer builds its connection around the remote
+      // offer, and a pre-built one would be replaced anyway.
+      sendCommand({ type: "start-local", video, iceServers });
     },
     [sendCommand]
   );
 
   const cleanup = useCallback(() => {
+    // Flush diagnostics FIRST: everything this needs (the call row, the
+    // stats, the trace) is cleared by the resets below, and the whole point
+    // of the table is that this survives the call.
+    flushCallDiagnosticsRef.current?.();
     sendCommand({ type: "hangup" });
     setMediaConfirmed(false);
     roleRef.current = null;
+    iceRestartCountRef.current = 0;
+    restartInFlightRef.current = false;
+    // Drop the loudspeaker preference the moment a call ends, not on the 3s
+    // auto-dismiss timer in reset().
+    //
+    // speakerEnabled lives in the native module and drives the session MODE
+    // (.videoChat = loudspeaker profile, .voiceChat = earpiece). reset() is
+    // the only other thing that clears it, and it runs 3s after the call
+    // ends — so starting a new call inside that window inherited the
+    // previous call's preference. Measured 2026-09-20: a video call at
+    // 10:21:36 was followed by an AUDIO call at 10:22:17, and the caller's
+    // leg came up in .videoChat/[Speaker] for a voice call while the callee
+    // correctly used .voiceChat/[Receiver] — the two ends on different
+    // profiles for the same call.
+    resetAudioRoute();
     pendingOfferRef.current = null;
     activeCallRowRef.current = null;
     answeredCallIdRef.current = null;
+    answerAppliedForCallIdRef.current = null;
+    wasActiveRef.current = false;
+    // Disarm the CallKit audio-session wait, so it can never leak into the
+    // NEXT call.
+    //
+    // The flag is armed in three places (startCall, and two paths in
+    // useCallManager) but was consumed by only the first getMedia that ran
+    // — and a single answer can arm it more than once. Whatever was left
+    // over stayed armed for the following call, where waitForCallKitAudioSession
+    // then reported "CallKit owns the session" for a call CallKit was never
+    // told about. acquireMedia takes that to mean CallKit will enable the
+    // audio unit itself, so it skips setAudioModeAsync, configureForVoiceCall
+    // AND enableWebRtcAudio(true) — and with useManualAudio = true nothing
+    // else ever turns the unit on. The call then connects perfectly, video
+    // shows, getStats confirms inbound RTP, and there is no sound at all:
+    // exactly the "звонок активен, звука нет" report on 2026-09-19, whose
+    // trace shows a healthy srflx/relay pair with media-flowing confirmed.
+    //
+    // clearCallKitAudioSessionWait has existed for this since it was
+    // written; nothing ever called it.
+    clearCallKitAudioSessionWait();
     // Or a call to peer B would be encrypted with peer A's key: the
     // render-time assignment only overwrites these when the prop is
     // non-null, so a null prop (setPeer(null) on idle) left the previous
@@ -297,6 +467,55 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
       signalChannelRef.current = null;
     }
   }, [sendCommand]);
+
+  /** Writes one row to call_diagnostics for the call that just ended, so the
+   * reason a call failed outlives the process. Fire-and-forget and fully
+   * guarded: diagnostics must never interfere with ending a call. */
+  const flushCallDiagnostics = useCallback(() => {
+    const call = activeCallRowRef.current;
+    const stats = callStatsRef.current;
+    const outcome = callOutcomeRef.current;
+    const wasAnswered = wasActiveRef.current;
+    // Reset immediately so a second cleanup() (teardown paths can overlap)
+    // cannot write the same call twice.
+    callStatsRef.current = null;
+    callOutcomeRef.current = null;
+    // Nothing worth recording for a call that never got past dialing/ringing
+    // — no call row, or never answered. A call that WAS answered is recorded
+    // even with no explicit outcome and no stats: a user hanging up manually
+    // before either media-flowing or media-timeout fired (e.g. right after
+    // the 10-second mark this exact symptom produces) used to leave nothing
+    // behind at all, which is precisely the case this table exists to catch
+    // — "the call was answered, then ended, and nobody knows why" must
+    // itself be a recorded outcome, not silence.
+    if (!call || !userId || !wasAnswered) return;
+
+    const report = getDiagnosticsReport();
+    void supabase
+      .from("call_diagnostics")
+      .insert({
+        call_id: call.id,
+        user_id: userId,
+        outcome:
+          outcome ?? (stats?.msToMedia != null ? "connected" : "ended_no_media_event"),
+        selected_candidate_pair: stats?.selectedCandidatePair ?? null,
+        turn_server: stats?.turnServer ?? null,
+        using_public_turn: USING_PUBLIC_TURN,
+        ms_to_media: stats?.msToMedia ?? null,
+        bytes_received: stats?.bytesReceived ?? null,
+        packets_lost: stats?.packetsLost ?? null,
+        jitter_ms: stats?.jitterMs ?? null,
+        trace: report,
+      })
+      .then(({ error }) => {
+        if (error) {
+          // eslint-disable-next-line no-console
+          console.error("[useCall] failed to write call diagnostics:", error.message);
+        }
+      });
+  }, [userId, getDiagnosticsReport]);
+
+  flushCallDiagnosticsRef.current = flushCallDiagnostics;
 
   // Watches the call ROW directly, independent of the broadcast signalling
   // channel used for offer/answer/hangup. That channel has no guaranteed
@@ -760,11 +979,28 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
       activeCallRowRef.current = call;
       setState({ phase: "outgoing", call });
 
+      // This call is about to be reported to CallKit too (see
+      // useCallManager's "outgoing" branch, which fires reportOutgoingCallStarted
+      // off this same phase change) via CXStartCallAction — and CallKit
+      // activates the shared AVAudioSession for that action exactly the same
+      // way it does for CXAnswerCallAction, calling didActivate on
+      // CallKitDelegate. Only the callee path armed
+      // waitForCallKitAudioSession before today; the caller path opened the
+      // mic and unconditionally ran setAudioModeAsync/configureForVoiceCall/
+      // enableWebRtcAudio itself, believing it alone owned the session, while
+      // CallKit was independently configuring and activating the SAME session
+      // for the SAME call a moment later. That is the caller-side mirror of
+      // the "answer from CallKit, connects, no audio" bug this file already
+      // fixes for callees — reported here as "connected with real RTP flow on
+      // both legs but total silence on both legs", since only one of the two
+      // legs (whichever one was the caller) needed to be racing CallKit for
+      // this to kill the call's audio in both directions.
+      markNextCallAsAnsweredViaCallKit();
       // Open the mic (and camera for a video call) immediately, so iOS shows
       // its permission prompt while the phone is ringing instead of only
       // once the peer answers. create-offer below reuses the same stream, so
       // this costs nothing and makes the prompt appear when the user expects.
-      requestLocalMedia(kind === "video");
+      requestLocalMedia(kind === "video", ICE_SERVERS);
 
       joinSignalChannel(call.id, async (signal) => {
         if (signal.type === "callee-ready") {
@@ -797,6 +1033,14 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
           // callActive back to true and left the camera indicator lit with
           // no way to turn it off short of killing the app.
           if (stateRef.current.phase === "idle" || stateRef.current.phase === "ended") return;
+          // See answerAppliedForCallIdRef's own comment: a second answer for
+          // a call this side already applied one for is a duplicate, not a
+          // renegotiation — accept-answer's setRemoteDescription throws on
+          // a peer connection already in "stable" state if this isn't
+          // skipped.
+          if (answerAppliedForCallIdRef.current === call.id) return;
+          answerAppliedForCallIdRef.current = call.id;
+          wasActiveRef.current = true;
           sendCommand({ type: "accept-answer", sdp: signal.sdp });
           setState((c) => (c.phase === "idle" || c.phase === "ended" ? c : { phase: "active", call }));
         } else if (signal.type === "ice-candidate") {
@@ -871,6 +1115,7 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
         });
 
       trace("phase -> active");
+      wasActiveRef.current = true;
       // Same guard: the call can be ended (remote hangup, CallKit decline)
       // between the create-answer above and this line.
       setState((c) => (c.phase === "idle" || c.phase === "ended" ? c : { phase: "active", call }));
@@ -899,6 +1144,22 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
       joinSignalChannel(call.id, (signal) => {
         if (signal.type === "offer") {
           trace("offer received", `kind=${signal.kind}`);
+          // An offer arriving on a call that is ALREADY answered is not a
+          // new call — it is the caller restarting ICE after a media
+          // timeout (see the media-timeout handler). Renegotiate in place
+          // on the existing peer connection instead of stashing it as a
+          // pending offer that nothing would ever consume, which is what
+          // made the caller's restart silently one-sided.
+          const answeredPhase = stateRef.current.phase;
+          if (
+            answeredCallIdRef.current === call.id &&
+            (answeredPhase === "connecting" || answeredPhase === "active")
+          ) {
+            trace("offer received", "ICE restart from caller — renegotiating");
+            sendCommand({ type: "renegotiate-answer", sdp: signal.sdp });
+            return;
+          }
+
           // Stash the offer; answerCall() is invoked explicitly when the user
           // taps Accept, so the mic/camera prompt only fires on consent.
           pendingOfferRef.current = { sdp: signal.sdp, kind: signal.kind };
@@ -1125,7 +1386,10 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
 
   const toggleSpeaker = useCallback(() => {
     const next = !speakerOn;
-    setSpeakerphoneOn(next);
+    // userInitiated: true — this is a direct response to the user tapping
+    // the speaker button, so it must always apply even while CallKit owns
+    // the session. See setSpeakerphoneOn's doc comment.
+    setSpeakerphoneOn(next, true);
     setSpeakerOnState(next);
   }, [speakerOn]);
 
@@ -1243,6 +1507,34 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
             clearTimeout(disconnectTimerRef.current);
             disconnectTimerRef.current = null;
           }
+          // Same one-retry policy as media-timeout, and for the same
+          // reason: "failed" is the ICE agent explicitly giving up on every
+          // candidate pair it tried, most commonly because the only relay
+          // candidate it gathered came from the shared free TURN server
+          // under load — a real, live call (2026-09-19) went "connecting"
+          // -> "failed" after 15 seconds on the caller's side while the
+          // callee's side never even saw connectionState leave "connecting"
+          // at all in the same window, both sides having gathered srflx
+          // candidates but zero relay. A fresh ICE gathering pass is a
+          // genuine second chance at a working pair (a different STUN/TURN
+          // response, not just the identical attempt repeating), not just a
+          // label change — restart-ice already exists for exactly this on
+          // the media-timeout path; reusing it here instead of ending the
+          // call outright is the same fix for the mirror failure mode.
+          if (
+            roleRef.current === "caller" &&
+            !restartInFlightRef.current &&
+            iceRestartCountRef.current < MAX_ICE_RESTARTS
+          ) {
+            iceRestartCountRef.current += 1;
+            trace("connection-state failed", "restarting ICE (one retry)");
+            // A restart produces a fresh answer for this same call.id; without
+            // clearing this the caller would discard it as a duplicate.
+            answerAppliedForCallIdRef.current = null;
+            restartInFlightRef.current = true;
+            sendCommand({ type: "restart-ice" });
+            return;
+          }
           setState((current) =>
             current.phase === "idle" || current.phase === "ended"
               ? current
@@ -1285,7 +1577,69 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
       }
       if (event.type === "media-flowing") {
         trace("media-flowing", "getStats confirmed inbound RTP growth");
+        // The restart (if any) that led here is finished — allow a later
+        // one if this connection subsequently breaks again.
+        restartInFlightRef.current = false;
         setMediaConfirmed(true);
+        // Records that media DID work, and whether it took an ICE restart to
+        // get there — "connected_after_restart" appearing in the data is the
+        // direct evidence that the restart is earning its keep.
+        callOutcomeRef.current = iceRestartedRef.current
+          ? "connected_after_restart"
+          : "connected";
+      }
+      if (event.type === "call-stats") {
+        // Held, not written yet: the outcome this belongs to isn't known
+        // until the call ends. A later snapshot (e.g. after an ICE restart)
+        // legitimately replaces an earlier one.
+        callStatsRef.current = event;
+        trace(
+          "call-stats",
+          `pair=${event.selectedCandidatePair ?? "?"} relay=${event.turnServer ?? "none"} ` +
+            // Audio shown separately: a combined byte count is dominated by
+            // video and stays healthy-looking on a call with no sound at
+            // all. audioBytes=0 here is the direct proof that the fault is
+            // the audio track itself, not the route or the session.
+            `audioBytes=${event.audioBytesReceived ?? "?"} audioPkts=${event.audioPacketsReceived ?? "?"} ` +
+            // OUTBOUND — what this device sent, and the local mic track's
+            // own state. Together with the inbound numbers above, this
+            // finally makes "whose mic is the problem" a fact instead of an
+            // inference: a low audioPkts on ONE side's trace is explained
+            // directly if that same side's outSent/localMic here also reads
+            // low/disabled, rather than needing to be guessed at from the
+            // OTHER side's inbound count.
+            `outSent=${event.outboundAudioBytesSent ?? "?"}/${event.outboundAudioPacketsSent ?? "?"} ` +
+            `localMic=enabled:${event.localAudioTrackEnabled ?? "?"} ` +
+            `state:${event.localAudioTrackReadyState ?? "?"} ` +
+            `muted:${event.localAudioTrackMuted ?? "?"}`
+        );
+      }
+      if (event.type === "negotiation-stalled") {
+        // ICE has been negotiating ~9s without connecting. Same one-restart-
+        // at-a-time policy as media-timeout below, and sharing the same
+        // counter deliberately: the two conditions can both be true for one
+        // call, and before this was centralised here the bridge restarted on
+        // its own while media-timeout restarted again on top of it.
+        //
+        // The role check is belt-and-braces (the bridge only emits this on
+        // the caller), but it is the invariant that actually matters: two
+        // sides restarting at once is what produced every failed call in
+        // call_diagnostics on 2026-09-19.
+        if (
+          !mediaConfirmedRef.current &&
+          roleRef.current === "caller" &&
+          !restartInFlightRef.current &&
+          iceRestartCountRef.current < MAX_ICE_RESTARTS
+        ) {
+          iceRestartCountRef.current += 1;
+          trace("negotiation-stalled", "still connecting at 9s — restarting ICE");
+          // A restart produces a fresh answer for this same call.id; without
+            // clearing this the caller would discard it as a duplicate.
+            answerAppliedForCallIdRef.current = null;
+            restartInFlightRef.current = true;
+            sendCommand({ type: "restart-ice" });
+        }
+        return;
       }
       if (event.type === "media-timeout") {
         // Media never started despite the PC reporting "connected" — a dead
@@ -1296,7 +1650,39 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
         // media-flowing event that beat it (both can be in flight briefly
         // near the deadline) must not kill a call that just started working.
         if (!mediaConfirmedRef.current) {
-          trace("media-timeout", "getStats saw no inbound RTP growth — ending as failed");
+          // First timeout on the caller's side: restart ICE rather than
+          // hanging up. The handshake succeeded, so the peers can reach
+          // each other — it is the chosen candidate pair (typically a
+          // saturated public relay) that isn't carrying RTP. Re-gathering
+          // gives ICE a genuine second chance at a different pair, which is
+          // what the media-timeout event was introduced for in the first
+          // place; until now it only ever ended the call, so a call died
+          // after exactly one bad relay pick with no retry. The callee
+          // doesn't initiate: a restart has to come from one side only, or
+          // both re-offer at once and glare.
+          if (
+            roleRef.current === "caller" &&
+            !restartInFlightRef.current &&
+            iceRestartCountRef.current < MAX_ICE_RESTARTS
+          ) {
+            iceRestartCountRef.current += 1;
+            trace("media-timeout", "no inbound RTP — restarting ICE (one retry)");
+            // A restart produces a fresh answer for this same call.id; without
+            // clearing this the caller would discard it as a duplicate.
+            answerAppliedForCallIdRef.current = null;
+            restartInFlightRef.current = true;
+            sendCommand({ type: "restart-ice" });
+            return;
+          }
+          trace(
+            "media-timeout",
+            iceRestartedRef.current
+              ? "no inbound RTP after ICE restart — ending as failed"
+              : "no inbound RTP — ending as failed"
+          );
+          callOutcomeRef.current = iceRestartedRef.current
+            ? "media_timeout_after_restart"
+            : "media_timeout";
           setState((current) =>
             current.phase === "idle" || current.phase === "ended"
               ? current
@@ -1304,6 +1690,14 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
           );
           cleanup();
         }
+      }
+      if (event.type === "log") {
+        // The bridge's own diagnostic notes (currently: per-candidate type
+        // as it's gathered, and when gathering finishes) — folded into the
+        // same trace/call_diagnostics record as everything else, so a call
+        // stuck on "Connecting" shows whether a relay candidate was ever
+        // gathered at all, not just that ICE never reached "connected."
+        trace("bridge-log", event.message);
       }
       if (event.type === "error") {
         // Errors arriving after the call is over (a late ICE candidate, a

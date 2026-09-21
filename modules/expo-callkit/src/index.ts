@@ -8,6 +8,16 @@ type CallKitEvents = {
   onEndCall: (payload: { uuid: string }) => void;
   onMuteChanged: (payload: { uuid: string; muted: boolean }) => void;
   onAudioSessionActivated: () => void;
+  /** Diagnostic-only — see CallKitDelegate's init. A system audio
+   * interruption (another app, Siri, a system alert, a real phone call)
+   * can silently stop a live call's audio without touching isAudioEnabled
+   * or any track state, and this is the only way that becomes visible. */
+  onAudioSessionInterruption: (payload: {
+    type: "began" | "ended";
+    reason: string;
+    wasSuspended: boolean;
+    shouldResume: boolean;
+  }) => void;
   onVoipToken: (payload: { token: string }) => void;
   onProviderReset: () => void;
 };
@@ -154,6 +164,15 @@ export function onCallKitProviderReset(listener: () => void): { remove: () => vo
  * answered from the lock screen could connect with no audio at all. */
 export function onCallKitAudioSessionActivated(listener: () => void): { remove: () => void } {
   return listen("onAudioSessionActivated", listener);
+}
+
+/** Diagnostic-only — see CallKitDelegate's init comment. Fires whenever iOS
+ * interrupts (or ends an interruption of) the shared AVAudioSession for a
+ * reason outside this app's control. */
+export function onCallKitAudioSessionInterruption(
+  listener: CallKitEvents["onAudioSessionInterruption"]
+): { remove: () => void } {
+  return listen("onAudioSessionInterruption", listener);
 }
 
 /** Synchronous read of whether CallKit has ALREADY activated the shared

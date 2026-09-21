@@ -34,6 +34,50 @@ final class CallKitDelegate: NSObject, CXProviderDelegate {
   /// here is also persisted.
   private weak var sink: CallKitEventSink?
 
+  private override init() {
+    super.init()
+    // Diagnostic only — added 2026-09-21 while chasing calls that connect,
+    // report audio flowing for several seconds, and then produce no new RTP
+    // with no route/session/ICE event anywhere in the trace to explain it.
+    //
+    // The one thing that CAN silently stop a live AVAudioSession without
+    // touching isAudioEnabled, the track's enabled/readyState/muted flags,
+    // or firing CXProviderDelegate's own didDeactivate is a system audio
+    // interruption: another app requesting audio, Siri, a system alert
+    // sound, a real phone call. WebRTC.framework's RTCAudioSession
+    // subscribes to this notification internally and may or may not
+    // reactivate afterward depending on iOS's own arbitration — but nothing
+    // in this app was listening for it, so if that is what happened here it
+    // was completely invisible in call_diagnostics. This makes it visible.
+    NotificationCenter.default.addObserver(
+      forName: AVAudioSession.interruptionNotification,
+      object: AVAudioSession.sharedInstance(),
+      queue: nil
+    ) { [weak self] notification in
+      guard
+        let typeValue = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+        let type = AVAudioSession.InterruptionType(rawValue: typeValue)
+      else { return }
+      let reasonValue = notification.userInfo?[AVAudioSessionInterruptionReasonKey] as? UInt
+      let wasSuspended =
+        (notification.userInfo?[AVAudioSessionInterruptionWasSuspendedKey] as? Bool) ?? false
+      let shouldResume =
+        type == .ended
+          && (notification.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt).map {
+            AVAudioSession.InterruptionOptions(rawValue: $0).contains(.shouldResume)
+          } ?? false
+      self?.sink?.emitCallKitEvent(
+        "onAudioSessionInterruption",
+        [
+          "type": type == .began ? "began" : "ended",
+          "reason": reasonValue.map(String.init) ?? "unknown",
+          "wasSuspended": wasSuspended,
+          "shouldResume": shouldResume,
+        ]
+      )
+    }
+  }
+
   func attach(_ sink: CallKitEventSink) {
     self.sink = sink
   }
@@ -89,6 +133,9 @@ final class CallKitDelegate: NSObject, CXProviderDelegate {
 
   func provider(_ provider: CXProvider, perform action: CXAnswerCallAction) {
     if store.consumeAnsweredInApp(action.callUUID) {
+      // Live for didDeactivate's purposes either way — an in-app answer is
+      // still a call whose audio must survive a transient session handover.
+      store.markCallLive(action.callUUID)
       // Answered inside the app; this action exists only to move CallKit's
       // own UI out of ringing. Fulfil silently — telling JS again would make
       // it answer a second time, rebuilding the peer connection over the one
@@ -105,6 +152,7 @@ final class CallKitDelegate: NSObject, CXProviderDelegate {
     // nobody and the stored record is the only thing that survives.
     store.persistAnsweredCall(action.callUUID)
     store.markAnsweredInCallKitUI(action.callUUID)
+    store.markCallLive(action.callUUID)
 
     // fulfil() BEFORE emit, deliberately. CallKit allows a delegate only a
     // few seconds to fulfil an action and hard-fails the call otherwise,
@@ -145,6 +193,7 @@ final class CallKitDelegate: NSObject, CXProviderDelegate {
     // no lock-screen "call in progress" UI, and reportOutgoingCallConnected
     // / endCall for this uuid silently do nothing afterwards.
     configureAudioSessionForCall()
+    store.markCallLive(action.callUUID)
     action.fulfill()
     provider.reportOutgoingCall(with: action.callUUID, startedConnectingAt: nil)
   }
@@ -158,29 +207,35 @@ final class CallKitDelegate: NSObject, CXProviderDelegate {
   }
 
   func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) {
-    // THE handover point. WebRTC runs with useManualAudio = true (set at
-    // launch in CallKitAppDelegateSubscriber), so its audio unit stays
-    // dormant until explicitly told the session is live. Handing CallKit's
-    // already-activated session to RTCAudioSession here is what makes a
-    // lock-screen answer actually carry audio, instead of WebRTC later
-    // activating its own session and rebuilding the route out from under the
-    // handover.
-    let session = RTCAudioSession.sharedInstance()
-    session.audioSessionDidActivate(audioSession)
-    session.isAudioEnabled = true
-
+    // REVERTED 2026-09-20 along with useManualAudio (see
+    // CallKitAppDelegateSubscriber.takeManualControlOfWebRtcAudio).
+    //
+    // This used to hand the session to RTCAudioSession explicitly —
+    // session.audioSessionDidActivate(audioSession) + isAudioEnabled = true
+    // — because with manual audio WebRTC's unit would otherwise never turn
+    // on. With manual audio OFF, RTCAudioSession manages activation itself
+    // as soon as a track needs it. Calling audioSessionDidActivate here too
+    // meant TWO activations racing for the same session on a call already
+    // carrying live audio: WebRTC had already activated its own session and
+    // started sending RTP, and this handover re-activated/rebuilt the
+    // route out from under that already-live audio unit — which is exactly
+    // the "I can hear them for about a second, then nothing" report,
+    // confirmed by call_diagnostics showing audioPkts=1 on the caller leg
+    // of a call whose other leg received 47 packets normally.
+    //
+    // Only bookkeeping remains: CallKit still needs to know a session is
+    // active for its own state, and JS still gets the event for anything
+    // that reads it (e.g. UI).
     store.setAudioSessionActive(true)
     sink?.emitCallKitEvent("onAudioSessionActivated", [:])
   }
 
   func provider(_ provider: CXProvider, didDeactivate audioSession: AVAudioSession) {
-    // Mirror of didActivate. Disabling BEFORE handing the session back stops
-    // WebRTC writing into a session iOS is tearing down, which otherwise
-    // wedges the audio unit for the next call.
-    let session = RTCAudioSession.sharedInstance()
-    session.isAudioEnabled = false
-    session.audioSessionDidDeactivate(audioSession)
-
+    // Mirror of didActivate — see its comment. No longer touches
+    // RTCAudioSession.isAudioEnabled or calls audioSessionDidDeactivate:
+    // with manual audio off, WebRTC's own audio session lifecycle handles
+    // deactivation, and forcing isAudioEnabled = false here could silence a
+    // still-live call the same way the activate-side double-handover did.
     store.setAudioSessionActive(false)
   }
 }

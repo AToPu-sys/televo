@@ -104,18 +104,24 @@ export async function getOrCreateDeviceKeyPair(): Promise<KeyPair> {
     publicKey = encodeBase64(pair.publicKey);
     secretKey = encodeBase64(pair.secretKey);
     await Promise.all([
-      // WHEN_UNLOCKED_THIS_DEVICE_ONLY excludes this from iCloud Keychain
-      // sync and encrypted-backup restore — without it, expo-secure-store's
-      // default lets the private key ride along in an iCloud Keychain sync,
-      // so an attacker who compromises the iCloud account (not the device)
-      // could restore it elsewhere and decrypt this account's Secret Chats.
-      // The comment at the top of this file already claims "the private key
-      // never leaves the device" — this makes that actually true, not just
-      // documented. Trade-off: it also means a full app delete+reinstall on
-      // THIS SAME device loses the key (Keychain items tied to
-      // ThisDeviceOnly don't survive an uninstall either), same as it would
-      // for Signal or WhatsApp — that data loss is inherent to on-device-only
-      // E2EE keys, not something this flag adds.
+      // ThisDeviceOnly: excludes the private key from encrypted device
+      // backups, so a restored backup can never carry it onto another
+      // device.
+      //
+      // This was briefly reverted earlier on 2026-09-19 on the theory that
+      // dropping it would let the key ride an iCloud Keychain sync and so
+      // survive a reinstall. That theory is wrong, and the revert was put
+      // back: iCloud Keychain sync requires kSecAttrSynchronizable, and
+      // expo-secure-store never sets it — SecureStoreModule.swift only ever
+      // writes kSecAttrAccessible / Service / Generic / Account /
+      // AccessGroup. So the key does not sync either way, and removing
+      // ThisDeviceOnly gave up backup protection for nothing.
+      //
+      // Surviving a reinstall therefore cannot be solved at this layer at
+      // all; it needs the identity key to stop being device-scoped
+      // (account-bound key wrapped under a user passphrase, stored
+      // server-side). Until that exists, a reinstall losing Secret Chat
+      // history is expected behaviour, the same as Signal or WhatsApp.
       SecureStore.setItemAsync(PRIVATE_KEY_STORE_KEY, secretKey, {
         keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
       }),
@@ -131,6 +137,7 @@ export async function getOrCreateDeviceKeyPair(): Promise<KeyPair> {
     kyberPublicKey = encodeBase64(pk);
     kyberSecretKey = encodeBase64(sk);
     await Promise.all([
+      // Same reasoning as the X25519 secret above.
       SecureStore.setItemAsync(KYBER_PRIVATE_KEY_STORE_KEY, kyberSecretKey, {
         keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
       }),

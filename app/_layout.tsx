@@ -187,7 +187,14 @@ function RootNavigator() {
     // replace the forgotten password. Hold on it until updatePassword clears
     // the flag.
     if (recoveringPassword) {
-      if (segments[1] !== "reset-password") router.replace("/(auth)/reset-password");
+      // Indexed through a widened alias: expo-router types useSegments()'s
+      // result as a 1-tuple for this route tree, so segments[1] is a type
+      // error even though the router genuinely populates it at runtime for
+      // a nested route like /(auth)/reset-password. Reading it as a plain
+      // string[] keeps the (correct) runtime behaviour without asserting
+      // anything false about the value itself.
+      const path = segments as readonly string[];
+      if (path[1] !== "reset-password") router.replace("/(auth)/reset-password");
       return;
     }
 
@@ -297,7 +304,23 @@ function GlobalCallOverlay() {
     getDiagnosticsReport,
   } = useCallManager();
 
-  if (state.phase === "idle" || !peer) return null;
+  // Unmounting this subtree destroys WebRtcBridge, and the bridge's unmount
+  // cleanup calls releaseMedia() — which closes the peer connection, stops
+  // the mic/camera, runs enableWebRtcAudio(false) and kills the audio
+  // watchdog. Doing that for a call that is still live is a mid-call kill
+  // switch: the user hears roughly a second of audio and then silence, with
+  // the connection apparently still up.
+  //
+  // `peer` is React state written asynchronously (setPeer in
+  // useCallManager's handleIncoming, cleared when the phase returns to
+  // idle), so it can legitimately be null for a render or two while a call
+  // is already in a non-idle phase — e.g. between the call row arriving and
+  // the peer profile resolving. Keying the unmount on `!peer` therefore tore
+  // the media engine down at exactly the wrong moment.
+  //
+  // Phase alone decides whether a call exists. A missing peer only means the
+  // header has no name/avatar to show yet, which CallOverlay already handles.
+  if (state.phase === "idle") return null;
 
   const isVideo =
     (state.phase !== "ended" && "call" in state && state.call.kind === "video") || false;
@@ -306,8 +329,8 @@ function GlobalCallOverlay() {
     <CallOverlay
       state={state}
       mediaConfirmed={mediaConfirmed}
-      peerName={peer.name}
-      peerAvatarUrl={peer.avatarUrl}
+      peerName={peer?.name ?? ""}
+      peerAvatarUrl={peer?.avatarUrl ?? null}
       muted={muted}
       cameraOff={cameraOff}
       speakerOn={speakerOn}

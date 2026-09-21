@@ -174,7 +174,7 @@ export default function ConversationScreen() {
     peerKeyChanged,
     acknowledgeKeyChange,
     repairMissingSessionKeys,
-    hasWorkingSessionKey,
+    anySessionKeyExists,
     ready: e2eeReady,
   } = useE2ee();
   const keyChanged = isEncrypted && peerKeyChanged.has(id);
@@ -230,34 +230,18 @@ export default function ConversationScreen() {
   // that's fixed properly.
   const canCall = !isAssistantChat && conversation?.kind !== "group";
 
-  // Security-first default: every chat — new or pre-existing — gets end-to-
-  // end encryption turned on automatically the moment it can be, with no
-  // button to press. is_encrypted is one-way (a DB trigger rejects turning
-  // it back off, see 016_harden_encryption_and_edit.sql), so this can only
-  // ever raise a conversation's protection, never lower it. Silent by
-  // design: this is a security upgrade, not a user decision, so there's
-  // nothing useful to ask permission for. It naturally no-ops for the
-  // assistant (no key pair to wrap to) and quietly retries next time the
-  // chat opens if the peer hasn't set up their key yet — startEncryptedChat
-  // already throws a clear "hasn't opened the app on a version that supports
-  // encryption yet" in that case, which is expected, not an error to surface.
-  const autoEncryptAttempted = useRef<string | null>(null);
-  useEffect(() => {
-    if (!id || !conversation || isAssistantChat) return;
-    if (isEncrypted || !e2eeReady) return;
-    if (autoEncryptAttempted.current === id) return;
-    autoEncryptAttempted.current = id;
+  // Secret Chat is opt-in, turned on only by an explicit user action (the
+  // lock toggle in the chat header), never automatically. This used to
+  // auto-encrypt every chat silently the moment it opened — no button to
+  // press — which meant nobody actually knew which of their chats were
+  // Secret Chats versus regular ones, since the answer was "eventually all
+  // of them, silently." Removed 2026-09-19: regular chats are still
+  // protected in transit and at rest (TLS + Supabase RLS), same as before —
+  // this only removes the automatic, invisible upgrade to CLIENT-SIDE E2EE.
+  // See handleEnableEncryption below for the explicit path that replaces it.
 
-    void startEncryptedChat(id, conversation.otherUserId ?? undefined)
-      .then(() => refreshConversation())
-      .catch(() => {
-        // Expected when a participant hasn't published a public key yet —
-        // this chat gets encrypted automatically the next time it's opened
-        // after they have. No user-facing error for what isn't a failure.
-      });
-  }, [id, conversation, isAssistantChat, isEncrypted, e2eeReady, startEncryptedChat, refreshConversation]);
-
-  // Companion to the effect above: if the chat is ALREADY encrypted and this
+  // Companion to the (removed) auto-encrypt effect above: if the chat is
+  // ALREADY encrypted (because the user explicitly turned it on) and this
   // device can decrypt in it, opportunistically top up any participant who's
   // missing their wrapped copy of the key (see repairMissingSessionKeys —
   // it only ever adds a row for someone who has none, never touches an
@@ -275,29 +259,74 @@ export default function ConversationScreen() {
     });
   }, [id, isEncrypted, e2eeReady, repairMissingSessionKeys]);
 
-  // If NO device holds a working key at all — is_encrypted=true but every
-  // encrypted_session_keys row for this conversation is gone or unreadable
-  // (e.g. every participant's local keypair changed since the row was
-  // wrapped to their old public key), repairMissingSessionKeys can't help
-  // either: it also starts from loadSessionKey, which fails the same way.
-  // That state can only be recovered by starting encryption over from zero —
-  // safe here specifically because there is no readable key anywhere left to
-  // desync from, and startEncryptedChat's plain-insert guard still refuses
-  // to touch any row that happens to exist.
+  // If NO PARTICIPANT holds a working key at all — is_encrypted=true but
+  // every encrypted_session_keys row for this conversation is gone (e.g.
+  // every participant's local keypair changed since the rows were wrapped),
+  // repairMissingSessionKeys can't help either: it also starts from
+  // loadSessionKey, which fails the same way for everyone. That state can
+  // only be recovered by starting encryption over from zero.
+  //
+  // Real incident (2026-09-19): this used to gate on hasWorkingSessionKey,
+  // which only answers "can THIS device decrypt" — not "does anyone have a
+  // working key." A device that lost its own keypair (a reinstall) but
+  // whose PEER still had a perfectly good session key would see
+  // hasWorkingSessionKey resolve false, conclude (per this effect's own,
+  // now-corrected-below assumption) that no key existed anywhere, and mint
+  // a brand new one via startEncryptedChat. The peer's existing row is never
+  // touched by that (deposit only ever ADDS a missing row), so the two
+  // devices ended up on two different, mutually undecryptable keys —
+  // exactly the "Unable to decrypt for everyone, not just me" report, and it
+  // reproduced identically after a manual database repair, because this
+  // effect re-triggered the same mistake the next time the affected device
+  // opened the chat. anySessionKeyExists checks the table directly — does
+  // ANY row exist for this conversation, from ANY participant — which is
+  // the question that's actually safe to act on: only truly zero rows
+  // anywhere justifies minting a replacement.
   const reinitAttempted = useRef<string | null>(null);
   useEffect(() => {
     if (!id || !conversation || isAssistantChat || !isEncrypted || !e2eeReady) return;
     if (reinitAttempted.current === id) return;
 
-    void hasWorkingSessionKey(id).then((hasKey) => {
-      if (hasKey || reinitAttempted.current === id) return;
+    void anySessionKeyExists(id).then((exists) => {
+      if (exists || reinitAttempted.current === id) return;
       reinitAttempted.current = id;
       void startEncryptedChat(id, conversation.otherUserId ?? undefined).catch(() => {
         // Same as the not-yet-encrypted path: expected if a participant
         // hasn't published a key, not a user-facing failure.
       });
     });
-  }, [id, conversation, isAssistantChat, isEncrypted, e2eeReady, hasWorkingSessionKey, startEncryptedChat]);
+  }, [id, conversation, isAssistantChat, isEncrypted, e2eeReady, anySessionKeyExists, startEncryptedChat]);
+
+  const [enablingEncryption, setEnablingEncryption] = useState(false);
+
+  // The explicit, user-initiated replacement for the auto-encrypt effect
+  // removed above. Only reachable from buildHeaderSheetOptions, and only
+  // shown for a direct chat that isn't encrypted yet — so this is always a
+  // deliberate "turn this chat into a Secret Chat" decision, never a side
+  // effect of merely opening the chat.
+  async function handleEnableEncryption() {
+    if (!id || !conversation || enablingEncryption) return;
+    setEnablingEncryption(true);
+    try {
+      await startEncryptedChat(id, conversation.otherUserId ?? undefined);
+      await refreshConversation();
+      showToast({ kind: "success", message: "Secret Chat turned on for this conversation." });
+    } catch (caught) {
+      // Most commonly: the other person hasn't opened a version of the app
+      // that publishes an encryption key yet. Named plainly rather than
+      // swallowed, since this is now a direct response to a button tap, not
+      // a background retry loop that gets another chance next time.
+      showToast({
+        kind: "error",
+        message:
+          caught instanceof Error
+            ? caught.message
+            : "Couldn't turn on Secret Chat. Try again in a moment.",
+      });
+    } finally {
+      setEnablingEncryption(false);
+    }
+  }
 
   function handleDisableEncryptionBlocked() {
     // A Secret Chat is deliberately one-way (scripts/sql/016_harden_encryption
@@ -381,6 +410,68 @@ export default function ConversationScreen() {
     }
   }
 
+  // "Delete for me": hides the chat from THIS account's list only (sets
+  // deleted_at on this device's own conversation_participants row — see
+  // 048_delete_chat.sql). Every message and the other participant's own
+  // view of the chat are untouched; it un-hides itself the next time either
+  // side sends a message (useChats.ts's realtime handler clears deleted_at
+  // on receipt).
+  function handleDeleteForMe() {
+    if (!id || !user?.id) return;
+    Alert.alert(
+      "Delete this chat?",
+      "It will be removed from your chat list. The other person keeps their copy, and it comes back if either of you sends a new message.",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Delete for me",
+          style: "destructive",
+          onPress: async () => {
+            const { error } = await supabase
+              .from("conversation_participants")
+              .update({ deleted_at: new Date().toISOString() })
+              .eq("conversation_id", id)
+              .eq("user_id", user.id);
+            if (error) {
+              Alert.alert("Couldn't delete chat", error.message);
+              return;
+            }
+            router.back();
+          },
+        },
+      ]
+    );
+  }
+
+  // "Delete for both": permanently removes the conversation row, which
+  // cascades (existing FKs, not new) to every message, session key, and
+  // call record tied to it — for EVERY participant, not just this device.
+  // Irreversible, unlike delete-for-me, so the confirmation says so plainly
+  // rather than using the same wording as the softer option above.
+  function handleDeleteForBoth() {
+    if (!id || !conversation) return;
+    const name = conversation.title || "this person";
+    Alert.alert(
+      "Delete for everyone?",
+      `This permanently deletes the entire conversation with ${name} — every message, for both of you. This can't be undone.`,
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Delete for everyone",
+          style: "destructive",
+          onPress: async () => {
+            const { error } = await supabase.from("conversations").delete().eq("id", id);
+            if (error) {
+              Alert.alert("Couldn't delete chat", error.message);
+              return;
+            }
+            router.back();
+          },
+        },
+      ]
+    );
+  }
+
   function handleOpenSelfDestructMenu() {
     setSelfDestructSheetOpen(true);
   }
@@ -439,6 +530,18 @@ export default function ConversationScreen() {
         icon: "lock-open-outline",
         onPress: handleDisableEncryptionBlocked,
       });
+    } else if (conversation?.kind === "direct" && !isAssistantChat) {
+      // The explicit opt-in that replaces the old silent auto-encrypt
+      // effect — Secret Chat only ever turns on because someone tapped
+      // this. Not offered for groups: startEncryptedChat supports it, but
+      // there's no group management UI yet for what happens when a member
+      // without a published key joins later.
+      options.push({
+        key: "enable-encryption",
+        label: enablingEncryption ? "Turning on Secret Chat…" : "Enable Secret Chat",
+        icon: "lock-closed-outline",
+        onPress: handleEnableEncryption,
+      });
     }
     if (conversation?.kind === "direct") {
       options.push({
@@ -448,6 +551,24 @@ export default function ConversationScreen() {
         destructive: !isBlocked,
         onPress: handleBlockToggle,
       });
+    }
+    if (!isAssistantChat) {
+      options.push({
+        key: "delete-for-me",
+        label: "Delete for me",
+        icon: "trash-outline",
+        destructive: true,
+        onPress: handleDeleteForMe,
+      });
+      if (conversation?.kind === "direct") {
+        options.push({
+          key: "delete-for-both",
+          label: "Delete for everyone",
+          icon: "trash-outline",
+          destructive: true,
+          onPress: handleDeleteForBoth,
+        });
+      }
     }
     return options;
   }

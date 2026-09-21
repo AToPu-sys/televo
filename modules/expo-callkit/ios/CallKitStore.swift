@@ -53,6 +53,30 @@ final class CallKitStore {
   /// lock screen, call connects, total silence" bug.
   private var audioSessionActive = false
 
+  /// Calls CallKit currently considers live on this device.
+  ///
+  /// Exists so didDeactivate can tell a genuine end-of-call teardown from a
+  /// transient session handover. iOS pairs each didActivate with a matching
+  /// didDeactivate, and for an OUTGOING call didActivate fires twice (see
+  /// CallKitDelegate) — so the first session gets handed back while the call
+  /// is still live. didDeactivate used to disable WebRTC's audio unit
+  /// unconditionally, which killed the mic and speaker a few seconds into a
+  /// call that was otherwise perfectly connected: audio for the first
+  /// moments, then silence.
+  private var liveCalls = Set<UUID>()
+
+  var hasLiveCall: Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return !liveCalls.isEmpty
+  }
+
+  func markCallLive(_ uuid: UUID) {
+    lock.lock()
+    defer { lock.unlock() }
+    liveCalls.insert(uuid)
+  }
+
   var isAudioSessionActive: Bool {
     lock.lock()
     defer { lock.unlock() }
@@ -138,6 +162,28 @@ final class CallKitStore {
     answeredInApp.remove(uuid)
     answeredInCallKitUI.remove(uuid)
     mutedInApp.remove(uuid)
+    liveCalls.remove(uuid)
+
+    // Clearing the audio-session flag here is what makes calls after the
+    // FIRST one audible again.
+    //
+    // audioSessionActive is set in didActivate and cleared in
+    // didDeactivate — but didDeactivate is not guaranteed: when the remote
+    // party hangs up, the call ends via reportCall(with:endedAt:), which
+    // does not route through the delegate at all, so iOS may never send a
+    // deactivation for it. The flag then stayed true for the rest of the
+    // process, and waitForCallKitAudioSession (WebRtcBridge.tsx) reads it
+    // as "CallKit already owns the session" on the NEXT call. acquireMedia
+    // therefore skipped its own enableWebRtcAudio(true), waiting for a
+    // didActivate that never comes for a call CallKit considers already
+    // handled — and with useManualAudio = true, nothing else turns the
+    // audio unit on. Result: the connection is perfect (relay candidate,
+    // RTP flowing, video visible) and there is no sound at all, which is
+    // exactly the "I can see but I can't hear" report.
+    //
+    // Both end paths converge here (forgetEverywhere calls this), so one
+    // reset covers a hangup from CallKit's UI and one reported by the app.
+    audioSessionActive = false
   }
 
   /// Full forget, persisted records included. Only correct when the user
@@ -169,6 +215,7 @@ final class CallKitStore {
     answeredInApp.removeAll()
     answeredInCallKitUI.removeAll()
     mutedInApp.removeAll()
+    liveCalls.removeAll()
     audioSessionActive = false
     lock.unlock()
 
