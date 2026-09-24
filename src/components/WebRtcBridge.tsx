@@ -1,12 +1,5 @@
 import { setAudioModeAsync } from "expo-audio";
-import {
-  audioRouteSnapshot,
-  configureForVoiceCall,
-  enableWebRtcAudio,
-  forceRepairAudioRoute,
-  isWebRtcAudioEnabled,
-  setCallKitOwnsSession,
-} from "expo-speaker-toggle";
+import { audioRouteSnapshot } from "expo-speaker-toggle";
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react";
 import { StyleSheet, View } from "react-native";
 import type {
@@ -65,6 +58,12 @@ export type BridgeEvent =
       localAudioTrackEnabled?: boolean | null;
       localAudioTrackReadyState?: string | null;
       localAudioTrackMuted?: boolean | null;
+      /** The remote (inbound) audio track's own state, read directly off
+       * the receiver — see collectCallStats for why this is separate from
+       * inbound-rtp byte/packet counts. */
+      remoteAudioTrackEnabled?: boolean | null;
+      remoteAudioTrackReadyState?: string | null;
+      remoteAudioTrackMuted?: boolean | null;
       selectedCandidatePair: string | null;
       turnServer: string | null;
       msToMedia: number | null;
@@ -106,15 +105,6 @@ export type WebRtcBridgeHandle = {
 // deleting them would mean editing every call site for no behavioural gain.
 export function markNextCallAsAnsweredViaCallKit(): void {}
 export function clearCallKitAudioSessionWait(): void {}
-
-/** Gain applied to the peer's decoded audio (1.0 = unchanged, max 10).
- *
- * iOS levels a voice-processing session conservatively and no route setting
- * raises the far end's actual signal, so calls read as too quiet even on the
- * loudspeaker. 3.0 is a clear, comfortable lift; the voice-processing unit's
- * own limiter still sits after this stage, so it cannot distort or feed back
- * into the mic. */
-const REMOTE_AUDIO_GAIN = 2.5;
 
 type MediaTrackHandle = {
   stop?: () => void;
@@ -265,28 +255,18 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
   // the restart had already fixed. Each loop captures the value at entry and
   // stops as soon as it no longer matches.
   const mediaWatchGenerationRef = useRef(0);
-  // Drives keepAudioAlive — see its comment. Generation invalidates a
-  // running loop; the timer handle lets teardown stop it immediately.
-  const audioWatchGenerationRef = useRef(0);
-  const audioWatchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   /** Drives periodicallyRefreshStats — same invalidation pattern as
    * mediaWatchGenerationRef, kept separate because this loop outlives the
    * one-shot media-flowing check that starts it. */
   const statsRefreshGenerationRef = useRef(0);
-  /** One route repair per call — see keepAudioAlive. */
-  const audioRouteRepairedRef = useRef(false);
+
   /** Mirrors the callActive prop for the unmount cleanup, which closes over
    * the first render's value and would otherwise always read false. */
   const callActiveRef = useRef(false);
-  /** Mirrors `visible` (this call carries video) for the audio watchdog.
-   *
-   * keepAudioAlive's tick re-arms itself with setTimeout and closes over the
-   * render in which the watchdog STARTED, so reading the prop directly froze
-   * whatever value was current at that instant for the rest of the call. */
-  const isVideoCallRef = useRef(false);
-  isVideoCallRef.current = visible;
-  /** The peer's incoming stream, so gain can be re-asserted after a
-   * renegotiation replaces the decoded track object. */
+  /** The peer's incoming stream. Held only so teardown can drop the
+   * reference; the gain machinery that used to read it was removed
+   * 2026-09-21 (see ontrack). */
   const remoteStreamRef = useRef<MediaStream | null>(null);
   /** The offer SDP this bridge has already built an answer for, so a
    * duplicated create-answer cannot tear down the live connection. See the
@@ -441,39 +421,20 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
    * just the resolved value) makes the second caller await the first. */
   function getMedia(video: boolean): Promise<MediaStream> {
     if (localStreamRef.current) {
-      // Re-run the audio session setup even when the STREAM is reused.
+      // Re-announce the stream even though it is being reused.
       //
-      // acquireMedia's own early return (`if (localStreamRef.current) return
-      // localStreamRef.current;`) skips setAudioModeAsync,
-      // configureForVoiceCall, enableWebRtcAudio(true) and the local-ready
-      // event — every one of those lives AFTER that early return. That is
-      // correct for the same-call case this exists for (create-offer
-      // reusing what start-local already opened) since the session was just
-      // configured a moment earlier in the same call.
+      // acquireMedia's own tail — setLocalUrl + post("local-ready") — is
+      // skipped by this early return, and useCall's local-ready handler is
+      // what initialises the call's speaker state and route. Without this,
+      // the path this early return exists for (a second call starting
+      // before the previous one's teardown finished) came up with the
+      // speaker state never initialised and the self-view still pointing at
+      // the previous call's stream URL.
       //
-      // It is wrong across two DIFFERENT calls. If releaseMedia's teardown
-      // from a previous call hasn't finished by the time the next call's
-      // getMedia runs — a real race on two calls placed back to back — the
-      // new call silently inherits whatever audio session state the old one
-      // left behind, with none of its own setup ever running. Measured
-      // 2026-09-21: a caller who placed two calls 18s apart got audioPkts=2
-      // on the first and 21 on the second (vs. 69-71 on the callee's side of
-      // the SAME calls), and neither trace shows "local media open" at all
-      // — the exact signature of this branch being taken with a stream that
-      // predates the current call.
-      //
-      // enableWebRtcAudio/setAudioModeAsync/configureForVoiceCall are all
-      // idempotent, so re-running them costs nothing when the stream really
-      // is fresh from this same call.
-      // Explicit marker — makes the reused-stream path a DIRECT fact in the
-      // trace instead of something inferred from "local media open" being
-      // missing. Names which cross-call race this was (see the long
-      // comment above) rather than requiring it be re-diagnosed each time.
-      post({
-        type: "log",
-        message: "getMedia: reusing stream from a previous call — re-applying audio session",
-      });
-      reapplyAudioSessionForReusedStream();
+      // Only the announcement is repeated here — no audio-session calls, so
+      // this cannot disturb a route that is already live.
+      setLocalUrl(localStreamRef.current.toURL());
+      post({ type: "local-ready" });
       return Promise.resolve(localStreamRef.current);
     }
     if (mediaPromiseRef.current) return mediaPromiseRef.current;
@@ -484,59 +445,34 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
     return pending;
   }
 
-  /** Repeats the SESSION half of acquireMedia's setup — not getUserMedia,
-   * since the stream is reused — for the cross-call race getMedia's comment
-   * explains. Idempotent, so this is safe even on a call where the stream
-   * genuinely IS still current and this ends up being a harmless repeat. */
-  function reapplyAudioSessionForReusedStream() {
-    void setAudioModeAsync({
-      playsInSilentMode: true,
-      allowsRecording: true,
-      shouldPlayInBackground: true,
-      interruptionMode: "doNotMix",
-      shouldRouteThroughEarpiece: false,
-    }).catch(() => {
-      // Non-fatal on its own; the call may still route audio correctly.
-    });
-    configureForVoiceCall();
-    enableWebRtcAudio(true);
-    if (localStreamRef.current) {
-      setLocalUrl(localStreamRef.current.toURL());
-    }
-    post({ type: "local-ready" });
-  }
-
+  /**
+   * Opens the camera/mic and hands the stream to WebRTC.
+   *
+   * REWRITTEN 2026-09-21. Everything that used to live here — CallKit audio
+   * session waits, setAudioModeAsync, configureForVoiceCall,
+   * enableWebRtcAudio, a 500ms watchdog re-asserting all of it, a "reused
+   * stream" special case — is gone. None of it was the actual problem.
+   *
+   * Real telemetry (2026-09-21, Bek <-> Shakha) showed calls connecting
+   * fine, audio flowing normally for several seconds, both legs' local mic
+   * tracks staying enabled/live/unmuted and continuously SENDING bytes for
+   * the whole call (outbound-rtp kept growing) — while the PEER stopped
+   * receiving new packets a few seconds in, on a TURN relay pair. That is a
+   * transport-level fault (ICE/relay), not anything an iOS audio session
+   * API can fix. All the manual session management above was solving
+   * problems from an earlier, different bug (CallKit's manual audio
+   * handover racing WebRTC — see the rewrite history in this file's git
+   * log) and had become dead weight once that was fixed by reverting
+   * useManualAudio.
+   *
+   * What's left: call getUserMedia, hand the tracks to WebRTC, done.
+   * RTCAudioSession (useManualAudio = false, set once at launch in
+   * CallKitAppDelegateSubscriber) owns session activation entirely on its
+   * own, exactly as it did in the last period this app is known to have
+   * carried real 2+ minute calls (before 2026-09-18).
+   */
   async function acquireMedia(video: boolean) {
     if (localStreamRef.current) return localStreamRef.current;
-
-    // REVERTED 2026-09-20 along with useManualAudio.
-    //
-    // This used to branch on "did CallKit already activate the session for
-    // this call" (callKitOwnsSession) and SKIP setAudioModeAsync/
-    // configureForVoiceCall when it had, on the theory that CallKit's own
-    // manual handover (CallKitDelegate.didActivate) had already set up the
-    // route and re-configuring here would tear it down.
-    //
-    // That theory no longer applies: CallKitDelegate.didActivate no longer
-    // does a manual RTCAudioSession handover (see its own comment). With
-    // useManualAudio = false, RTCAudioSession activates itself the moment a
-    // track needs it, and CallKit's didActivate is now just bookkeeping.
-    // Nothing external configures the category/route on this device's
-    // behalf anymore, so skipping the configuration here — for EVERY call,
-    // not just CallKit-answered ones — would leave a real gap. Both calls
-    // now always run.
-    try {
-      await setAudioModeAsync({
-        playsInSilentMode: true,
-        allowsRecording: true,
-        shouldPlayInBackground: true,
-        interruptionMode: "doNotMix",
-        shouldRouteThroughEarpiece: false,
-      });
-    } catch {
-      // Non-fatal on its own; the call may still route audio correctly.
-    }
-    configureForVoiceCall();
 
     const webrtc = getWebRtc();
     if (!webrtc) {
@@ -549,12 +485,10 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
     // prompt — the thing the WebView could never reach.
     const stream = await webrtc.mediaDevices.getUserMedia({
       // Plain `true` on purpose: react-native-webrtc's constraints only
-      // accept video fields (see its Constraints.d.ts), so echoCancellation
-      // / noiseSuppression / autoGainControl cannot be requested here — they
-      // come from the AVAudioSession mode instead, which
-      // configureForVoiceCall and setSpeakerphoneOn set to .voiceChat or
-      // .videoChat. Both engage iOS's voice-processing I/O unit, which is
-      // what actually provides echo cancellation and automatic gain.
+      // accept video fields (see its Constraints.d.ts). Echo cancellation
+      // and automatic gain come from RTCAudioSessionConfiguration.webRTC()'s
+      // own default mode, applied by the framework itself now that nothing
+      // here overrides it.
       audio: true,
       // Ranges, not fixed values. Without constraints react-native-webrtc
       // negotiates something very conservative (often 320x240) that looks
@@ -563,18 +497,6 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
       // of the network, and congestion control can only throw frames away.
       // Giving min/ideal/max lets the encoder actually scale down outdoors
       // on mobile data and back up on wifi.
-      // 960x540/30fps, revised 2026-09-20 after measurement.
-      //
-      // This was briefly dropped to 640x480/24 while call reliability was
-      // still unproven. It since was: real calls now connect in ~540ms and
-      // carry 15-34KB of inbound media over both direct and relay paths
-      // (call_diagnostics, 09:40-09:42 UTC that day), so the bandwidth
-      // headroom that reduction bought is no longer needed and only costs
-      // picture quality. 540p keeps a visibly sharper image than 480p while
-      // still asking far less of the link than the original 720p/30, whose
-      // ~900kbit/s demand at the first frame was genuinely too much on weak
-      // mobile signal. min/ideal/max still lets the encoder scale down
-      // outdoors and up on wifi — this only sets where negotiation starts.
       video: video
         ? {
             facingMode: "user",
@@ -596,38 +518,6 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
     }
 
     localStreamRef.current = stream as MediaStream;
-
-    // WebRTC runs with useManualAudio = true so it can never seize the
-    // session CallKit hands over. For a CallKit call, CallKit's didActivate
-    // enables audio natively. For every OTHER call — outgoing, or answered
-    // inside the app — nothing else will, so it has to happen here or the
-    // call connects silent.
-    // UNCONDITIONAL, deliberately — this is the one that must never be
-    // skipped.
-    //
-    // Before 2026-09-18 (aae427d, "rewrite CallKit") WebRTC ran with
-    // useManualAudio = NO: its own audio device module activated the
-    // session whenever a track started, so a call was audible no matter
-    // what the rest of the app did. Calls from that period ran 128-153
-    // seconds on average (calls table, 09-12/09-13) — real conversations.
-    // After the rewrite, useManualAudio = YES means WebRTC NEVER enables
-    // audio by itself, and this call became the only thing that does it for
-    // outgoing and in-app-answered calls — gated behind callKitOwnsSession.
-    //
-    // Every way that gate can be wrong produces a silent call: a leftover
-    // arm from a previous answer, a CallKit didActivate that never arrives
-    // for a call CallKit was not told about, or a stale native
-    // audioSessionActive flag. Average call length fell to 13-21 seconds.
-    //
-    // Enabling unconditionally costs nothing when CallKit genuinely owns
-    // the session: enableWebRtcAudio is idempotent (it sets isAudioEnabled
-    // and calls setActive(true), both no-ops on an already-active session),
-    // and the two calls this used to guard — setAudioModeAsync and
-    // configureForVoiceCall — are the ones that actually rebuild the audio
-    // ROUTE and must still be skipped for CallKit. Those stay guarded
-    // above. This one only turns the unit on.
-    enableWebRtcAudio(true);
-
     setLocalUrl((stream as MediaStream).toURL());
     post({ type: "local-ready" });
     return stream as MediaStream;
@@ -652,29 +542,14 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
     }
     stallRestartedRef.current = false;
     isCallerRef.current = false;
-    // Stop the audio watchdog, or it re-enables the audio unit after the
-    // call is over and holds the recording indicator on.
-    audioWatchGenerationRef.current += 1;
+    // Stop the periodic stats snapshot loop — it must not keep polling a
+    // connection that is being torn down.
     statsRefreshGenerationRef.current += 1;
-    audioRouteRepairedRef.current = false;
+
     answeredSdpRef.current = null;
     remoteStreamRef.current = null;
     offerCreatedRef.current = false;
-    if (audioWatchTimerRef.current) {
-      clearTimeout(audioWatchTimerRef.current);
-      audioWatchTimerRef.current = null;
-    }
-    // Leaving WebRTC's audio unit enabled keeps the session live after the
-    // call, which holds the recording indicator on and wedges the unit for
-    // the next call. CallKit calls also pass through here; its didDeactivate
-    // disables audio too, and doing it twice is harmless.
-    enableWebRtcAudio(false);
-    // Every call ends up here regardless of how it started, so this is the
-    // one place guaranteed to run before the NEXT call's getMedia — without
-    // it, a CallKit-answered call would leave callKitOwnsSession stuck true
-    // and silently suppress a later, ordinary outgoing call's own speaker
-    // route changes.
-    setCallKitOwnsSession(false);
+
     const pc = pcRef.current;
     if (pc) {
       // Senders hold their own references to the capture tracks; release
@@ -712,8 +587,18 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
     // connection.
     pendingCandidatesRef.current = [];
 
-    // Stopping tracks alone doesn't drop iOS's playAndRecord session, and the
-    // OS keeps the recording indicator lit while that session is active.
+    // Drop iOS's recording session. Restored 2026-09-21 after the audio
+    // rewrite removed it along with everything else that touched
+    // setAudioModeAsync.
+    //
+    // Stopping the tracks is not enough on its own: the playAndRecord
+    // session stays active, so the OS keeps the orange recording indicator
+    // lit and keeps ducking other audio. useRinger is now the only other
+    // writer of this flag and it only ever sets it TRUE — with this gone,
+    // nothing ever set it back, and the indicator stayed on until the app
+    // was force-quit. Unlike the setCategory calls the rewrite removed,
+    // this runs strictly AFTER the call's media is already torn down, so
+    // there is no live audio for it to disturb.
     void setAudioModeAsync({ allowsRecording: false, shouldPlayInBackground: false }).catch(
       () => {}
     );
@@ -747,6 +632,7 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
    * number in a database slightly more current. */
   async function periodicallyRefreshStats(pc: RTCPeerConnectionType) {
     const generation = ++statsRefreshGenerationRef.current;
+    const loopStartedAt = Date.now();
     // 2s rather than a flat 5s: measured 2026-09-21, several real calls
     // lasted only 11-14s total — media-flowing fired around the 7-10s mark,
     // and the user hung up 2-4s later. A 5s interval never got a second
@@ -756,16 +642,74 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
     // (a call someone hangs up quickly because they can't hear anything IS
     // the symptom). Cheap enough to run this often — getStats() is a local
     // read, not a network call.
+    //
+    // 2026-09-24: real calls show audioPkts frozen from the FIRST 2s sample
+    // through the entire rest of a 76s call on both legs — meaning the
+    // freeze happens somewhere inside that first 2s window, which this
+    // cadence is too coarse to localize. For the first 6s after
+    // media-flowing (i.e. right where tuneForMobileNetwork's setParameters
+    // also runs), sample every 500ms instead, so the exact tick where
+    // audioPkts stops advancing is visible rather than inferred.
+    let lastAudioPackets = -1;
+    let sawGrowthAfterFirstSample = false;
     while (true) {
-      await new Promise((resolve) => setTimeout(resolve, 2000));
+      const elapsed = Date.now() - loopStartedAt;
+      await new Promise((resolve) => setTimeout(resolve, elapsed < 6000 ? 500 : 2000));
       if (statsRefreshGenerationRef.current !== generation) return;
       if (pcRef.current !== pc) return;
       const state = pc.connectionState;
       if (state === "closed" || state === "failed") return;
       try {
-        post(await collectCallStats(pc, null));
+        const stats = await collectCallStats(pc, null);
+        const currentPackets = stats.audioPacketsReceived ?? -1;
+        if (lastAudioPackets >= 0 && currentPackets > lastAudioPackets) {
+          sawGrowthAfterFirstSample = true;
+        } else if (lastAudioPackets >= 0 && currentPackets === lastAudioPackets && !sawGrowthAfterFirstSample) {
+          post({
+            type: "log",
+            message: `audioPkts stalled at ${currentPackets} (t=${elapsed}ms, no growth since first sample)`,
+          });
+        }
+        lastAudioPackets = currentPackets;
+        post(stats);
       } catch {
         return;
+      }
+      // Route snapshot on the SAME cadence, not just the one-shot at
+      // media-flowing. Added because the one-shot version's error handling
+      // was fixed (it used to swallow failures with a bare `catch {}`,
+      // which is why call_diagnostics 158/159 on 2026-09-24 never showed
+      // this line at all despite media-flowing firing on both legs) but a
+      // single snapshot still can't tell "silent from the start" apart
+      // from "was fine, then something changed the route mid-call" (a
+      // Bluetooth device connecting, an interruption ending, CallKit
+      // handing the session back). Best-effort and read-only, same as the
+      // one-shot version — a failure here must never end the call, only
+      // be visible in its trace.
+      try {
+        const snap = audioRouteSnapshot();
+        const outputs = Array.isArray(snap.outputs)
+          ? (snap.outputs as { portType?: string; portName?: string }[])
+              .map((o) => `${o.portType ?? "?"}/${o.portName ?? "?"}`)
+              .join(",")
+          : "none";
+        post({
+          type: "log",
+          message:
+            `audio route (periodic): outputs=[${outputs}] volume=${String(snap.outputVolume ?? "?")} ` +
+            `category=${String(snap.category ?? "?")} mode=${String(snap.mode ?? "?")} ` +
+            `rtcEnabled=${String(snap.rtcIsAudioEnabled ?? "?")} rtcActive=${String(snap.rtcIsActive ?? "?")} ` +
+            `otherAudioPlaying=${String(snap.isOtherAudioPlaying ?? "?")} ` +
+            `ioChannels=${String(snap.rtcInputChannels ?? "?")}/${String(snap.rtcOutputChannels ?? "?")} ` +
+            `sampleRate=${String(snap.rtcSampleRate ?? "?")} ioBuffer=${String(snap.rtcIOBufferDuration ?? "?")}`,
+        });
+      } catch (snapshotError) {
+        post({
+          type: "log",
+          message: `audio route (periodic) snapshot failed: ${
+            snapshotError instanceof Error ? snapshotError.message : String(snapshotError)
+          }`,
+        });
       }
     }
   }
@@ -874,6 +818,35 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
         // Diagnostics only.
       }
 
+      // Remote (inbound) track state — added 2026-09-24 alongside the
+      // stalled-audioPkts detection above. Distinguishes two very different
+      // failures that both look like "audioPkts stopped growing": the
+      // TRANSPORT stopped delivering RTP (this stays enabled/live/unmuted
+      // while inbound-rtp simply reports nothing new — a network/relay
+      // problem), versus the receiver's OWN track going muted/ended while
+      // the transport is fine (a local playback/decoder problem, which
+      // outbound-rtp on the peer's own trace could never reveal since that
+      // peer's send path might be working perfectly).
+      try {
+        const receivers = (
+          pc as unknown as {
+            getReceivers?: () => { track?: { kind?: string; enabled?: boolean; readyState?: string; muted?: boolean } | null }[];
+          }
+        ).getReceivers?.();
+        const audioReceiver = receivers?.find((r) => r.track?.kind === "audio");
+        if (audioReceiver?.track) {
+          result.remoteAudioTrackEnabled = audioReceiver.track.enabled ?? null;
+          result.remoteAudioTrackReadyState = audioReceiver.track.readyState ?? null;
+          result.remoteAudioTrackMuted = audioReceiver.track.muted ?? null;
+        } else {
+          result.remoteAudioTrackEnabled = null;
+          result.remoteAudioTrackReadyState = "no-audio-receiver";
+          result.remoteAudioTrackMuted = null;
+        }
+      } catch {
+        // Diagnostics only.
+      }
+
       // The selected pair is the one marked selected, or (on some
       // implementations) the succeeded pair referenced by the transport.
       // Follow the transport's own pointer first — the spec-sanctioned way.
@@ -925,47 +898,6 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
     return result;
   }
 
-  /**
-   * Keeps audio ON for the whole call, repairing it automatically.
-   *
-   * Enabling audio once is not enough. With useManualAudio = true (added
-   * 2026-09-18 alongside CallKit) WebRTC never enables its own audio unit,
-   * so anything that switches it off mid-call is permanent: an interruption
-   * from a real phone call, a Bluetooth device connecting, a CallKit
-   * didDeactivate for a session it hands back while the call is still up,
-   * or an enableWebRtcAudio(true) whose setActive() threw because another
-   * call held the session at that instant.
-   *
-   * Every one of those leaves a call that is fully connected — video
-   * visible, RTP flowing, getStats healthy — and completely silent, which
-   * is the failure the calls table shows as average duration collapsing
-   * from 128-153s (09-12/09-13) to 13-21s (09-18/09-19).
-   *
-   * Rather than add another place that must get the decision right, this
-   * polls the ACTUAL native state twice a second and re-asserts audio the
-   * moment it reads false. enableWebRtcAudio is idempotent, so a healthy
-   * call pays one cheap native read per tick and nothing else.
-   *
-   * Generation-guarded like watchForInboundMedia, and stops on teardown or
-   * when the connection is replaced.
-   */
-  /** Disabled 2026-09-20 along with useManualAudio.
-   *
-   * This polled the native module and re-asserted the audio unit / route /
-   * gain on a timer. It only existed because useManualAudio = true made
-   * WebRTC refuse to manage its own audio, so something had to notice when
-   * the unit was off. With manual audio reverted, WebRTC activates the
-   * session itself and there is nothing for a watchdog to repair — polling
-   * native every tick was pure overhead (and a source of stutter) on every
-   * call.
-   *
-   * Kept as a no-op rather than deleted so the single call site and the
-   * generation/timer refs stay intact; re-enabling is a matter of restoring
-   * this body if manual audio is ever tried again. */
-  function keepAudioAlive(_pc: RTCPeerConnectionType) {
-    return;
-  }
-
   async function watchForInboundMedia(pc: RTCPeerConnectionType) {
     const startedAt = Date.now();
     // Raised from 8000ms 2026-09-20 for cross-border reliability. An
@@ -992,20 +924,66 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
           }
         });
         if (lastBytes >= 0 && bytes > lastBytes) {
-          // Safety net: real RTP is arriving, so this call is unambiguously
-          // live — make sure WebRTC's audio unit is actually on, whatever
-          // the earlier callKitOwnsSession decision concluded. With
-          // useManualAudio = true, a wrong guess there (CallKit's
-          // audioSessionActive flag left stale by a hangup that never
-          // produced a didDeactivate — see CallKitStore.forgetInMemory)
-          // means nobody ever enables audio and the call is silent despite
-          // a perfect connection. enableWebRtcAudio(true) is idempotent, so
-          // re-asserting it on the one event that proves media is flowing
-          // costs nothing and closes that whole class of failure.
-          enableWebRtcAudio(true);
-          // From here the call is proven live — keep audio on for its
-          // whole duration, not just this instant.
-          keepAudioAlive(pc);
+          // Entry marker, unconditional and outside any try/catch — proves
+          // this branch was actually reached, independent of whether the
+          // snapshot below succeeds. Without this, "no audio route line in
+          // the trace" is ambiguous between "the snapshot call threw" and
+          // "this code path never ran at all" (e.g. bytes never grew, or
+          // grew on a stats read this function's own generation guard had
+          // already invalidated). Exactly the ambiguity that made
+          // call_diagnostics 158/159 (2026-09-24) unreadable.
+          post({ type: "log", message: "media-flowing branch entered" });
+          // One-time, READ-ONLY route snapshot the instant media is proven
+          // to be flowing.
+          //
+          // Added 2026-09-23 after telemetry showed a 34-second call with
+          // audio packets arriving continuously and symmetrically on both
+          // legs, surviving a mid-call network change — and the user still
+          // heard nothing. That rules out WebRTC, ICE and the transport
+          // entirely: decoded audio was arriving at the track. What was
+          // never actually verified is what happens after that — whether
+          // the OS route those decoded samples are being played through
+          // has a live output at all, or is pointed at something silent
+          // (system volume at 0, a route to a disconnected Bluetooth
+          // device, a route with no output). This is read-only diagnostics
+          // — it does not call setCategory or touch the route in any way,
+          // so it cannot itself disturb a working call the way earlier
+          // "fixes" in this file did.
+          try {
+            const snap = audioRouteSnapshot();
+            const outputs = Array.isArray(snap.outputs)
+              ? (snap.outputs as { portType?: string; portName?: string }[])
+                  .map((o) => `${o.portType ?? "?"}/${o.portName ?? "?"}`)
+                  .join(",")
+              : "none";
+            post({
+              type: "log",
+              message:
+                `audio route: outputs=[${outputs}] volume=${String(snap.outputVolume ?? "?")} ` +
+                `category=${String(snap.category ?? "?")} mode=${String(snap.mode ?? "?")} ` +
+                `rtcEnabled=${String(snap.rtcIsAudioEnabled ?? "?")} rtcActive=${String(snap.rtcIsActive ?? "?")} ` +
+                `otherAudioPlaying=${String(snap.isOtherAudioPlaying ?? "?")} ` +
+                `ioChannels=${String(snap.rtcInputChannels ?? "?")}/${String(snap.rtcOutputChannels ?? "?")} ` +
+                `sampleRate=${String(snap.rtcSampleRate ?? "?")} ioBuffer=${String(snap.rtcIOBufferDuration ?? "?")}`,
+            });
+          } catch (snapshotError) {
+            // Surfaced, not swallowed: a bare `catch {}` here is exactly
+            // why this diagnostic went missing from real call traces on
+            // 2026-09-24 (call_diagnostics ids 158/159) — media-flowing
+            // fired on both legs but the "audio route:" line that should
+            // have preceded it never appeared in either trace, which is
+            // only possible if something in this block threw and was
+            // silently discarded. Posting the failure AS a log line (not
+            // throwing further — this must never affect the call) means
+            // the next real call's trace shows WHY the snapshot is
+            // missing instead of just that it's missing.
+            post({
+              type: "log",
+              message: `audio route snapshot failed: ${
+                snapshotError instanceof Error ? snapshotError.message : String(snapshotError)
+              }`,
+            });
+          }
           post({ type: "media-flowing" });
           post(await collectCallStats(pc, Date.now() - startedAt));
           // Keep re-snapshotting stats for the rest of the call.
@@ -1133,42 +1111,35 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
         }
 
         await sender.setParameters(params);
+        if (kind === "audio") {
+          // 2026-09-24: real calls show inbound/outbound RTP counters
+          // frozen solid within 1-2s of connect — right where this runs on
+          // BOTH peers (connectionState -> "connected" fires close together
+          // on caller and callee). A silently swallowed failure here, or a
+          // native encoder that accepts the call but glitches applying it,
+          // would explain a freeze with no other trace event anywhere. This
+          // makes the outcome a fact instead of a blind spot: confirms the
+          // call succeeded, or (if the catch below fires) that it didn't.
+          post({
+            type: "log",
+            message: "tuneForMobileNetwork: audio setParameters applied ok",
+          });
+        }
       }
-    } catch {
+    } catch (tuneError) {
       // Any failure here leaves WebRTC's own defaults in place; the call
-      // still works, just without the audio-first bias.
+      // still works, just without the audio-first bias. Logged rather than
+      // silently swallowed as of 2026-09-24 — see the audio branch above.
+      post({
+        type: "log",
+        message: `tuneForMobileNetwork failed: ${
+          tuneError instanceof Error ? tuneError.message : String(tuneError)
+        }`,
+      });
     }
   }
 
   releaseMediaRef.current = releaseMedia;
-
-  /** The peer's stream, kept so the audio watchdog can re-assert gain. */
-  const remoteStreamRefLocal = remoteStreamRef;
-
-  /** Re-applies the incoming-voice gain.
-   *
-   * Called from ontrack AND from the audio watchdog every 500ms. Once was
-   * not enough: _setVolume lives on the decoded track object, and that
-   * object is replaced whenever the transceiver re-negotiates (an ICE
-   * restart, a route change, iOS rebuilding the audio unit). The new track
-   * arrives at the library default of 1.0, so a call that started at the
-   * boosted level silently dropped back to the quiet one partway through —
-   * matching the report of audio that is audible for the first seconds and
-   * then effectively inaudible.
-   *
-   * Idempotent and cheap: setting the same value on an unchanged track is a
-   * no-op in react-native-webrtc. */
-  function applyRemoteGain() {
-    try {
-      const stream = remoteStreamRefLocal.current as unknown as {
-        getAudioTracks?: () => { _setVolume?: (v: number) => void }[];
-      } | null;
-      stream?.getAudioTracks?.().forEach((track) => track._setVolume?.(REMOTE_AUDIO_GAIN));
-    } catch {
-      // Older react-native-webrtc without _setVolume — the call still works
-      // at the default level.
-    }
-  }
 
   function createPeer(iceServers: RTCIceServer[]) {
     const webrtc = getWebRtc();
@@ -1278,16 +1249,22 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
       remoteStreamRef.current = stream;
       setRemoteUrl(stream.toURL());
 
-      // Amplify the incoming voice. Routing and session mode alone left
-      // calls noticeably quiet: iOS levels a voice-processing session
-      // conservatively, and there is no route setting that raises the far
-      // end's actual signal. _setVolume is react-native-webrtc's own gain
-      // control on the decoded track (1.0 = unchanged, up to 10).
+      // NO gain call here anymore — removed 2026-09-21.
       //
-      // 2.5 roughly doubles perceived loudness while staying well below the
-      // point where a loud speaker clips — the voice-processing unit's
-      // limiter still sits after this, so it can't distort into the mic.
-      applyRemoteGain();
+      // This used to call track._setVolume(2.5) on every inbound audio
+      // track. _setVolume is a non-standard react-native-webrtc extension
+      // (mediaStreamTrackSetVolume -> RTCAudioTrack.source.volume), and it
+      // is the ONLY thing that sat between arriving RTP and the speaker.
+      // Telemetry from 2026-09-21 showed calls where inbound audio packets
+      // arrived continuously and symmetrically (59-60 packets in 8s on both
+      // legs, counts still climbing) on a direct srflx/srflx path — data
+      // was demonstrably being received — while the user still heard
+      // nothing. With the route, the session, the track state and the
+      // packet counts all verified healthy, this was the last remaining
+      // link in the chain that had never been ruled out.
+      //
+      // Left out rather than reduced to 1.0: setting source.volume at all
+      // is what is under suspicion, not the particular value.
     };
 
     pc.onconnectionstatechange = () => {

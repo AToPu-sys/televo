@@ -73,7 +73,16 @@ export function useRinger(active: boolean, mode: "incoming" | "outgoing") {
         // call reached "Connected" carrying no audio at all.
         await setAudioModeAsync({ playsInSilentMode: true, allowsRecording: true });
 
-        const player = createAudioPlayer(require("../../assets/ringtone.wav"));
+        // keepAudioSessionActive: true — 2026-09-24, same fix and same real
+        // trace as useConnectingTone.ts. This player's stop() runs exactly
+        // when the call moves out of ringing/outgoing — the same moment
+        // WebRTC's own audio unit is taking over the shared AVAudioSession.
+        // Without this flag, expo-audio deactivates that shared session on
+        // cleanup, tearing down the session out from under audio that may
+        // have only just started.
+        const player = createAudioPlayer(require("../../assets/ringtone.wav"), {
+          keepAudioSessionActive: true,
+        });
 
         // If a previous run's player is somehow still around (the effect
         // re-runs when `mode` flips, which happens on the same render as a

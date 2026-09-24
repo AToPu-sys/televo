@@ -26,7 +26,13 @@ const MessageNotificationsContext = createContext<MessageNotificationsContextVal
  * notification pipeline. */
 function playSound(asset: number) {
   try {
-    const player = createAudioPlayer(asset);
+    // keepAudioSessionActive: true — 2026-09-24, same fix as
+    // useConnectingTone.ts/useRinger.ts. A message chime can play WHILE a
+    // call is active (the notification pipeline doesn't know or care), and
+    // without this flag this player's remove() below deactivates the
+    // shared AVAudioSession — tearing down a live WebRTC audio unit for an
+    // unrelated 0.6-volume chime.
+    const player = createAudioPlayer(asset, { keepAudioSessionActive: true });
     player.volume = 0.6;
     player.play();
     // expo-audio players aren't auto-released; without this every message

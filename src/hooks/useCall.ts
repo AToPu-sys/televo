@@ -66,7 +66,19 @@ const RING_TIMEOUT_MS = 45_000;
  * work."
  */
 export type CallDiagnosticsEntry = { t: number; label: string; detail?: string };
-const MAX_DIAGNOSTICS_ENTRIES = 40;
+// Raised from 40 to 200 on 2026-09-24. The periodic call-stats snapshot
+// (every 2s, see WebRtcBridge's periodicallyRefreshStats) alone produces
+// ~38 entries on a 76-second call — enough on its own to push the EARLY
+// entries (local media open, connection-state, and the one-shot audio
+// route snapshot at media-flowing) out of a 40-entry ring buffer before the
+// call even ends. That is exactly the diagnostic this buffer exists to
+// preserve: a 2026-09-24 call where Shakha's inbound audioPkts froze at 11
+// for the entire 76s (a real, still-unresolved one-sided-audio symptom) had
+// its route snapshot silently evicted, so the trace that reached
+// call_diagnostics could show the SYMPTOM but not the cause. 200 entries is
+// generous relative to what a call actually produces (mostly per-candidate
+// ICE logs early on, then one call-stats line every few seconds).
+const MAX_DIAGNOSTICS_ENTRIES = 200;
 
 export function useCall(userId: string | undefined, peerPublicKey?: string | null) {
   const { encryptSignalToPeer, decryptSignalFromPeer, startCallKem, receiveCallKem } = useE2ee();
@@ -1465,12 +1477,31 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
         // never appears in the trace, permission was denied or getUserMedia
         // threw (see the "error" branch below for why).
         trace("local media open", "mic/camera stream acquired");
-        // Video starts on the loudspeaker (nobody holds a phone to their ear
-        // while watching the screen); voice keeps the earpiece, which is what
-        // people expect when they raise the phone to answer. Forcing the
-        // loudspeaker on every call meant an ordinary voice call blasted the
-        // room — and it also overwrote configureForVoiceCall's .voiceChat
-        // mode with .videoChat behind the user's back.
+        // Records the route a video call is EXPECTED to be on, for the
+        // speaker button's own on/off state — it no longer forces it.
+        //
+        // REWRITTEN 2026-09-21, then corrected the same day.
+        //
+        // The rewrite removed BOTH automatic setSpeakerphoneOn calls — this
+        // one and a second on "connected" — because each runs
+        // AVAudioSession.setCategory natively, which tears down and rebuilds
+        // the live audio route. Doing that twice, moments into a call that
+        // was already carrying audio, is the class of mid-call failure this
+        // file spent 2026-09-19..21 chasing.
+        //
+        // Removing the SECOND one (on "connected", while media is already
+        // flowing) is the fix. Removing this one too was a mistake: it left
+        // setSpeakerOnState() claiming the loudspeaker was on for a video
+        // call while the native route had never actually been moved there.
+        // The user then sees a lit speaker button, hears nothing, taps it —
+        // and toggleSpeaker computes !true = false and explicitly forces the
+        // EARPIECE, the exact opposite of what they wanted, needing two taps
+        // to recover.
+        //
+        // Applied here only, and only once: local-ready fires when
+        // getUserMedia has just returned, BEFORE any RTP is flowing, so
+        // there is no live audio for a category change to disturb. State and
+        // route are set together so they cannot disagree.
         const current = stateRef.current;
         const wantSpeaker =
           current.phase !== "idle" && current.phase !== "ended" && "call" in current
@@ -1566,13 +1597,9 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
             clearTimeout(disconnectTimerRef.current);
             disconnectTimerRef.current = null;
           }
-          // Re-assert the audio route now that the connection is up.
-          // Setting it at getUserMedia time (which still happens, for the
-          // ringing UI) isn't enough on its own: iOS re-evaluates the route
-          // as the call's audio unit starts, and can land back on the
-          // earpiece — the "speaker is on but it's quiet" symptom. Applying
-          // it again here makes the chosen route stick.
-          setSpeakerphoneOn(speakerOnRef.current);
+          // No audio-route re-assert here anymore — see the local-ready
+          // handler's comment. Rebuilding the route at the exact moment
+          // media starts flowing was actively harmful, not protective.
         }
       }
       if (event.type === "media-flowing") {
@@ -1611,7 +1638,18 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
             `outSent=${event.outboundAudioBytesSent ?? "?"}/${event.outboundAudioPacketsSent ?? "?"} ` +
             `localMic=enabled:${event.localAudioTrackEnabled ?? "?"} ` +
             `state:${event.localAudioTrackReadyState ?? "?"} ` +
-            `muted:${event.localAudioTrackMuted ?? "?"}`
+            `muted:${event.localAudioTrackMuted ?? "?"} ` +
+            // Remote (inbound) track state — added 2026-09-24. If audioPkts
+            // is frozen while this reads enabled:true/state:live/muted:false,
+            // the RECEIVER thinks everything is fine and the fault is
+            // upstream (transport/relay not delivering RTP, or the peer's
+            // own outbound-rtp — check ITS trace). If this instead shows
+            // muted:true or state:ended while the peer's outSent keeps
+            // climbing, the fault is local: this device's own decoder/track
+            // died while data kept arriving.
+            `remoteAudio=enabled:${event.remoteAudioTrackEnabled ?? "?"} ` +
+            `state:${event.remoteAudioTrackReadyState ?? "?"} ` +
+            `muted:${event.remoteAudioTrackMuted ?? "?"}`
         );
       }
       if (event.type === "negotiation-stalled") {

@@ -79,12 +79,35 @@ public class SpeakerToggleModule: Module {
     defer { rtcSession.unlockForConfiguration() }
 
     let session = AVAudioSession.sharedInstance()
+    let wantMode: AVAudioSession.Mode = speakerEnabled ? .videoChat : .voiceChat
     do {
-      try session.setCategory(
-        .playAndRecord,
-        mode: speakerEnabled ? .videoChat : .voiceChat,
-        options: [.allowBluetooth, .allowBluetoothA2DP]
-      )
+      // 2026-09-24: real calls traced the exact failure this used to cause.
+      // A user tap on the speaker button mid-call (userInitiated == true,
+      // always applied unconditionally) called setCategory on an audio
+      // session that was already .playAndRecord with the SAME options —
+      // the only things actually changing are mode and the output
+      // override. setCategory tears down and rebuilds the active I/O unit
+      // regardless of whether the category value itself changed, which is
+      // exactly what "a few seconds of audio, then permanent silence,
+      // RTP packet counters frozen for the rest of the call" turned out to
+      // be: WebRTC's already-flowing audio track stayed bound to the I/O
+      // unit instance that no longer existed after the rebuild.
+      //
+      // setMode alone reconfigures voice-processing (echo cancellation/AGC
+      // leveling) WITHOUT tearing down the I/O unit — it is the whole
+      // reason .voiceChat vs .videoChat exists as a mode rather than a
+      // category. Skipping setCategory whenever the category is already
+      // correct keeps the audio unit — and the live RTP flow bound to it —
+      // untouched.
+      if session.category != .playAndRecord {
+        try session.setCategory(
+          .playAndRecord,
+          mode: wantMode,
+          options: [.allowBluetooth, .allowBluetoothA2DP]
+        )
+      } else if session.mode != wantMode {
+        try session.setMode(wantMode)
+      }
       try session.overrideOutputAudioPort(speakerEnabled ? .speaker : .none)
     } catch {
       // Non-fatal: fails when the session isn't in a call-capable state yet
@@ -237,6 +260,17 @@ public class SpeakerToggleModule: Module {
         "rtcIsAudioEnabled": rtcSession.isAudioEnabled,
         "rtcIsActive": rtcSession.isActive,
         "sessionSecondaryAudioShouldBeSilencedHint": session.secondaryAudioShouldBeSilencedHint,
+        // Added 2026-09-24 while chasing calls where inbound/outbound RTP
+        // packet counters freeze solid 1-2s after connect with nothing else
+        // in the trace to explain it. None of the fields above would catch
+        // the audio HARDWARE I/O silently reconfiguring out from under a
+        // live call (e.g. channel count collapsing to 0, or the sample rate
+        // changing) while category/mode/route/isActive all keep reporting
+        // normal — this makes that visible if it's the cause.
+        "rtcInputChannels": rtcSession.inputNumberOfChannels,
+        "rtcOutputChannels": rtcSession.outputNumberOfChannels,
+        "rtcSampleRate": rtcSession.sampleRate,
+        "rtcIOBufferDuration": rtcSession.ioBufferDuration,
       ]
     }
 

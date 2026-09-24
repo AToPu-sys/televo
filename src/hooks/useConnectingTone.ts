@@ -40,7 +40,23 @@ export function useConnectingTone(active: boolean) {
 
     (async () => {
       try {
-        const player = createAudioPlayer(require("../../assets/connecting.wav"));
+        // keepAudioSessionActive: true — 2026-09-24. This tone's whole job is
+        // to play WHILE WebRTC's own audio unit is live on the same shared
+        // AVAudioSession (the exact "connecting, not yet confirmed" window).
+        // Without this flag, expo-audio deactivates the shared session the
+        // moment this player is removed/paused — and cleanup here fires
+        // right as `active` flips false, which is the SAME instant
+        // mediaConfirmed becomes true and WebRTC's track starts actually
+        // carrying audio. A real call traced this exactly: AVAudioSession
+        // activated, ~1.7s later deactivated (this player's own cleanup),
+        // followed immediately by AVAudioSessionAudioHardwareFormatChange
+        // and RTP packet counters frozen for the rest of the call — the
+        // shared session was torn down out from under a WebRTC track that
+        // had only just started receiving. This flag stops expo-audio from
+        // touching the shared session's activation state at all.
+        const player = createAudioPlayer(require("../../assets/connecting.wav"), {
+          keepAudioSessionActive: true,
+        });
 
         const previous = playerRef.current;
         if (previous && previous !== player) stop(previous);
