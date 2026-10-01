@@ -21,6 +21,12 @@ entrypoint = "./functions/send-push-notification/index.ts"
 # For example, if you want to serve static HTML pages in your function:
 # static_files = [ "./functions/send-push-notification/*.html" ]
 
+[functions.send-waitlist-email]
+enabled = true
+verify_jwt = false
+import_map = "./functions/send-waitlist-email/deno.json"
+entrypoint = "./functions/send-waitlist-email/index.ts"
+
 [auth]
 additional_redirect_urls = ["televo://", "televo://**", "exp://**", "https://gettelevo.space/**"]
 minimum_password_length = 10
