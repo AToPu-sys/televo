@@ -17,6 +17,16 @@ expo-env.d.ts
 *.p12
 *.key
 *.mobileprovision
+*.keystore
+
+# Android release signing key + passwords — never commit, back up separately
+/secrets/
+
+# Firebase Android config — not a tightly-held secret (the API key is scoped
+# by Firebase Security Rules, same as the Supabase publishable key), but kept
+# out of the repo anyway rather than making that judgment call for every
+# future reader of this file.
+/google-services.json
 
 # Metro
 .metro-health-check*
@@ -25,6 +35,7 @@ expo-env.d.ts
 npm-debug.*
 yarn-debug.*
 yarn-error.*
+firebase-debug.*
 
 # macOS
 .DS_Store

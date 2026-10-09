@@ -88,3 +88,22 @@ AppState.addEventListener("change", (state) => {
 supabase.auth.onAuthStateChange((_event, session) => {
   supabase.realtime.setAuth(session?.access_token ?? null);
 });
+
+/** Pulls the `session_id` claim out of a Supabase access token (a standard
+ * JWT) without a full JWT library — this is the one field the Devices
+ * screen needs to link a push_tokens/voip_push_tokens row back to a
+ * specific auth.sessions row (see scripts/sql/055_device_sessions.sql).
+ * `atob` is available in Hermes; base64url (`-`/`_` instead of `+`/`/`, no
+ * padding) needs converting to standard base64 first or atob rejects it. */
+export function decodeSessionIdFromAccessToken(accessToken: string): string | null {
+  try {
+    const payloadSegment = accessToken.split(".")[1];
+    if (!payloadSegment) return null;
+    const base64 = payloadSegment.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = base64 + "=".repeat((4 - (base64.length % 4)) % 4);
+    const payload = JSON.parse(atob(padded));
+    return typeof payload.session_id === "string" ? payload.session_id : null;
+  } catch {
+    return null;
+  }
+}

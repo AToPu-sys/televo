@@ -1,112 +1,133 @@
 // The ONLY place a support_agent_queue row can turn into a real ban/unban.
-// Reached by clicking the approve/reject link in the operator's own inbox —
-// a GET request with a one-time token, no Supabase session required, since
-// the operator is reading this from an email client, not the app.
 //
-// Deliberately re-derives the action from structured columns (intent's
-// sibling fields — kind/days/target_user_id), never from the free-text
-// `proposed_action` or `intent` the model wrote. A compromised or malformed
-// queue row can therefore make this endpoint refuse or no-op, but never
-// execute something other than a plain ban/unban of the resolved user.
+// The operator's email links point at https://gettelevo.space/admin/review
+// (a static page), which calls this function:
+//   GET  ?token=…            → JSON summary of the pending request (no effect)
+//   POST {token, decision}   → applies approve/reject
+//
+// Why not act on the link click itself, like the first version did: mail
+// providers and security scanners (Gmail, Outlook Safe Links, antivirus
+// gateways) open every link in an email automatically to check it, so a
+// state-changing GET could approve a ban with nobody ever clicking. And
+// Supabase serves Edge Function HTML as text/plain + nosniff, so an HTML
+// confirmation page can't live here — it renders as raw markup.
+//
+// The action KIND (ban vs unban) is re-derived from proposed_action's fixed
+// vocabulary ("lift the ban" is the only unban phrasing the agent writes);
+// ban duration comes from apply_support_ban itself (support_ban_count), so
+// a malformed queue row can at most pick ban-vs-unban for the already
+// resolved target — never a duration or a different user.
 import "@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
 
-function html(title: string, body: string): Response {
-  return new Response(
-    `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title>
-     <style>body{font-family:-apple-system,sans-serif;max-width:520px;margin:60px auto;padding:0 20px;color:#222}</style>
-     </head><body><h2>${title}</h2>${body}</body></html>`,
-    { headers: { "content-type": "text/html; charset=utf-8" } }
-  );
+const ALLOWED_ORIGIN = "https://gettelevo.space";
+
+function json(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      "content-type": "application/json",
+      "access-control-allow-origin": ALLOWED_ORIGIN,
+      "access-control-allow-methods": "GET, POST, OPTIONS",
+      "access-control-allow-headers": "content-type",
+      "cache-control": "no-store",
+    },
+  });
 }
 
 Deno.serve(async (req) => {
-  const url = new URL(req.url);
-  const token = url.searchParams.get("token");
-  const decision = url.searchParams.get("decision");
+  if (req.method === "OPTIONS") return json({});
 
-  if (!token || (decision !== "approve" && decision !== "reject")) {
-    return html("Invalid link", "<p>This link is missing required information.</p>");
+  const admin = createClient(
+    Deno.env.get("SUPABASE_URL")!,
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+  );
+
+  let token: string | null = null;
+  let decision: string | null = null;
+  if (req.method === "GET") {
+    token = new URL(req.url).searchParams.get("token");
+  } else if (req.method === "POST") {
+    try {
+      const body = await req.json();
+      token = typeof body.token === "string" ? body.token : null;
+      decision = typeof body.decision === "string" ? body.decision : null;
+    } catch {
+      return json({ error: "bad_request" }, 400);
+    }
+  } else {
+    return json({ error: "method_not_allowed" }, 405);
   }
 
-  const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
-  const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-  const admin = createClient(supabaseUrl, serviceRoleKey);
+  if (!token) return json({ error: "missing_token" }, 400);
 
-  const { data: row, error: fetchError } = await admin
+  const { data: row } = await admin
     .from("support_agent_queue")
-    .select("*")
+    .select("id, status, decided_at, from_email, intent, proposed_action, target_user_id, target_user_display_name, created_at")
     .eq("approval_token", token)
     .maybeSingle();
 
-  if (fetchError || !row) {
-    return html("Link not found", "<p>This approval link is invalid or has already been used.</p>");
-  }
-  if (row.status !== "pending") {
-    return html(
-      "Already handled",
-      `<p>This request was already <b>${row.status}</b> on ${new Date(row.decided_at).toLocaleString()}.</p>`
-    );
-  }
+  if (!row) return json({ error: "not_found" }, 404);
 
-  if (decision === "reject") {
-    await admin
-      .from("support_agent_queue")
-      .update({ status: "rejected", decided_at: new Date().toISOString() })
-      .eq("id", row.id);
-    return html("Rejected", `<p>No action was taken on <b>${row.from_email}</b>'s request.</p>`);
-  }
+  const summary = {
+    status: row.status,
+    decidedAt: row.decided_at,
+    createdAt: row.created_at,
+    fromEmail: row.from_email,
+    intent: row.intent,
+    proposedAction: row.proposed_action,
+    targetUserId: row.target_user_id,
+    targetDisplayName: row.target_user_display_name,
+  };
 
-  // decision === "approve" from here.
-  if (!row.target_user_id) {
-    return html(
-      "Cannot approve — no user identified",
-      `<p>The agent could not confidently match a user for this request, so there is nothing to apply. Handle this one manually, then come back and reject this link so it doesn't stay pending.</p>
-       <p><b>Original request:</b></p><pre>${row.body}</pre>`
-    );
+  if (req.method === "GET") return json(summary);
+
+  if (decision !== "approve" && decision !== "reject") {
+    return json({ error: "invalid_decision" }, 400);
+  }
+  if (decision === "approve" && !row.target_user_id) {
+    return json({ error: "no_target_user" }, 409);
   }
 
-  const actionLower = row.proposed_action.toLowerCase();
-  const isUnban = actionLower.includes("lift");
-  const daysMatch = actionLower.match(/(\d+)\s*day/);
-  const days = daysMatch ? parseInt(daysMatch[1], 10) : null;
-
-  if (isUnban) {
-    const { error } = await admin
-      .from("user_moderation")
-      .update({ banned_until: null, banned_reason: null, updated_at: new Date().toISOString() })
-      .eq("user_id", row.target_user_id);
-    if (error) {
-      console.error("Unban failed:", error.message);
-      return html("Failed", `<p>Could not lift the ban: ${error.message}</p>`);
-    }
-  } else {
-    const bannedUntil = days
-      ? new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString()
-      : null; // null banned_until with a reason set = permanent, matching 035_auto_moderation's own convention
-    const { error } = await admin.from("user_moderation").upsert(
-      {
-        user_id: row.target_user_id,
-        banned_until: bannedUntil,
-        banned_reason: `Support request from ${row.from_email}: ${row.intent}`,
-        updated_at: new Date().toISOString(),
-      },
-      { onConflict: "user_id" }
-    );
-    if (error) {
-      console.error("Ban failed:", error.message);
-      return html("Failed", `<p>Could not apply the ban: ${error.message}</p>`);
-    }
-  }
-
-  await admin
+  // Claim the row atomically: only one request can move it off "pending",
+  // so a double-click (or two open tabs) can't apply the ban twice and
+  // skip a step of the 6h → 24h → permanent escalation.
+  const { data: claimed } = await admin
     .from("support_agent_queue")
-    .update({ status: "approved", decided_at: new Date().toISOString() })
-    .eq("id", row.id);
+    .update({
+      status: decision === "approve" ? "approved" : "rejected",
+      decided_at: new Date().toISOString(),
+    })
+    .eq("id", row.id)
+    .eq("status", "pending")
+    .select("id");
 
-  return html(
-    "Applied",
-    `<p><b>${row.proposed_action}</b> applied to ${row.target_user_display_name ?? row.target_user_id}.</p>
-     <p>Requested by ${row.from_email}.</p>`
-  );
+  if (!claimed || claimed.length === 0) {
+    return json({ error: "already_handled", ...summary }, 409);
+  }
+
+  if (decision === "reject") return json({ ok: true, applied: "rejected" });
+
+  const isUnban = String(row.proposed_action).toLowerCase().includes("lift");
+  const { data: result, error } = isUnban
+    ? await admin.rpc("apply_support_unban", { p_user_id: row.target_user_id })
+    : await admin.rpc("apply_support_ban", {
+        p_user_id: row.target_user_id,
+        // The banned user sees this reason (BanScreen, and the support agent
+        // quotes it back on appeal), so it must never carry the reporter's
+        // address or the model's free-text read of their email — that would
+        // tell the banned person exactly who reported them. The full request
+        // stays in support_agent_queue for the operator.
+        p_reason: "Violation of the community rules, confirmed after a report.",
+      });
+
+  if (error) {
+    console.error("apply failed:", error.message);
+    // Put it back so the operator can retry instead of being stuck with a
+    // row marked approved that never actually took effect.
+    await admin.from("support_agent_queue").update({ status: "pending", decided_at: null }).eq("id", row.id);
+    return json({ error: "apply_failed", detail: error.message }, 500);
+  }
+
+  return json({ ok: true, applied: isUnban ? "unban" : "ban", result });
 });

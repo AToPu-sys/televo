@@ -14,7 +14,9 @@
 import "@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
 
-const CLAUDE_MODEL = "claude-haiku-4-5";
+// Groq (OpenAI-compatible) since 2026-10-04 — the Anthropic organization
+// was disabled, so every report fell through to the rules-only fallback.
+const GROQ_MODEL = "openai/gpt-oss-120b";
 
 type Severity = "none" | "low" | "medium" | "high";
 
@@ -51,6 +53,8 @@ Classify the severity of the REPORTED MESSAGE:
 - "high": Severe violation. Credible threats of violence, sexual content involving minors, coordinated abuse, doxxing with intent to harm, promotion of self-harm.
 
 Be conservative. This is private conversation between people who chose to talk to each other, and the report is one side's account. Strong language alone is NOT a violation. When genuinely uncertain, answer "none".
+
+Messages are often in Russian, Uzbek, or Russian typed in Latin letters (translit). Judge intent, not vocabulary: Russian mat between friends ("бля", "тупой", "долбоёб" as banter) is "none"; the same words aimed at someone in a hostile, targeted way can be "low"; threats ("убью", "зарежу", "я знаю где ты живёшь") are "high".
 
 Respond with ONLY a JSON object, no other text:
 {"severity":"none|low|medium|high","rationale":"one short sentence"}`;
@@ -89,6 +93,15 @@ function classifyByRules(reason: string, content: string): { severity: Severity;
     return { severity: "high", rationale: "Rule match: encouragement of self-harm." };
   }
 
+  // Russian equivalents. No \b here: JS's \b only understands ASCII word
+  // characters, so it never matches next to Cyrillic letters.
+  if (/(убью|убить тебя|зарежу|застрелю|прибью тебя)/.test(text) || /я знаю,? где ты (живешь|живёшь|работаешь)/.test(text)) {
+    return { severity: "high", rationale: "Rule match: apparent threat of violence toward the recipient." };
+  }
+  if (/(убей себя|убейся|иди сдохни|повесься)/.test(text)) {
+    return { severity: "high", rationale: "Rule match: encouragement of self-harm." };
+  }
+
   // Promotional spam: a link plus solicitation language, reported as spam.
   const hasLink = /https?:\/\/|www\./.test(text);
   const solicit = /\b(buy|cheap|free money|click here|promo|discount|followers|crypto|investment)\b/.test(text);
@@ -102,21 +115,23 @@ function classifyByRules(reason: string, content: string): { severity: Severity;
 }
 
 async function classify(reason: string, content: string): Promise<{ severity: Severity; rationale: string }> {
-  const apiKey = Deno.env.get("ANTHROPIC_API_KEY");
-  if (!apiKey) throw new Error("ANTHROPIC_API_KEY not configured");
+  const apiKey = Deno.env.get("GROQ_API_KEY");
+  if (!apiKey) throw new Error("GROQ_API_KEY not configured");
 
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
+  const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
+      Authorization: `Bearer ${apiKey}`,
     },
     body: JSON.stringify({
-      model: CLAUDE_MODEL,
-      max_tokens: 200,
-      system: SYSTEM_PROMPT,
+      model: GROQ_MODEL,
+      // Reasoning model — leaves room for its hidden reasoning before the
+      // short JSON verdict.
+      max_completion_tokens: 1024,
+      response_format: { type: "json_object" },
       messages: [
+        { role: "system", content: SYSTEM_PROMPT },
         {
           role: "user",
           content: `Report category: ${reason}\n\nReported message:\n"""${content.slice(0, 4000)}"""`,
@@ -126,11 +141,11 @@ async function classify(reason: string, content: string): Promise<{ severity: Se
   });
 
   if (!response.ok) {
-    throw new Error(`Anthropic API ${response.status}: ${await response.text()}`);
+    throw new Error(`Groq API ${response.status}: ${await response.text()}`);
   }
 
   const data = await response.json();
-  const text = data?.content?.[0]?.text ?? "";
+  const text = data?.choices?.[0]?.message?.content ?? "";
   const match = text.match(/\{[\s\S]*\}/);
   if (!match) throw new Error(`unparseable classifier output: ${text.slice(0, 200)}`);
 
@@ -173,12 +188,12 @@ Deno.serve(async (req) => {
   }
 
   let verdict: { severity: Severity; rationale: string };
-  let decidedBy = `auto:${CLAUDE_MODEL}`;
+  let decidedBy = `auto:${GROQ_MODEL}`;
   try {
     verdict = await classify(record.reason, content);
   } catch (error) {
-    // The LLM is unavailable (commonly: the Anthropic organisation is
-    // disabled). Fall back to rules rather than dropping the report.
+    // The LLM is unavailable (quota, outage, revoked key). Fall back to
+    // rules rather than dropping the report.
     console.error("LLM classification failed, falling back to rules:", String(error));
     const ruled = classifyByRules(record.reason, content);
     if (!ruled) {

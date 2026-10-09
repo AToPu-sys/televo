@@ -27,6 +27,41 @@ verify_jwt = false
 import_map = "./functions/send-waitlist-email/deno.json"
 entrypoint = "./functions/send-waitlist-email/index.ts"
 
+[functions.send-crash-alert]
+enabled = true
+verify_jwt = false
+import_map = "./functions/send-crash-alert/deno.json"
+entrypoint = "./functions/send-crash-alert/index.ts"
+
+[functions.support-email-agent]
+enabled = true
+verify_jwt = false
+import_map = "./functions/support-email-agent/deno.json"
+entrypoint = "./functions/support-email-agent/index.ts"
+
+[functions.approve-support-action]
+enabled = true
+verify_jwt = false
+import_map = "./functions/approve-support-action/deno.json"
+entrypoint = "./functions/approve-support-action/index.ts"
+
+[functions.send-launch-email]
+enabled = true
+verify_jwt = false
+import_map = "./functions/send-launch-email/deno.json"
+entrypoint = "./functions/send-launch-email/index.ts"
+
+[functions.register-device-location]
+enabled = true
+verify_jwt = true
+import_map = "./functions/register-device-location/deno.json"
+entrypoint = "./functions/register-device-location/index.ts"
+# static_files (bundling the DB-IP mmdb directly into the deploy) was tried
+# first and rejected by the platform: an 8MB file deploy returns 413
+# "request entity too large" regardless of the Docker vs --use-api path.
+# index.ts instead fetches the database from a private Storage bucket
+# (geoip-data) on cold start and caches it — see its own header comment.
+
 [auth]
 additional_redirect_urls = ["televo://", "televo://**", "exp://**", "https://gettelevo.space/**"]
 minimum_password_length = 10

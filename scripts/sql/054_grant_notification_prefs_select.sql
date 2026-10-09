@@ -1,0 +1,11 @@
+-- 013 replaced the table-level SELECT grant on public.profiles with an
+-- explicit per-column grant (only that exact list of columns is readable by
+-- `authenticated`). 053 added notify_messages/notify_calls but never added
+-- them to that list, so any select() naming those columns fails the
+-- column-level privilege check entirely — not just for those two columns,
+-- for the WHOLE query, since Postgres checks column privileges on the full
+-- projection before running it. That's why the Settings screen's profile
+-- fetch (app/(tabs)/settings.tsx) got back a null `data` and silently never
+-- left "Loading…": the query was permission-denied outright, not merely
+-- returning two null fields.
+grant select (notify_messages, notify_calls) on public.profiles to authenticated;

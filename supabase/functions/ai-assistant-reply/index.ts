@@ -1,14 +1,18 @@
 // Called by a Postgres webhook (see scripts/sql/010_ai_assistant_webhook.sql)
 // whenever a new message lands in a conversation that includes the reserved
 // assistant user (00000000-0000-0000-0000-000000000001) and was NOT sent by
-// the assistant itself. Fetches recent history for context, calls the Claude
-// API, and inserts the reply using the service-role key. The client never
-// calls Claude directly and never holds an API key.
+// the assistant itself. Fetches recent history for context, calls the model
+// (Groq, OpenAI-compatible API), and inserts the reply using the service-role
+// key. The client never calls the model directly and never holds an API key.
+//
+// Groq rather than Anthropic since 2026-10-04: the Anthropic organization
+// behind ANTHROPIC_API_KEY was disabled ("organization_on_hold"), so every
+// reply here was silently the "assistant is unavailable" fallback.
 import "@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
 
 const ASSISTANT_USER_ID = "00000000-0000-0000-0000-000000000001";
-const CLAUDE_MODEL = "claude-haiku-4-5";
+const GROQ_MODEL = "openai/gpt-oss-120b";
 const HISTORY_LIMIT = 20;
 
 type WebhookPayload = {
@@ -77,15 +81,15 @@ Deno.serve(async (req) => {
 
   const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
   const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-  const anthropicApiKey = Deno.env.get("ANTHROPIC_API_KEY");
+  const groqApiKey = Deno.env.get("GROQ_API_KEY");
 
   // The admin client is built BEFORE the key check so an unconfigured or
   // failing upstream can still post a visible reply rather than leaving the
   // user with a chat that silently never answers.
   const admin = createClient(supabaseUrl, serviceRoleKey);
 
-  if (!anthropicApiKey) {
-    console.error("ANTHROPIC_API_KEY is not configured");
+  if (!groqApiKey) {
+    console.error("GROQ_API_KEY is not configured");
     await postFallback(
       admin,
       message.conversation_id,
@@ -117,32 +121,38 @@ Deno.serve(async (req) => {
     .limit(HISTORY_LIMIT);
 
   const orderedHistory = (history ?? []).slice().reverse();
-  const claudeMessages = orderedHistory
+  const chatMessages = orderedHistory
     .filter((row) => row.body)
     .map((row) => ({
       role: row.sender_id === ASSISTANT_USER_ID ? "assistant" : "user",
       content: row.body as string,
     }));
 
-  const claudeResponse = await fetch("https://api.anthropic.com/v1/messages", {
+  const modelResponse = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
     headers: {
-      "x-api-key": anthropicApiKey,
-      "anthropic-version": "2023-06-01",
+      Authorization: `Bearer ${groqApiKey}`,
       "content-type": "application/json",
     },
     body: JSON.stringify({
-      model: CLAUDE_MODEL,
-      max_tokens: 1024,
-      system:
-        "You are the Televo Assistant, a helpful AI chat contact inside the Televo messenger app. Keep replies conversational and reasonably concise, like a chat message rather than an essay.",
-      messages: claudeMessages,
+      model: GROQ_MODEL,
+      // Reasoning model: part of this budget goes to its hidden reasoning
+      // before the visible reply, so it's higher than the reply itself needs.
+      max_completion_tokens: 1536,
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are the Televo Assistant, a helpful AI chat contact inside the Televo messenger app. Reply in the language the user writes in. Keep replies conversational and reasonably concise, like a chat message rather than an essay.",
+        },
+        ...chatMessages,
+      ],
     }),
   });
 
-  if (!claudeResponse.ok) {
-    const errorText = await claudeResponse.text();
-    console.error("Claude API error:", claudeResponse.status, errorText);
+  if (!modelResponse.ok) {
+    const errorText = await modelResponse.text();
+    console.error("Groq API error:", modelResponse.status, errorText);
     await postFallback(
       admin,
       message.conversation_id,
@@ -151,15 +161,16 @@ Deno.serve(async (req) => {
     return new Response("upstream error", { status: 502 });
   }
 
-  const claudeData = await claudeResponse.json();
-  const replyText = claudeData.content
-    ?.filter((block: { type: string }) => block.type === "text")
-    .map((block: { text: string }) => block.text)
-    .join("\n")
-    .trim();
+  const modelData = await modelResponse.json();
+  const replyText = (modelData.choices?.[0]?.message?.content ?? "").trim();
 
   if (!replyText) {
-    console.error("Claude returned no text content:", JSON.stringify(claudeData));
+    console.error("Model returned no text content:", JSON.stringify(modelData));
+    await postFallback(
+      admin,
+      message.conversation_id,
+      "The assistant is unavailable right now. Everything else in Televo works normally — you can keep chatting and calling as usual."
+    );
     return new Response("empty reply", { status: 502 });
   }
 

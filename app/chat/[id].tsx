@@ -1,7 +1,7 @@
 import { Ionicons } from "@expo/vector-icons";
 import * as DocumentPicker from "expo-document-picker";
 import * as ImagePicker from "expo-image-picker";
-import { useLocalSearchParams, useRouter } from "expo-router";
+import { useFocusEffect, useLocalSearchParams, useRouter } from "expo-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
@@ -19,6 +19,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 
 import { ActionSheet, type ActionSheetOption } from "../../src/components/ActionSheet";
 import { Avatar } from "../../src/components/Avatar";
+import { MediaViewer, type MediaViewerItem } from "../../src/components/MediaViewer";
 import { MessageBubble } from "../../src/components/MessageBubble";
 import { useAuth } from "../../src/hooks/useAuth";
 import { blockUser, isUserBlocked } from "../../src/hooks/useBlockedUsers";
@@ -35,6 +36,7 @@ import { supabase } from "../../src/lib/supabase";
 import { useTheme } from "../../src/hooks/useTheme";
 import { useToast } from "../../src/hooks/useToast";
 import { useTyping } from "../../src/hooks/useTyping";
+import { useVoiceRecorder, VOICE_MAX_MS } from "../../src/hooks/useVoiceRecorder";
 import { radius, spacing } from "../../src/theme";
 
 const SELF_DESTRUCT_OPTIONS: { label: string; seconds: number | null }[] = [
@@ -108,6 +110,15 @@ export default function ConversationScreen() {
 
   const { conversation, loading: loadingConversation, refresh: refreshConversation } =
     useConversation(id, user?.id);
+  // Coming back from group info: the name, photo or member count may have
+  // just been changed there.
+  const isGroupRef = useRef(false);
+  isGroupRef.current = conversation?.kind === "group";
+  useFocusEffect(
+    useCallback(() => {
+      if (isGroupRef.current) void refreshConversation();
+    }, [refreshConversation])
+  );
   // Stays undefined (rather than defaulting to false) until the conversation
   // row has actually loaded. useMessages will not fetch on an undefined
   // value, since guessing "false" for what turns out to be an encrypted chat
@@ -124,6 +135,7 @@ export default function ConversationScreen() {
     editMessage,
     sendImage,
     sendDocument,
+    sendVoice,
     deleteMessage,
     markRead,
     retryDecryption,
@@ -161,7 +173,11 @@ export default function ConversationScreen() {
     }
   ).current;
   const viewabilityConfig = useRef({ itemVisiblePercentThreshold: 0 }).current;
-  const participantNames = useParticipantNames(id, user?.id);
+  const messageSenderIds = useMemo(
+    () => messages.flatMap((m) => [m.sender_id, m.forwarded_from_sender_id ?? ""]).filter(Boolean),
+    [messages]
+  );
+  const participantNames = useParticipantNames(id, user?.id, messageSenderIds);
   const { label: presenceLabel } = useLastSeen(user?.id, conversation?.otherUserId);
   const { typingLabel, notifyTyping, notifyStoppedTyping } = useTyping(
     id,
@@ -169,6 +185,47 @@ export default function ConversationScreen() {
     user?.user_metadata?.display_name as string | undefined
   );
   const { placeCall, state: callState } = useCallManager();
+  const callInProgress = callState.phase !== "idle" && callState.phase !== "ended";
+  const voice = useVoiceRecorder(callInProgress);
+  const cancelVoice = voice.cancel;
+  const [voiceSending, setVoiceSending] = useState(false);
+
+  async function startVoice() {
+    if (callInProgress) {
+      showToast({ kind: "error", message: "Voice messages can't be recorded during a call." });
+      return;
+    }
+    const started = await voice.start();
+    if (!started) {
+      showToast({
+        kind: "error",
+        message: "Microphone access is needed for voice messages. Allow it in iOS Settings → Televo.",
+      });
+    }
+  }
+
+  const finishVoice = useCallback(async () => {
+    if (voiceSending) return;
+    setVoiceSending(true);
+    try {
+      const recording = await voice.finish();
+      if (recording) await sendVoice(recording.uri, recording.durationMs, recording.waveform);
+    } catch {
+      showToast({ kind: "error", message: "Voice message couldn't be sent. Tap it to see details." });
+    } finally {
+      setVoiceSending(false);
+    }
+  }, [voice, voiceSending, sendVoice, showToast]);
+
+  useEffect(() => {
+    if (voice.isRecording && voice.durationMs >= VOICE_MAX_MS) void finishVoice();
+  }, [voice.isRecording, voice.durationMs, finishVoice]);
+
+  // A call starting mid-recording discards the recording (without touching
+  // the audio mode — see useVoiceRecorder) so it can't fight the call's audio.
+  useEffect(() => {
+    if (callInProgress && voice.isRecording) void cancelVoice();
+  }, [callInProgress, voice.isRecording, cancelVoice]);
   const {
     startEncryptedChat,
     peerKeyChanged,
@@ -228,7 +285,8 @@ export default function ConversationScreen() {
   // Group calls ring every member but only the first to answer connects and
   // the rest keep ringing, so the call buttons are hidden for groups until
   // that's fixed properly.
-  const canCall = !isAssistantChat && conversation?.kind !== "group";
+  const canCall =
+    !isAssistantChat && conversation?.kind !== "group" && !conversation?.otherIsDeleted;
 
   // Secret Chat is opt-in, turned on only by an explicit user action (the
   // lock toggle in the chat header), never automatically. This used to
@@ -363,7 +421,12 @@ export default function ConversationScreen() {
   // Blocking is bidirectional server-side, so once either side blocks, every
   // send fails at RLS. Previously the composer stayed fully enabled and the
   // message just turned into a red "failed" bubble with no explanation.
-  const composerDisabled = isBlocked;
+  // A deleted account (conversation.otherIsDeleted — 063_soft_delete_account.sql)
+  // is the same shape of dead end, enforced server-side by
+  // enforce_ban_on_message: the old conversation history stays visible, new
+  // messages just fail, so this disables the composer the same way blocking
+  // does rather than letting the user hit that error.
+  const composerDisabled = isBlocked || !!conversation?.otherIsDeleted;
 
   function handleBlockToggle() {
     if (!user?.id || !conversation?.otherUserId) return;
@@ -714,6 +777,24 @@ export default function ConversationScreen() {
     setMessageSheetTarget(message);
   }, []);
 
+  // Chat-wide list of photos/videos, newest-first (matches `messages`),
+  // so the full-screen viewer can page between every visual message in
+  // this conversation, not just the one that was tapped.
+  const mediaItems = useMemo<MediaViewerItem[]>(
+    () =>
+      messages
+        .filter(
+          (m): m is ChatMessage & { media_url: string } =>
+          (m.kind === "image" || m.kind === "video") && !!m.media_url
+        )
+        .map((m) => ({ id: m.id, path: m.media_url, kind: m.kind as "image" | "video" })),
+    [messages]
+  );
+  const [viewerMessageId, setViewerMessageId] = useState<string | null>(null);
+  const handleOpenMedia = useCallback((messageId: string) => {
+    setViewerMessageId(messageId);
+  }, []);
+
   // App Store Guideline 1.2 requires a way to report offensive content in
   // any app with user-generated content. Snapshots the body because the
   // message may be deleted before the report is reviewed.
@@ -870,9 +951,11 @@ export default function ConversationScreen() {
         </Pressable>
         <Pressable
           style={styles.headerIdentity}
-          disabled={!conversation?.otherUserId || isAssistantChat}
+          disabled={(conversation?.kind !== "group" && !conversation?.otherUserId) || isAssistantChat}
           onPress={() => {
-            if (conversation?.otherUserId) {
+            if (conversation?.kind === "group") {
+              router.push({ pathname: "/group-info" as never, params: { conversationId: id } });
+            } else if (conversation?.otherUserId) {
               router.push({
                 pathname: "/user-profile" as never,
                 params: { userId: conversation.otherUserId, conversationId: id },
@@ -880,7 +963,7 @@ export default function ConversationScreen() {
             }
           }}
           accessibilityRole="button"
-          accessibilityLabel={`View ${title}'s profile`}
+          accessibilityLabel={conversation?.kind === "group" ? `${title} group info` : `View ${title}'s profile`}
         >
           <Avatar name={title} uri={conversation?.avatarUrl ?? null} size={38} />
           <View style={styles.headerText}>
@@ -1035,7 +1118,7 @@ export default function ConversationScreen() {
             initialNumToRender={14}
             updateCellsBatchingPeriod={40}
             removeClippedSubviews
-            renderItem={({ item: row }) => {
+            renderItem={({ item: row, index }) => {
               if (row.type === "separator") {
                 return (
                   <View style={styles.dateSeparator} pointerEvents="none">
@@ -1072,15 +1155,32 @@ export default function ConversationScreen() {
                 ? { senderName: participantNames[item.forwarded_from_sender_id] ?? "Someone" }
                 : null;
 
+              // The list is inverted, so rows[index + 1] is the message just
+              // above this one. Name the sender on the first message of each
+              // run, the way Telegram does, rather than on every bubble.
+              const isOwn = item.sender_id === user?.id;
+              const above = rows[index + 1];
+              const startsRun =
+                !above ||
+                above.type !== "message" ||
+                above.message.kind === "system" ||
+                above.message.sender_id !== item.sender_id;
+              const senderName =
+                conversation?.kind === "group" && !isOwn && item.kind !== "system" && startsRun
+                  ? (participantNames[item.sender_id] ?? "Former member")
+                  : null;
+
               return (
                 <MessageBubble
                   message={item}
-                  isOwn={item.sender_id === user?.id}
-                  onLongPress={handleMessageLongPress}
+                  isOwn={isOwn}
+                  senderName={senderName}
+                  onLongPress={item.kind === "system" ? undefined : handleMessageLongPress}
                   replyPreview={replyPreview}
                   forwardedFrom={forwardedFrom}
                   peerLastReadAt={peerLastReadAt}
                   onRetryDecryption={retryDecryption}
+                  onOpenMedia={handleOpenMedia}
                 />
               );
             }}
@@ -1134,6 +1234,48 @@ export default function ConversationScreen() {
             { backgroundColor: theme.surface, borderTopColor: theme.border },
           ]}
         >
+          {voice.isRecording || voiceSending ? (
+            <>
+              <Pressable
+                onPress={() => void voice.cancel()}
+                disabled={voiceSending}
+                accessibilityRole="button"
+                accessibilityLabel="Discard voice message"
+                hitSlop={8}
+                style={styles.attach}
+              >
+                <Ionicons name="trash-outline" size={24} color={theme.danger} />
+              </Pressable>
+              <View style={[styles.recordingBar, { backgroundColor: theme.surfaceElevated }]}>
+                <View style={[styles.recordingDot, { backgroundColor: theme.danger }]} />
+                <Text style={[styles.recordingTime, { color: theme.text }]}>
+                  {`${Math.floor(voice.durationMs / 60000)}:${String(Math.floor(voice.durationMs / 1000) % 60).padStart(2, "0")}`}
+                </Text>
+                <View style={[styles.recordingTrack, { backgroundColor: theme.border }]}>
+                  <View
+                    style={[
+                      styles.recordingLevel,
+                      { width: `${Math.round(8 + voice.level * 92)}%`, backgroundColor: theme.accent },
+                    ]}
+                  />
+                </View>
+              </View>
+              <Pressable
+                onPress={() => void finishVoice()}
+                disabled={voiceSending}
+                accessibilityRole="button"
+                accessibilityLabel="Send voice message"
+                style={({ pressed }) => [styles.send, { backgroundColor: theme.accent, opacity: pressed ? 0.8 : 1 }]}
+              >
+                {voiceSending ? (
+                  <ActivityIndicator color="#FFFFFF" />
+                ) : (
+                  <Ionicons name="arrow-up" size={20} color="#FFFFFF" />
+                )}
+              </Pressable>
+            </>
+          ) : (
+            <>
           <Pressable
             onPress={() => setAttachSheetOpen(true)}
             disabled={attaching || composerDisabled}
@@ -1156,7 +1298,13 @@ export default function ConversationScreen() {
               setDraft(text);
               notifyTyping();
             }}
-            placeholder={composerDisabled ? "You blocked this person" : "Message"}
+            placeholder={
+              conversation?.otherIsDeleted
+                ? "This account has been deleted"
+                : composerDisabled
+                  ? "You blocked this person"
+                  : "Message"
+            }
             placeholderTextColor={theme.textSecondary}
             style={[
               styles.input,
@@ -1165,6 +1313,19 @@ export default function ConversationScreen() {
             multiline
             accessibilityLabel="Message text"
           />
+          {!draft.trim() && !composerDisabled && !isAssistantChat ? (
+            <Pressable
+              onPress={() => void startVoice()}
+              accessibilityRole="button"
+              accessibilityLabel="Record voice message"
+              style={({ pressed }) => [
+                styles.send,
+                { backgroundColor: theme.surfaceElevated, opacity: pressed ? 0.8 : 1 },
+              ]}
+            >
+              <Ionicons name="mic-outline" size={22} color={theme.accent} />
+            </Pressable>
+          ) : (
           <Pressable
             onPress={handleSend}
             disabled={!draft.trim() || sending || composerDisabled}
@@ -1185,8 +1346,23 @@ export default function ConversationScreen() {
               color={draft.trim() ? "#FFFFFF" : theme.textSecondary}
             />
           </Pressable>
+          )}
+            </>
+          )}
         </View>
       </KeyboardAvoidingView>
+
+      {viewerMessageId ? (
+        <MediaViewer
+          items={mediaItems}
+          initialIndex={Math.max(
+            0,
+            mediaItems.findIndex((m) => m.id === viewerMessageId)
+          )}
+          conversationId={id ?? ""}
+          onClose={() => setViewerMessageId(null)}
+        />
+      ) : null}
 
       <ActionSheet
         visible={!!messageSheetTarget}
@@ -1286,6 +1462,19 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   attach: { width: 40, height: 40, alignItems: "center", justifyContent: "center" },
+  recordingBar: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+    minHeight: 40,
+    borderRadius: radius.lg,
+    paddingHorizontal: spacing.md,
+  },
+  recordingDot: { width: 10, height: 10, borderRadius: 5 },
+  recordingTime: { fontSize: 15, fontWeight: "600", fontVariant: ["tabular-nums"], minWidth: 42 },
+  recordingTrack: { flex: 1, height: 4, borderRadius: 2, overflow: "hidden" },
+  recordingLevel: { height: 4, borderRadius: 2 },
   headerAction: { marginLeft: spacing.md },
   replyBar: {
     flexDirection: "row",

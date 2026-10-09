@@ -5,6 +5,7 @@
 // same @gettelevo.space sender already verified there for auth email
 // (src/lib/supabase.ts's magic-link setup) and support-email-agent.
 import "@supabase/functions-js/edge-runtime.d.ts";
+import { renderEmail } from "./emailTemplate.ts";
 
 const FROM = "Televo <hello@gettelevo.space>";
 
@@ -55,9 +56,29 @@ Deno.serve(async (req) => {
       from: FROM,
       to: email,
       subject: "You're on the Televo beta list",
-      html: `<p>Hi,</p>
-<p>You're on the list for the Televo beta. We'll email this address the moment it's live on the App Store — no spam before then.</p>
-<p>— Televo</p>`,
+      html: renderEmail({
+        preheader: "We'll email you the moment Televo is live on the App Store.",
+        heading: "You're on the list.",
+        bodyHtml: `<p style="margin:0 0 14px;">Thanks for signing up for the Televo beta. We'll email this address the moment it's live on the App Store — nothing before then, no spam.</p>
+<p style="margin:0;">In the meantime, here's what you're waiting for:</p>`,
+        features: [
+          {
+            icon: "🔒",
+            title: "Secret Chats only you can read",
+            body: "Keys are generated on your phone and never touch our servers — not even we can read them.",
+          },
+          {
+            icon: "📞",
+            title: "Real calls, real WebRTC",
+            body: "Native voice & video, encrypted in transit, with CallKit so calls ring even when the app is closed.",
+          },
+          {
+            icon: "🚫",
+            title: "No ads, ever",
+            body: "Free for personal 1:1 communication, and we never sell a byte of your data. That's a promise, not a policy.",
+          },
+        ],
+      }),
     }),
   });
 
