@@ -11,6 +11,14 @@ export type ConversationHeader = {
   otherUserId: string | null;
   isEncrypted: boolean;
   selfDestructSeconds: number | null;
+  /** True once the other participant has deleted their account
+   * (profiles.is_deleted — see 063_soft_delete_account.sql). Their old
+   * messages stay in this conversation; the server already rejects new
+   * ones from either side via enforce_ban_on_message/enforce_ban_on_call,
+   * this just lets the UI stop offering the call/send controls proactively
+   * instead of letting the user hit that error. Always false for a group
+   * (no single "other participant" to check). */
+  otherIsDeleted: boolean;
 };
 
 /** Loads the header details for one conversation (title, avatar, member count). */
@@ -34,6 +42,7 @@ export function useConversation(conversationId: string | undefined, userId: stri
         id,
         kind,
         title,
+        avatar_url,
         is_encrypted,
         self_destruct_seconds,
         conversation_participants ( user_id )
@@ -63,8 +72,8 @@ export function useConversation(conversationId: string | undefined, userId: stri
         id: data.id,
         kind: "group",
         title: data.title ?? "Group",
-        subtitle: `${participants.length} members`,
-        avatarUrl: null,
+        subtitle: `${participants.length} ${participants.length === 1 ? "member" : "members"}`,
+        avatarUrl: data.avatar_url ?? null,
         otherUserId: null,
         // Was hardcoded false regardless of the server's actual value —
         // startEncryptedChat supports groups (wraps the session key to every
@@ -77,6 +86,7 @@ export function useConversation(conversationId: string | undefined, userId: stri
         // server-side flag.
         isEncrypted: data.is_encrypted,
         selfDestructSeconds: data.self_destruct_seconds,
+        otherIsDeleted: false,
       });
       setLoading(false);
       return;
@@ -94,6 +104,7 @@ export function useConversation(conversationId: string | undefined, userId: stri
         otherUserId: null,
         isEncrypted: data.is_encrypted,
         selfDestructSeconds: data.self_destruct_seconds,
+        otherIsDeleted: false,
       });
       setLoading(false);
       return;
@@ -124,14 +135,27 @@ export function useConversation(conversationId: string | undefined, userId: stri
       otherUserId: other.user_id,
       isEncrypted: data.is_encrypted,
       selfDestructSeconds: data.self_destruct_seconds,
+      otherIsDeleted: false,
     });
     setLoading(false);
 
-    const { data: profile } = await supabase
+    const { data: profile, error: profileError } = await supabase
       .from("profiles")
-      .select("display_name, username, avatar_url")
+      .select("display_name, username, avatar_url, is_deleted")
       .eq("id", other.user_id)
       .single();
+
+    // This used to fail silently into the "Unknown" fallback below with zero
+    // trace — found live 2026-10-03 when a missing column-level GRANT (see
+    // 066_grant_is_deleted_select.sql) made this query reject outright
+    // ("permission denied for table profiles") and every direct chat's
+    // header read "Unknown" with no way to tell a permissions error apart
+    // from a profile that genuinely doesn't exist.
+    if (profileError) {
+      console.error("[useConversation] profile fetch failed:", profileError.message, {
+        otherUserId: other.user_id,
+      });
+    }
 
     // Fills in the real name/avatar once it arrives — a second, later render,
     // not a second thing the screen has to wait on before showing anything.
@@ -142,6 +166,7 @@ export function useConversation(conversationId: string | undefined, userId: stri
             title: profile?.display_name ?? "Unknown",
             subtitle: profile?.username ? `@${String(profile.username)}` : null,
             avatarUrl: profile?.avatar_url ?? null,
+            otherIsDeleted: profile?.is_deleted ?? false,
           }
         : current
     );

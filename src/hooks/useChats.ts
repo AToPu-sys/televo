@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { ASSISTANT_USER_ID } from "../lib/assistant";
 import { parseEnvelope } from "../lib/e2e";
+import { describeGroupEvent } from "../lib/groupEvents";
 import { supabase } from "../lib/supabase";
 import type { Database } from "../types/database";
 import { useE2ee } from "./useE2ee";
@@ -404,10 +405,16 @@ function previewFor(
       return "📷 Photo";
     case "video":
       return "🎬 Video";
+    case "document":
+      return "📄 Document";
+    case "voice":
+      return "🎤 Voice message";
     case "activity_share":
       return "Shared an activity";
     case "contact_share":
       return "Shared a contact";
+    case "system":
+      return describeGroupEvent(body);
     default:
       // Reached only for unencrypted conversations (encrypted ones are
       // decrypted above, before this runs) — but guard anyway so a raw

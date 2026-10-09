@@ -88,7 +88,7 @@ export default function NewGroupScreen() {
             value={title}
             onChangeText={setTitle}
             placeholder="Weekend plans"
-            maxLength={80}
+            maxLength={64}
           />
           <Text style={[styles.count, { color: theme.textSecondary }]}>
             {selected.length} {selected.length === 1 ? "member" : "members"} selected
