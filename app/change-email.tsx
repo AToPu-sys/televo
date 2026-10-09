@@ -14,22 +14,27 @@ import { SafeAreaView } from "react-native-safe-area-context";
 
 import { Button } from "../src/components/Button";
 import { TextField } from "../src/components/TextField";
-import { useAuth } from "../src/hooks/useAuth";
+import { useAuth, verifyCurrentPassword } from "../src/hooks/useAuth";
 import { useTheme } from "../src/hooks/useTheme";
 import { radius, spacing } from "../src/theme";
 
-/** Supabase's "Secure email change" (the project default) requires
- * confirming from BOTH the old and new addresses before the account's email
- * actually changes — updateUser() only starts that process. There is no
- * further step to take in-app: both confirmation links land back here as
- * `televo://` callbacks that useAuthDeepLinks (app/_layout.tsx) already
- * handles the same way it handles every other auth email link. */
+/** Supabase's "Secure email change" setting, if enabled on the project, would
+ * additionally confirm from the OLD address before the change takes effect —
+ * but that's a dashboard toggle this app can't verify at runtime, so it isn't
+ * relied on as the only safeguard. The password check below is the
+ * guaranteed one: it's the defense against a hijacked *session* (stolen
+ * token, unlocked phone) being used to quietly move the account to an
+ * attacker-controlled address — proving the current password is known is
+ * required before updateUser() is even called. See verifyCurrentPassword in
+ * useAuth.tsx. Confirmation links still land back here as `televo://`
+ * callbacks that useAuthDeepLinks (app/_layout.tsx) already handles. */
 export default function ChangeEmailScreen() {
   const { theme } = useTheme();
   const router = useRouter();
   const { user, changeEmail } = useAuth();
 
   const [newEmail, setNewEmail] = useState("");
+  const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [sent, setSent] = useState(false);
@@ -45,9 +50,19 @@ export default function ChangeEmailScreen() {
       setError("That's already your current email address.");
       return;
     }
+    if (!password) {
+      setError("Enter your current password to confirm it's really you.");
+      return;
+    }
 
     setBusy(true);
     try {
+      if (!user?.email) throw new Error("Couldn't verify your account.");
+      const passwordOk = await verifyCurrentPassword(user.email, password);
+      if (!passwordOk) {
+        setError("That password is incorrect.");
+        return;
+      }
       await changeEmail(trimmed);
       setSent(true);
     } catch (caught) {
@@ -95,6 +110,15 @@ export default function ChangeEmailScreen() {
                 autoCapitalize="none"
                 autoComplete="email"
                 placeholder="you@example.com"
+              />
+              <TextField
+                label="Current password"
+                value={password}
+                onChangeText={setPassword}
+                secureTextEntry
+                autoCapitalize="none"
+                autoComplete="current-password"
+                placeholder="Confirm it's you"
               />
               {error ? <Text style={[styles.error, { color: theme.danger }]}>{error}</Text> : null}
               <Button title="Send confirmation" onPress={handleSubmit} loading={busy} />

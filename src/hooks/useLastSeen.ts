@@ -13,6 +13,14 @@ export type PresenceInfo = { label: string | null };
  * that hiding last_seen_at from being read at all would need RLS — this
  * profiles column is otherwise publicly readable like the rest of the
  * profile, so reciprocity is a UI-level courtesy, not a security boundary).
+ *
+ * The target's timestamp comes from last_seen_for() (064_frozen_last_seen_when_blocked.sql),
+ * not a raw profiles select: that RPC freezes the value at whenever a block
+ * between the two of them happened, in either direction, so blocking someone
+ * shows "was here a while ago" instead of their live presence continuing to
+ * update — the same way Telegram reads once a block exists, distinct from a
+ * DELETED account (profiles.display_name itself becomes "Deleted Account"
+ * for those, with their real last_seen_at left untouched here).
  */
 export function useLastSeen(viewerId: string | undefined, targetUserId: string | null | undefined) {
   const [presence, setPresence] = useState<PresenceInfo>({ label: null });
@@ -49,17 +57,27 @@ export function useLastSeen(viewerId: string | undefined, targetUserId: string |
 
       const { data: target } = await supabase
         .from("profiles")
-        .select("last_seen_at, show_last_seen")
+        .select("show_last_seen")
         .eq("id", targetUserId)
         .single();
 
       if (!active) return;
-      if (!target || !target.show_last_seen || !target.last_seen_at) {
+      if (!target || !target.show_last_seen) {
         setPresence({ label: null });
         return;
       }
 
-      setPresence({ label: formatPresence(target.last_seen_at) });
+      const { data: lastSeenAt } = await supabase.rpc("last_seen_for", {
+        p_target_user_id: targetUserId,
+      });
+
+      if (!active) return;
+      if (!lastSeenAt) {
+        setPresence({ label: null });
+        return;
+      }
+
+      setPresence({ label: formatPresence(lastSeenAt) });
     })();
 
     return () => {

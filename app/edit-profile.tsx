@@ -12,6 +12,12 @@ import { useAuth } from "../src/hooks/useAuth";
 import { useTheme } from "../src/hooks/useTheme";
 import { uploadAvatar } from "../src/lib/media";
 import { supabase } from "../src/lib/supabase";
+import {
+  checkUsername,
+  quickUsernameProblem,
+  usernameErrorFromSave,
+  usernameProblemMessage,
+} from "../src/lib/username";
 import { spacing } from "../src/theme";
 
 /**
@@ -26,6 +32,11 @@ export default function EditProfileScreen() {
 
   const [displayName, setDisplayName] = useState("");
   const [bio, setBio] = useState("");
+  const [username, setUsername] = useState("");
+  const [originalUsername, setOriginalUsername] = useState("");
+  const [usernameStatus, setUsernameStatus] = useState<
+    { kind: "idle" } | { kind: "checking" } | { kind: "ok" } | { kind: "problem"; message: string }
+  >({ kind: "idle" });
   const [avatarUrl, setAvatarUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -38,7 +49,7 @@ export default function EditProfileScreen() {
 
     supabase
       .from("profiles")
-      .select("display_name, bio, avatar_url")
+      .select("display_name, bio, avatar_url, username")
       .eq("id", user.id)
       .single()
       .then(({ data }) => {
@@ -46,6 +57,8 @@ export default function EditProfileScreen() {
         setDisplayName(data.display_name ?? "");
         setBio(data.bio ?? "");
         setAvatarUrl(data.avatar_url);
+        setUsername(String(data.username ?? ""));
+        setOriginalUsername(String(data.username ?? ""));
         setLoading(false);
       });
 
@@ -53,6 +66,36 @@ export default function EditProfileScreen() {
       active = false;
     };
   }, [user?.id]);
+
+  const usernameChanged = username.trim().toLowerCase() !== originalUsername.toLowerCase();
+
+  // Live verdict while typing, debounced so each keystroke isn't a round trip.
+  // An unchanged username is never re-checked: an existing account may predate
+  // the current rules (e.g. a 3-character name) and is allowed to keep it.
+  useEffect(() => {
+    if (!usernameChanged) {
+      setUsernameStatus({ kind: "idle" });
+      return;
+    }
+    const quick = quickUsernameProblem(username);
+    if (quick) {
+      setUsernameStatus({ kind: "problem", message: usernameProblemMessage(quick) });
+      return;
+    }
+    setUsernameStatus({ kind: "checking" });
+    let active = true;
+    const timer = setTimeout(async () => {
+      const problem = await checkUsername(username);
+      if (!active) return;
+      setUsernameStatus(
+        problem ? { kind: "problem", message: usernameProblemMessage(problem) } : { kind: "ok" }
+      );
+    }, 400);
+    return () => {
+      active = false;
+      clearTimeout(timer);
+    };
+  }, [username, usernameChanged]);
 
   async function handlePickAvatar() {
     if (!user?.id || uploadingAvatar) return;
@@ -87,6 +130,32 @@ export default function EditProfileScreen() {
     }
   }
 
+  async function handleRemoveAvatar() {
+    if (!user?.id || uploadingAvatar || !avatarUrl) return;
+    Alert.alert("Remove photo?", "Your profile will show your initials instead.", [
+      { text: "Cancel", style: "cancel" },
+      {
+        text: "Remove",
+        style: "destructive",
+        onPress: async () => {
+          setUploadingAvatar(true);
+          try {
+            const { error: updateError } = await supabase
+              .from("profiles")
+              .update({ avatar_url: null })
+              .eq("id", user.id);
+            if (updateError) throw updateError;
+            setAvatarUrl(null);
+          } catch (caught) {
+            Alert.alert("Couldn't remove photo", caught instanceof Error ? caught.message : "Please try again.");
+          } finally {
+            setUploadingAvatar(false);
+          }
+        },
+      },
+    ]);
+  }
+
   async function handleSave() {
     if (!user?.id) return;
     setError(null);
@@ -99,11 +168,29 @@ export default function EditProfileScreen() {
 
     setSaving(true);
     try {
-      const { error: updateError } = await supabase
-        .from("profiles")
-        .update({ display_name: trimmedName, bio: bio.trim() || null })
-        .eq("id", user.id);
-      if (updateError) throw updateError;
+      const update: { display_name: string; bio: string | null; username?: string } = {
+        display_name: trimmedName,
+        bio: bio.trim() || null,
+      };
+      if (usernameChanged) {
+        const problem = await checkUsername(username);
+        if (problem) {
+          setUsernameStatus({ kind: "problem", message: usernameProblemMessage(problem) });
+          return;
+        }
+        update.username = username.trim();
+      }
+      const { error: updateError } = await supabase.from("profiles").update(update).eq("id", user.id);
+      if (updateError) {
+        // The trigger is the final word (a name can be taken between the live
+        // check and this save) — show its verdict on the username field.
+        const usernameMessage = usernameErrorFromSave(updateError.message);
+        if (usernameMessage) {
+          setUsernameStatus({ kind: "problem", message: usernameMessage });
+          return;
+        }
+        throw updateError;
+      }
       router.back();
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Couldn't save your profile.");
@@ -138,6 +225,17 @@ export default function EditProfileScreen() {
             </Text>
           </Pressable>
 
+          {avatarUrl && !uploadingAvatar ? (
+            <Pressable
+              onPress={handleRemoveAvatar}
+              accessibilityRole="button"
+              accessibilityLabel="Remove profile picture"
+              style={styles.removeAvatarButton}
+            >
+              <Text style={[styles.removeAvatarText, { color: theme.danger }]}>Remove photo</Text>
+            </Pressable>
+          ) : null}
+
           <TextField
             label="Name"
             value={displayName}
@@ -145,6 +243,24 @@ export default function EditProfileScreen() {
             placeholder="Your name"
             maxLength={50}
             error={error}
+          />
+
+          <TextField
+            label="Username"
+            value={username}
+            onChangeText={(text) => setUsername(text.replace(/\s/g, ""))}
+            placeholder="username"
+            autoCapitalize="none"
+            autoCorrect={false}
+            maxLength={24}
+            error={usernameStatus.kind === "problem" ? usernameStatus.message : null}
+            hint={
+              usernameStatus.kind === "checking"
+                ? "Checking…"
+                : usernameStatus.kind === "ok"
+                  ? `@${username.trim()} is available.`
+                  : "People can find you by this. 4–24 characters: a–z, 0–9, _ and ."
+            }
           />
 
           <TextField
@@ -157,7 +273,12 @@ export default function EditProfileScreen() {
             maxLength={200}
           />
 
-          <Button title="Save" onPress={handleSave} loading={saving} />
+          <Button
+            title="Save"
+            onPress={handleSave}
+            loading={saving}
+            disabled={usernameStatus.kind === "problem" || usernameStatus.kind === "checking"}
+          />
         </ScrollView>
       )}
     </SafeAreaView>
@@ -180,4 +301,6 @@ const styles = StyleSheet.create({
   content: { padding: spacing.xl, gap: spacing.lg },
   avatarBlock: { alignItems: "center", gap: spacing.sm },
   avatarAction: { fontSize: 15, fontWeight: "600" },
+  removeAvatarButton: { alignItems: "center", marginTop: -spacing.sm },
+  removeAvatarText: { fontSize: 14, fontWeight: "500" },
 });

@@ -1,6 +1,6 @@
 import { Ionicons } from "@expo/vector-icons";
 import { useEffect, useState } from "react";
-import { Modal, Pressable, StyleSheet, Text, View } from "react-native";
+import { Pressable, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
 import { useAppLock } from "../hooks/useAppLock";
@@ -90,19 +90,24 @@ export function PasscodeScreen() {
     setError(false);
   }
 
-  // A native Modal, not a sibling View: rendered inline it was just another
-  // element in the layout tree with flex:1, so it only covered the space its
-  // parent happened to give it — the status bar area, and anything drawn
-  // outside the navigator, stayed visible behind it. A lock screen that
-  // doesn't cover the whole display isn't a lock screen. Modal puts it in
-  // its own window, edge to edge, above everything including the call
-  // overlay.
+  // 2026-09-28: used to wrap itself in its own <Modal> here — needed back
+  // when _layout.tsx rendered PasscodeScreen as a plain inline sibling of
+  // <Stack> (flex:1 in the same implicit column only covers the space its
+  // parent happens to give it, not the whole display). _layout.tsx now
+  // renders MfaChallengeScreen/PasscodeScreen inside ONE persistent outer
+  // <Modal> of its own, for the same full-screen-coverage reason. Keeping a
+  // SECOND <Modal> here nested it inside that one — two independent native
+  // presentation windows, one inside the other — which is what caused the
+  // app to hang solid on a bare black screen after Face ID/passcode unlock
+  // on a real device (no crash log, because nothing threw; the two native
+  // presentations just deadlocked against each other). A plain View is
+  // enough now that the outer Modal already guarantees full-screen coverage.
   return (
-    <Modal visible animationType="fade" statusBarTranslucent presentationStyle="overFullScreen" transparent>
+    <>
       {/* The background sits on the outer View, not the SafeAreaView, so the
           colour reaches under the notch and home indicator instead of
           leaving unpainted bands there. */}
-      <View style={[styles.container, { backgroundColor: theme.background }]}>
+      <View style={[StyleSheet.absoluteFill, styles.container, { backgroundColor: theme.background }]}>
         <SafeAreaView style={styles.container}>
           <View style={styles.content}>
             <Ionicons name="lock-closed" size={40} color={theme.accent} />
@@ -195,7 +200,7 @@ export function PasscodeScreen() {
           </View>
         </SafeAreaView>
       </View>
-    </Modal>
+    </>
   );
 }
 

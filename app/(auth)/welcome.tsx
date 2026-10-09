@@ -28,6 +28,11 @@ export default function WelcomeScreen() {
 
       <View style={styles.actions}>
         <Button title="Continue with Email" onPress={() => router.push("/(auth)/sign-in")} />
+        <Button
+          title="Log in with QR Code"
+          variant="ghost"
+          onPress={() => router.push("/(auth)/qr-sign-in")}
+        />
       </View>
     </SafeAreaView>
   );

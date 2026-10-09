@@ -1,0 +1,15 @@
+-- Bug found live 2026-10-03: 063_soft_delete_account.sql added
+-- profiles.is_deleted, and useConversation.ts's profile select started
+-- asking for it the same day — but 013_lock_down_phone_column.sql locked
+-- public.profiles down to a column-level SELECT allowlist years earlier
+-- (table-level SELECT is revoked outright; only specific columns are
+-- re-granted to `authenticated`). is_deleted was never added to that list.
+--
+-- The failure mode was NOT "is_deleted comes back null" — a single missing
+-- column in a `select a, b, c` makes POSTGRES REJECT THE WHOLE QUERY with
+-- "permission denied for table profiles" (PostgREST exposes this as a plain
+-- query failure, no partial result). That took down every direct chat's
+-- header in the app: the profile fetch failed outright, so
+-- useConversation's catch-all fell back to "Unknown" for every single
+-- conversation, not just ones involving a deleted account.
+grant select (is_deleted) on public.profiles to authenticated;

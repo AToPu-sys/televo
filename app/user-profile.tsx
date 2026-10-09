@@ -16,11 +16,12 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { Avatar } from "../src/components/Avatar";
 import { Button } from "../src/components/Button";
 import { useAuth } from "../src/hooks/useAuth";
+import { TelevoIdRow } from "../src/components/TelevoIdRow";
 import { blockUser, isUserBlocked, unblockUser } from "../src/hooks/useBlockedUsers";
 import { useE2ee } from "../src/hooks/useE2ee";
 import { useLastSeen } from "../src/hooks/useLastSeen";
 import { useTheme } from "../src/hooks/useTheme";
-import { fetchDecryptedMediaFile, parseMediaRef, signedChatMediaUrl } from "../src/lib/media";
+import { cachedMediaUri } from "../src/lib/mediaCache";
 import { supabase } from "../src/lib/supabase";
 import { spacing } from "../src/theme";
 import type { Database } from "../src/types/database";
@@ -237,6 +238,8 @@ export default function UserProfileScreen() {
             </View>
           ) : null}
 
+          {userId ? <TelevoIdRow userId={userId} /> : null}
+
           {conversationId && (media.length > 0 || documents.length > 0 || calls.length > 0) ? (
             <View style={[styles.section, { borderTopColor: theme.border }]}>
               <View style={styles.tabRow}>
@@ -376,12 +379,9 @@ function MediaThumbnail({
 
   useEffect(() => {
     let active = true;
-    const { nonce } = parseMediaRef(item.media_url);
-    const load = nonce
-      ? fetchDecryptedMediaFile(item.media_url, (ciphertext, mediaNonce) =>
-          decryptBytesForConversation(conversationId, ciphertext, mediaNonce)
-        )
-      : signedChatMediaUrl(item.media_url);
+    const load = cachedMediaUri(item.media_url, (ciphertext, mediaNonce) =>
+      decryptBytesForConversation(conversationId, ciphertext, mediaNonce)
+    );
 
     Promise.resolve(load)
       .then((resolved) => {

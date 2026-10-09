@@ -157,6 +157,19 @@ export default function PrivacySecurityScreen() {
           <Ionicons name="chevron-forward" size={18} color={theme.textSecondary} />
         </Pressable>
 
+        <Pressable
+          onPress={() => router.push("/devices" as never)}
+          accessibilityRole="button"
+          accessibilityLabel="Devices"
+          style={[styles.section, styles.row, { backgroundColor: theme.surfaceElevated }]}
+        >
+          <View style={styles.rowLabel}>
+            <Ionicons name="phone-portrait-outline" size={20} color={theme.accent} />
+            <Text style={[styles.rowText, { color: theme.text }]}>Devices</Text>
+          </View>
+          <Ionicons name="chevron-forward" size={18} color={theme.textSecondary} />
+        </Pressable>
+
         <Text style={[styles.groupLabel, { color: theme.textSecondary }]}>PRIVACY</Text>
         <Pressable
           onPress={() => router.push("/privacy-last-seen")}

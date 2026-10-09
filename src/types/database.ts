@@ -421,6 +421,48 @@ export type Database = {
         }
         Relationships: []
       }
+      client_crash_reports: {
+        Row: {
+          app_version: string | null
+          build_number: string | null
+          id: number
+          is_fatal: boolean
+          message: string
+          occurred_at: string
+          platform: string
+          reported_at: string
+          screen: string | null
+          stack: string | null
+          user_id: string | null
+        }
+        Insert: {
+          app_version?: string | null
+          build_number?: string | null
+          id?: never
+          is_fatal: boolean
+          message: string
+          occurred_at: string
+          platform: string
+          reported_at?: string
+          screen?: string | null
+          stack?: string | null
+          user_id?: string | null
+        }
+        Update: {
+          app_version?: string | null
+          build_number?: string | null
+          id?: never
+          is_fatal?: boolean
+          message?: string
+          occurred_at?: string
+          platform?: string
+          reported_at?: string
+          screen?: string | null
+          stack?: string | null
+          user_id?: string | null
+        }
+        Relationships: []
+      }
       content_reports: {
         Row: {
           conversation_id: string | null
@@ -509,8 +551,10 @@ export type Database = {
       }
       conversations: {
         Row: {
+          avatar_url: string | null
           created_at: string
           created_by: string
+          description: string | null
           id: string
           is_encrypted: boolean
           kind: Database["public"]["Enums"]["conversation_kind"]
@@ -519,8 +563,10 @@ export type Database = {
           updated_at: string
         }
         Insert: {
+          avatar_url?: string | null
           created_at?: string
           created_by: string
+          description?: string | null
           id?: string
           is_encrypted?: boolean
           kind: Database["public"]["Enums"]["conversation_kind"]
@@ -529,8 +575,10 @@ export type Database = {
           updated_at?: string
         }
         Update: {
+          avatar_url?: string | null
           created_at?: string
           created_by?: string
+          description?: string | null
           id?: string
           is_encrypted?: boolean
           kind?: Database["public"]["Enums"]["conversation_kind"]
@@ -648,11 +696,13 @@ export type Database = {
           forwarded_from_sender_id: string | null
           id: string
           kind: Database["public"]["Enums"]["message_kind"]
+          media_duration_ms: number | null
           media_url: string | null
           reply_to_id: string | null
           sender_id: string
           shared_activity_id: string | null
           shared_profile_id: string | null
+          waveform: string | null
         }
         Insert: {
           body?: string | null
@@ -666,11 +716,13 @@ export type Database = {
           forwarded_from_sender_id?: string | null
           id?: string
           kind?: Database["public"]["Enums"]["message_kind"]
+          media_duration_ms?: number | null
           media_url?: string | null
           reply_to_id?: string | null
           sender_id: string
           shared_activity_id?: string | null
           shared_profile_id?: string | null
+          waveform?: string | null
         }
         Update: {
           body?: string | null
@@ -684,11 +736,13 @@ export type Database = {
           forwarded_from_sender_id?: string | null
           id?: string
           kind?: Database["public"]["Enums"]["message_kind"]
+          media_duration_ms?: number | null
           media_url?: string | null
           reply_to_id?: string | null
           sender_id?: string
           shared_activity_id?: string | null
           shared_profile_id?: string | null
+          waveform?: string | null
         }
         Relationships: [
           {
@@ -842,8 +896,11 @@ export type Database = {
           e2e_kyber_public_key: string | null
           e2e_public_key: string | null
           id: string
+          is_deleted: boolean
           language: string
           last_seen_at: string | null
+          notify_calls: boolean
+          notify_messages: boolean
           onboarding_completed_at: string | null
           phone: string | null
           show_last_seen: boolean
@@ -862,8 +919,11 @@ export type Database = {
           e2e_kyber_public_key?: string | null
           e2e_public_key?: string | null
           id: string
+          is_deleted?: boolean
           language?: string
           last_seen_at?: string | null
+          notify_calls?: boolean
+          notify_messages?: boolean
           onboarding_completed_at?: string | null
           phone?: string | null
           show_last_seen?: boolean
@@ -882,8 +942,11 @@ export type Database = {
           e2e_kyber_public_key?: string | null
           e2e_public_key?: string | null
           id?: string
+          is_deleted?: boolean
           language?: string
           last_seen_at?: string | null
+          notify_calls?: boolean
+          notify_messages?: boolean
           onboarding_completed_at?: string | null
           phone?: string | null
           show_last_seen?: boolean
@@ -898,24 +961,54 @@ export type Database = {
       push_tokens: {
         Row: {
           created_at: string
+          device_model: string | null
           device_name: string | null
           expo_push_token: string
+          session_id: string | null
           updated_at: string
           user_id: string
         }
         Insert: {
           created_at?: string
+          device_model?: string | null
           device_name?: string | null
           expo_push_token: string
+          session_id?: string | null
           updated_at?: string
           user_id: string
         }
         Update: {
           created_at?: string
+          device_model?: string | null
           device_name?: string | null
           expo_push_token?: string
+          session_id?: string | null
           updated_at?: string
           user_id?: string
+        }
+        Relationships: []
+      }
+      qr_login_requests: {
+        Row: {
+          created_at: string
+          expires_at: string
+          id: string
+          scanned_by_user_id: string | null
+          status: string
+        }
+        Insert: {
+          created_at?: string
+          expires_at?: string
+          id?: string
+          scanned_by_user_id?: string | null
+          status?: string
+        }
+        Update: {
+          created_at?: string
+          expires_at?: string
+          id?: string
+          scanned_by_user_id?: string | null
+          status?: string
         }
         Relationships: []
       }
@@ -1006,6 +1099,78 @@ export type Database = {
         }
         Relationships: []
       }
+      session_locations: {
+        Row: {
+          city: string | null
+          country: string | null
+          created_at: string
+          session_id: string
+        }
+        Insert: {
+          city?: string | null
+          country?: string | null
+          created_at?: string
+          session_id: string
+        }
+        Update: {
+          city?: string | null
+          country?: string | null
+          created_at?: string
+          session_id?: string
+        }
+        Relationships: []
+      }
+      support_agent_queue: {
+        Row: {
+          approval_token: string
+          body: string
+          created_at: string
+          decided_at: string | null
+          from_email: string
+          id: string
+          intent: string
+          proposed_action: string
+          proposed_reply: string
+          received_at: string
+          status: string
+          subject: string | null
+          target_user_display_name: string | null
+          target_user_id: string | null
+        }
+        Insert: {
+          approval_token?: string
+          body: string
+          created_at?: string
+          decided_at?: string | null
+          from_email: string
+          id?: string
+          intent: string
+          proposed_action: string
+          proposed_reply: string
+          received_at?: string
+          status?: string
+          subject?: string | null
+          target_user_display_name?: string | null
+          target_user_id?: string | null
+        }
+        Update: {
+          approval_token?: string
+          body?: string
+          created_at?: string
+          decided_at?: string | null
+          from_email?: string
+          id?: string
+          intent?: string
+          proposed_action?: string
+          proposed_reply?: string
+          received_at?: string
+          status?: string
+          subject?: string | null
+          target_user_display_name?: string | null
+          target_user_id?: string | null
+        }
+        Relationships: []
+      }
       user_moderation: {
         Row: {
           banned_reason: string | null
@@ -1034,21 +1199,27 @@ export type Database = {
         Row: {
           apns_token: string
           created_at: string
+          device_model: string | null
           device_name: string | null
+          session_id: string | null
           updated_at: string
           user_id: string
         }
         Insert: {
           apns_token: string
           created_at?: string
+          device_model?: string | null
           device_name?: string | null
+          session_id?: string | null
           updated_at?: string
           user_id: string
         }
         Update: {
           apns_token?: string
           created_at?: string
+          device_model?: string | null
           device_name?: string | null
+          session_id?: string | null
           updated_at?: string
           user_id?: string
         }
@@ -1059,18 +1230,21 @@ export type Database = {
           created_at: string
           email: string
           id: string
+          launch_notified_at: string | null
           source: string | null
         }
         Insert: {
           created_at?: string
           email: string
           id?: string
+          launch_notified_at?: string | null
           source?: string | null
         }
         Update: {
           created_at?: string
           email?: string
           id?: string
+          launch_notified_at?: string | null
           source?: string | null
         }
         Relationships: []
@@ -1080,6 +1254,10 @@ export type Database = {
       [_ in never]: never
     }
     Functions: {
+      add_group_members: {
+        Args: { p_conversation: string; p_user_ids: string[] }
+        Returns: number
+      }
       any_session_key_exists: {
         Args: { p_conversation_id: string }
         Returns: boolean
@@ -1098,6 +1276,14 @@ export type Database = {
         Returns: boolean
       }
       call_id_from_topic: { Args: { topic: string }; Returns: string }
+      can_add_participant: {
+        Args: {
+          p_conversation: string
+          p_new_is_admin: boolean
+          p_new_user: string
+        }
+        Returns: boolean
+      }
       chat_list_summary: {
         Args: never
         Returns: {
@@ -1110,20 +1296,44 @@ export type Database = {
         }[]
       }
       check_apns_cert_expiry: { Args: never; Returns: undefined }
-      claim_expo_push_token: {
-        Args: { p_device_name?: string; p_token: string }
-        Returns: undefined
-      }
-      claim_voip_push_token: {
-        Args: { p_device_name?: string; p_token: string }
-        Returns: undefined
-      }
+      check_username: { Args: { p_username: string }; Returns: string }
+      claim_expo_push_token:
+        | {
+            Args: { p_device_name?: string; p_token: string }
+            Returns: undefined
+          }
+        | {
+            Args: {
+              p_device_model?: string
+              p_device_name: string
+              p_session_id: string
+              p_token: string
+            }
+            Returns: undefined
+          }
+      claim_voip_push_token:
+        | {
+            Args: { p_device_name?: string; p_token: string }
+            Returns: undefined
+          }
+        | {
+            Args: {
+              p_device_model?: string
+              p_device_name: string
+              p_session_id: string
+              p_token: string
+            }
+            Returns: undefined
+          }
+      confirm_qr_login: { Args: { p_request_id: string }; Returns: undefined }
       conversation_id_from_typing_topic: {
         Args: { topic: string }
         Returns: string
       }
+      create_qr_login_request: { Args: never; Returns: string }
       delete_expired_messages: { Args: never; Returns: number }
       delete_own_account: { Args: never; Returns: undefined }
+      deny_qr_login: { Args: { p_request_id: string }; Returns: undefined }
       deposit_session_key_if_missing: {
         Args: {
           p_conversation_id: string
@@ -1135,6 +1345,8 @@ export type Database = {
         }
         Returns: boolean
       }
+      display_name_of: { Args: { p_user: string }; Returns: string }
+      expire_old_qr_login_requests: { Args: never; Returns: undefined }
       find_user: {
         Args: { term: string }
         Returns: {
@@ -1145,6 +1357,7 @@ export type Database = {
           username: string
         }[]
       }
+      forget_device: { Args: { p_session_id: string }; Returns: undefined }
       get_activity_streak: { Args: { profile_id: string }; Returns: number }
       get_challenge_leaderboard: {
         Args: { challenge_id_input: string }
@@ -1223,10 +1436,33 @@ export type Database = {
         Args: { conversation: string; member: string }
         Returns: boolean
       }
+      is_group_admin: {
+        Args: { p_conversation: string; p_user: string }
+        Returns: boolean
+      }
       is_moderator: { Args: { uid: string }; Returns: boolean }
       is_username_available: {
         Args: { check_username: string }
         Returns: boolean
+      }
+      last_seen_for: { Args: { p_target_user_id: string }; Returns: string }
+      leave_group: { Args: { p_conversation: string }; Returns: undefined }
+      list_my_devices: {
+        Args: never
+        Returns: {
+          city: string
+          country: string
+          created_at: string
+          device_model: string
+          device_name: string
+          is_active: boolean
+          last_active_at: string
+          session_id: string
+        }[]
+      }
+      mark_qr_login_scanned: {
+        Args: { p_request_id: string }
+        Returns: undefined
       }
       match_contact_phones: {
         Args: { phone_hashes: string[] }
@@ -1256,7 +1492,15 @@ export type Database = {
           isSetofReturn: true
         }
       }
+      post_group_event: {
+        Args: { p_actor: string; p_conversation: string; p_event: Json }
+        Returns: undefined
+      }
       record_apns_cert_alerts: { Args: never; Returns: undefined }
+      remove_group_member: {
+        Args: { p_conversation: string; p_user: string }
+        Returns: undefined
+      }
       resolve_report: {
         Args: { outcome: string; report_id: string }
         Returns: undefined
@@ -1275,8 +1519,25 @@ export type Database = {
           status: string
         }[]
       }
+      revoke_device_session: {
+        Args: { p_session_id: string }
+        Returns: undefined
+      }
+      session_belongs_to_user: {
+        Args: { p_session_id: string; p_user_id: string }
+        Returns: boolean
+      }
       session_meets_mfa_requirement: { Args: never; Returns: boolean }
+      set_group_admin: {
+        Args: { p_conversation: string; p_make_admin: boolean; p_user: string }
+        Returns: undefined
+      }
       set_my_phone: { Args: { new_phone?: string }; Returns: undefined }
+      set_session_location: {
+        Args: { p_city: string; p_country: string; p_session_id: string }
+        Returns: undefined
+      }
+      username_problem: { Args: { p_username: string }; Returns: string }
     }
     Enums: {
       activity_type:
@@ -1325,6 +1586,8 @@ export type Database = {
         | "activity_share"
         | "contact_share"
         | "document"
+        | "voice"
+        | "system"
     }
     CompositeTypes: {
       [_ in never]: never
@@ -1502,6 +1765,8 @@ export const Constants = {
         "activity_share",
         "contact_share",
         "document",
+        "voice",
+        "system",
       ],
     },
   },

@@ -6,6 +6,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 
 import { Avatar } from "../../src/components/Avatar";
 import { Button } from "../../src/components/Button";
+import { TelevoIdRow } from "../../src/components/TelevoIdRow";
 import { TextField } from "../../src/components/TextField";
 import { useAuth } from "../../src/hooks/useAuth";
 import { useTheme } from "../../src/hooks/useTheme";
@@ -20,6 +21,8 @@ type Profile = {
   bio: string | null;
   avatar_url: string | null;
   phone: string | null;
+  notify_messages: boolean;
+  notify_calls: boolean;
 };
 
 export default function SettingsScreen() {
@@ -42,7 +45,7 @@ export default function SettingsScreen() {
       const [{ data }, { data: ownPhone }] = await Promise.all([
         supabase
           .from("profiles")
-          .select("display_name, username, bio, avatar_url")
+          .select("display_name, username, bio, avatar_url, notify_messages, notify_calls")
           .eq("id", user.id)
           .single(),
         supabase.rpc("get_my_phone"),
@@ -56,6 +59,8 @@ export default function SettingsScreen() {
         bio: data.bio,
         avatar_url: data.avatar_url,
         phone: ownPhone ?? null,
+        notify_messages: data.notify_messages,
+        notify_calls: data.notify_calls,
       });
       // Only seed the draft if the user hasn't started typing — otherwise a
       // slow profile fetch overwrites what they've already entered.
@@ -102,20 +107,40 @@ export default function SettingsScreen() {
     }
   }
 
+  async function handleToggleNotifyMessages(next: boolean) {
+    if (!user?.id) return;
+    setProfile((current) => (current ? { ...current, notify_messages: next } : current));
+    const { error } = await supabase.from("profiles").update({ notify_messages: next }).eq("id", user.id);
+    if (error) {
+      // Revert on failure — otherwise the switch shows a state the server
+      // never actually saved, and the preference silently doesn't take.
+      setProfile((current) => (current ? { ...current, notify_messages: !next } : current));
+    }
+  }
+
+  async function handleToggleNotifyCalls(next: boolean) {
+    if (!user?.id) return;
+    setProfile((current) => (current ? { ...current, notify_calls: next } : current));
+    const { error } = await supabase.from("profiles").update({ notify_calls: next }).eq("id", user.id);
+    if (error) {
+      setProfile((current) => (current ? { ...current, notify_calls: !next } : current));
+    }
+  }
+
   // App Store Guideline 5.1.1(v): an app that supports account creation must
   // let the user delete their account from within the app — not just
   // deactivate, and not by emailing support.
   function handleDeleteAccount() {
     Alert.alert(
       "Delete account?",
-      "This permanently deletes your account, profile, messages and media. It cannot be undone.",
+      "Your profile becomes \"Deleted Account\" and you can never sign in again. People you've chatted with keep their existing conversation history, but can no longer message or call you. This cannot be undone.",
       [
         { text: "Cancel", style: "cancel" },
         {
           text: "Delete",
           style: "destructive",
           onPress: () => {
-            Alert.alert("Are you sure?", "This is permanent. Everything will be erased.", [
+            Alert.alert("Are you sure?", "This is permanent and cannot be reversed.", [
               { text: "Cancel", style: "cancel" },
               {
                 text: "Delete forever",
@@ -205,6 +230,8 @@ export default function SettingsScreen() {
           </Text>
         </Pressable>
 
+        {user?.id ? <TelevoIdRow userId={user.id} /> : null}
+
         <View style={[styles.section, { backgroundColor: theme.surfaceElevated, paddingVertical: spacing.md }]}>
           <TextField
             label="Phone number"
@@ -259,6 +286,37 @@ export default function SettingsScreen() {
           </Pressable>
         </View>
 
+        <Text style={[styles.groupLabel, { color: theme.textSecondary }]}>NOTIFICATIONS</Text>
+        <View style={[styles.section, { backgroundColor: theme.surfaceElevated }]}>
+          <View style={styles.settingRow}>
+            <View style={styles.settingLabel}>
+              <Ionicons name="chatbubble-outline" size={20} color={theme.accent} />
+              <Text style={[styles.settingText, { color: theme.text }]}>Messages</Text>
+            </View>
+            <Switch
+              value={profile?.notify_messages ?? true}
+              onValueChange={handleToggleNotifyMessages}
+              trackColor={{ true: theme.accent, false: theme.border }}
+              accessibilityLabel="Message notifications"
+            />
+          </View>
+
+          <View style={[styles.divider, { backgroundColor: theme.border }]} />
+
+          <View style={styles.settingRow}>
+            <View style={styles.settingLabel}>
+              <Ionicons name="call-outline" size={20} color={theme.accent} />
+              <Text style={[styles.settingText, { color: theme.text }]}>Calls</Text>
+            </View>
+            <Switch
+              value={profile?.notify_calls ?? true}
+              onValueChange={handleToggleNotifyCalls}
+              trackColor={{ true: theme.accent, false: theme.border }}
+              accessibilityLabel="Call notifications"
+            />
+          </View>
+        </View>
+
         <Text style={[styles.groupLabel, { color: theme.textSecondary }]}>PRIVACY & SOCIAL</Text>
         <Pressable
           onPress={() => router.push("/find-friends")}
@@ -282,6 +340,19 @@ export default function SettingsScreen() {
           <View style={styles.settingLabel}>
             <Ionicons name="lock-closed-outline" size={20} color={theme.accent} />
             <Text style={[styles.settingText, { color: theme.text }]}>Privacy & Security</Text>
+          </View>
+          <Ionicons name="chevron-forward" size={18} color={theme.textSecondary} />
+        </Pressable>
+
+        <Pressable
+          onPress={() => router.push("/storage")}
+          accessibilityRole="button"
+          accessibilityLabel="Storage"
+          style={[styles.section, styles.settingRow, { backgroundColor: theme.surfaceElevated }]}
+        >
+          <View style={styles.settingLabel}>
+            <Ionicons name="folder-outline" size={20} color={theme.accent} />
+            <Text style={[styles.settingText, { color: theme.text }]}>Storage</Text>
           </View>
           <Ionicons name="chevron-forward" size={18} color={theme.textSecondary} />
         </Pressable>

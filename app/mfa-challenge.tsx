@@ -1,4 +1,5 @@
 import { Ionicons } from "@expo/vector-icons";
+import { useRouter } from "expo-router";
 import { useState } from "react";
 import { KeyboardAvoidingView, Platform, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
@@ -18,6 +19,7 @@ import { spacing } from "../src/theme";
 export default function MfaChallengeScreen() {
   const { theme } = useTheme();
   const { verifyMfaCode, signOut } = useAuth();
+  const router = useRouter();
 
   const [code, setCode] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -32,7 +34,18 @@ export default function MfaChallengeScreen() {
     setBusy(true);
     try {
       await verifyMfaCode(code);
-      // Root navigator re-renders once needsMfaChallenge clears.
+      // 2026-09-28: RootNavigator's own navigation effect only redirects to
+      // /(tabs)/chats when `session && inAuthGroup` — but `session` already
+      // existed at AAL1 before this screen ever showed (password sign-in
+      // opens a real session; MFA is a second gate on top of it), so the
+      // route was never inside the (auth) group while this Modal-rendered
+      // gate was covering the screen. That condition therefore never fires
+      // on MFA completion, and whatever route was mounted underneath the
+      // Modal before it closed (often nothing yet) is what becomes visible
+      // — a blank white screen instead of chats. Navigating explicitly here
+      // is the fix, not a workaround: this is the one moment that actually
+      // knows verification just succeeded.
+      router.replace("/(tabs)/chats");
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "That code didn't work.");
     } finally {
