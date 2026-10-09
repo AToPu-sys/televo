@@ -7,15 +7,12 @@ import { ActivityIndicator, Alert, Image, Pressable, StyleSheet, Text, View } fr
 
 import { useTheme } from "../hooks/useTheme";
 import type { ChatMessage } from "../hooks/useMessages";
-import {
-  fetchDecryptedBytes,
-  fetchDecryptedMediaFile,
-  mimeForPath,
-  parseMediaRef,
-  signedChatMediaUrl,
-} from "../lib/media";
+import { mimeForPath } from "../lib/media";
 import { useE2ee } from "../hooks/useE2ee";
 import { parseEnvelope } from "../lib/e2e";
+import { describeGroupEvent } from "../lib/groupEvents";
+import { cachedMediaUri } from "../lib/mediaCache";
+import { VoiceMessage } from "./VoiceMessage";
 import { radius, spacing } from "../theme";
 
 type ReplyPreview = { senderName: string; text: string };
@@ -37,6 +34,12 @@ type MessageBubbleProps = {
    * with no way back short of leaving and re-entering the chat, unlike a
    * failed photo/video, which already had tap-to-retry. */
   onRetryDecryption?: (messageId: string) => void;
+  /** Opens the full-screen photo/video viewer for this message. Absent
+   * kind/media_url means the bubble has no media and never calls it. */
+  onOpenMedia?: (messageId: string) => void;
+  /** Shown above an incoming message in a group, on the first message of a
+   * run from the same sender — otherwise nobody can tell who wrote what. */
+  senderName?: string | null;
 };
 
 function MessageBubbleComponent({
@@ -47,8 +50,20 @@ function MessageBubbleComponent({
   forwardedFrom,
   peerLastReadAt,
   onRetryDecryption,
+  onOpenMedia,
+  senderName,
 }: MessageBubbleProps) {
   const { theme } = useTheme();
+
+  if (message.kind === "system") {
+    return (
+      <View style={styles.systemRow}>
+        <Text style={[styles.systemText, { backgroundColor: theme.surfaceElevated, color: theme.textSecondary }]}>
+          {describeGroupEvent(message.body)}
+        </Text>
+      </View>
+    );
+  }
 
   const backgroundColor = isOwn ? theme.bubbleOut : theme.bubbleIn;
   const textColor = isOwn ? theme.bubbleOutText : theme.bubbleInText;
@@ -69,6 +84,12 @@ function MessageBubbleComponent({
           message.failed ? { borderColor: theme.danger, borderWidth: 1 } : null,
         ]}
       >
+        {senderName ? (
+          <Text style={[styles.senderName, { color: theme.accent }]} numberOfLines={1}>
+            {senderName}
+          </Text>
+        ) : null}
+
         {forwardedFrom ? (
           <Text style={[styles.forwardedLabel, { color: textColor }]}>
             Forwarded from {forwardedFrom.senderName}
@@ -91,6 +112,7 @@ function MessageBubbleComponent({
             path={message.media_url}
             pending={message.pending}
             conversationId={message.conversation_id}
+            onPress={onOpenMedia ? () => onOpenMedia(message.id) : undefined}
           />
         ) : null}
 
@@ -99,6 +121,7 @@ function MessageBubbleComponent({
             path={message.media_url}
             pending={message.pending}
             conversationId={message.conversation_id}
+            onPress={onOpenMedia ? () => onOpenMedia(message.id) : undefined}
           />
         ) : null}
 
@@ -109,6 +132,17 @@ function MessageBubbleComponent({
             sizeBytes={message.document_size_bytes}
             textColor={textColor}
             conversationId={message.conversation_id}
+          />
+        ) : null}
+
+        {message.kind === "voice" && message.media_url ? (
+          <VoiceMessage
+            mediaRef={message.media_url}
+            durationMs={message.media_duration_ms}
+            waveform={message.waveform}
+            conversationId={message.conversation_id}
+            color={textColor}
+            accent={theme.accent}
           />
         ) : null}
 
@@ -168,6 +202,9 @@ function MessageBubbleComponent({
  * reason: useMessages replaces the array on every realtime event, and an
  * unchanged message frequently arrives as a new object. */
 export const MessageBubble = memo(MessageBubbleComponent, (prev, next) => {
+  // onOpenMedia/onRetryDecryption/onLongPress intentionally excluded from
+  // this comparison, matching the existing fields below — the parent passes
+  // a stable identity-per-message closure for each.
   const a = prev.message;
   const b = next.message;
   return (
@@ -185,6 +222,7 @@ export const MessageBubble = memo(MessageBubbleComponent, (prev, next) => {
     prev.onLongPress === next.onLongPress &&
     prev.replyPreview?.text === next.replyPreview?.text &&
     prev.replyPreview?.senderName === next.replyPreview?.senderName &&
+    prev.senderName === next.senderName &&
     prev.forwardedFrom?.senderName === next.forwardedFrom?.senderName
   );
 });
@@ -198,16 +236,22 @@ function ChatImage({
   path,
   pending,
   conversationId,
+  onPress,
 }: {
   path: string;
   pending?: boolean;
   conversationId?: string;
+  onPress?: () => void;
 }) {
   const { theme } = useTheme();
   const { decryptBytesForConversation } = useE2ee();
   const isLocal = path.startsWith("file:") || path.startsWith("content:");
   const [uri, setUri] = useState<string | null>(isLocal ? path : null);
   const [failed, setFailed] = useState(false);
+  // The actual photo's aspect ratio, so the bubble shows it in full instead
+  // of cropping it into a fixed 220x160 box (Image's default resizeMode is
+  // "cover", which crops to fill — exactly the "appears cut off" report).
+  const [aspectRatio, setAspectRatio] = useState(1);
   // Bumped to force a retry from the "Image unavailable" state — a failed
   // load is very often transient (session token mid-refresh, a network
   // blip) rather than the media actually being gone, so it shouldn't be a
@@ -222,16 +266,11 @@ function ChatImage({
 
     let active = true;
 
-    // A "#nonce" suffix marks media that was encrypted with the chat's
-    // session key — a signed URL alone would just render ciphertext, so it
-    // has to be downloaded and decrypted on-device first.
-    const { nonce } = parseMediaRef(path);
-
-    const load = nonce
-      ? fetchDecryptedMediaFile(path, (ciphertext, mediaNonce) =>
-          decryptBytesForConversation(conversationId ?? "", ciphertext, mediaNonce)
-        )
-      : signedChatMediaUrl(path);
+    // A "#nonce" suffix marks media encrypted with the chat's session key;
+    // cachedMediaUri downloads + decrypts it once and serves it from disk.
+    const load = cachedMediaUri(path, (ciphertext, mediaNonce) =>
+      decryptBytesForConversation(conversationId ?? "", ciphertext, mediaNonce)
+    );
 
     Promise.resolve(load)
       .then((resolved) => {
@@ -247,7 +286,7 @@ function ChatImage({
         if (!active) return;
         // eslint-disable-next-line no-console
         console.error("[ChatImage] load failed:", error instanceof Error ? error.message : error, {
-          hasNonce: !!nonce,
+          hasNonce: path.includes("#"),
         });
         setFailed(true);
       });
@@ -256,6 +295,23 @@ function ChatImage({
       active = false;
     };
   }, [path, isLocal, conversationId, decryptBytesForConversation, retryCount]);
+
+  useEffect(() => {
+    if (!uri) return;
+    let active = true;
+    Image.getSize(
+      uri,
+      (width, height) => {
+        if (active && width > 0 && height > 0) setAspectRatio(width / height);
+      },
+      () => {
+        // Non-fatal: the image still renders at the default square ratio.
+      }
+    );
+    return () => {
+      active = false;
+    };
+  }, [uri]);
 
   if (failed) {
     return (
@@ -284,15 +340,26 @@ function ChatImage({
     );
   }
 
+  // Width fixed (matches the old 220 default), height derived from the real
+  // aspect ratio and clamped so a very tall/wide photo still fits the bubble
+  // — the same bounds WhatsApp/Telegram use for an inline photo.
+  const width = 220;
+  const height = Math.max(140, Math.min(320, width / aspectRatio));
+
   return (
-    <View>
-      <Image source={{ uri }} style={styles.media} accessibilityIgnoresInvertColors />
+    <Pressable onPress={onPress} disabled={!onPress} accessibilityRole={onPress ? "button" : undefined}>
+      <Image
+        source={{ uri }}
+        style={[styles.media, { width, height }]}
+        resizeMode="cover"
+        accessibilityIgnoresInvertColors
+      />
       {pending ? (
         <View style={styles.uploadOverlay}>
           <ActivityIndicator color="#FFFFFF" />
         </View>
       ) : null}
-    </View>
+    </Pressable>
   );
 }
 
@@ -313,10 +380,12 @@ function ChatVideo({
   path,
   pending,
   conversationId,
+  onPress,
 }: {
   path: string;
   pending?: boolean;
   conversationId?: string;
+  onPress?: () => void;
 }) {
   const { theme } = useTheme();
   const { decryptBytesForConversation } = useE2ee();
@@ -332,13 +401,10 @@ function ChatVideo({
     }
 
     let active = true;
-    const { nonce } = parseMediaRef(path);
 
-    const load = nonce
-      ? fetchDecryptedMediaFile(path, (ciphertext, mediaNonce) =>
-          decryptBytesForConversation(conversationId ?? "", ciphertext, mediaNonce)
-        )
-      : signedChatMediaUrl(path);
+    const load = cachedMediaUri(path, (ciphertext, mediaNonce) =>
+      decryptBytesForConversation(conversationId ?? "", ciphertext, mediaNonce)
+    );
 
     Promise.resolve(load)
       .then((resolved) => {
@@ -354,7 +420,7 @@ function ChatVideo({
         if (!active) return;
         // eslint-disable-next-line no-console
         console.error("[ChatVideo] load failed:", error instanceof Error ? error.message : error, {
-          hasNonce: !!nonce,
+          hasNonce: path.includes("#"),
         });
         setFailed(true);
       });
@@ -389,7 +455,7 @@ function ChatVideo({
   }
 
   return (
-    <View>
+    <Pressable onPress={onPress} disabled={!onPress} accessibilityRole={onPress ? "button" : undefined}>
       <VideoView
         player={player}
         style={styles.media}
@@ -402,7 +468,7 @@ function ChatVideo({
           <ActivityIndicator color="#FFFFFF" />
         </View>
       ) : null}
-    </View>
+    </Pressable>
   );
 }
 
@@ -440,7 +506,6 @@ function DocumentAttachment({
 
       // Save under the name the sender gave it, not the storage key, so the
       // file arrives in Files/Quick Look correctly named.
-      const { nonce } = parseMediaRef(path);
       const safeName = (name ?? "document").replace(/[^a-zA-Z0-9._-]/g, "_");
 
       // A dedicated subdirectory keeps one attachment from overwriting
@@ -453,26 +518,16 @@ function DocumentAttachment({
       const target = new File(folder, safeName);
       if (target.exists) target.delete();
 
-      if (nonce) {
-        // Secret Chat: the stored bytes are ciphertext, so they have to be
-        // downloaded and decrypted before anything can open them.
-        const plain = await fetchDecryptedBytes(path, (ciphertext, mediaNonce) =>
-          decryptBytesForConversation(conversationId ?? "", ciphertext, mediaNonce)
-        );
-        if (!plain) {
-          Alert.alert("Unavailable", "This file could not be decrypted.");
-          return;
-        }
-        target.create();
-        target.write(plain);
-      } else {
-        const url = await signedChatMediaUrl(path);
-        // The download writes into `target`. Its declared return type in
-        // expo-file-system 19 resolves to the DOM `File` rather than the
-        // filesystem one (an upstream typing bug), so the result is ignored
-        // and the handle created above is used instead.
-        await File.downloadFileAsync(url, target);
+      // Downloaded (and, for Secret Chats, decrypted) once into the media
+      // cache, then copied out under the sender's filename for the share sheet.
+      const cached = await cachedMediaUri(path, (ciphertext, mediaNonce) =>
+        decryptBytesForConversation(conversationId ?? "", ciphertext, mediaNonce)
+      );
+      if (!cached) {
+        Alert.alert("Unavailable", "This file could not be downloaded or decrypted.");
+        return;
       }
+      new File(cached).copy(target);
 
       await Sharing.shareAsync(target.uri, {
         mimeType: mimeForPath(path),
@@ -545,6 +600,17 @@ function formatTime(iso: string) {
 }
 
 const styles = StyleSheet.create({
+  systemRow: { alignItems: "center", marginVertical: spacing.sm, paddingHorizontal: spacing.lg },
+  systemText: {
+    fontSize: 13,
+    fontWeight: "500",
+    textAlign: "center",
+    paddingHorizontal: spacing.md,
+    paddingVertical: 5,
+    borderRadius: 12,
+    overflow: "hidden",
+  },
+  senderName: { fontSize: 13, fontWeight: "700", marginBottom: 2 },
   row: { flexDirection: "row", marginVertical: 2 },
   alignStart: { justifyContent: "flex-start" },
   alignEnd: { justifyContent: "flex-end" },
@@ -568,7 +634,7 @@ const styles = StyleSheet.create({
   },
   replyQuoteName: { fontSize: 12, fontWeight: "700" },
   replyQuoteText: { fontSize: 12 },
-  media: { width: 220, height: 160, borderRadius: radius.md },
+  media: { width: 220, height: 160, borderRadius: radius.md, overflow: "hidden" },
   mediaPlaceholder: { alignItems: "center", justifyContent: "center", gap: spacing.xs },
   mediaError: { fontSize: 12 },
   uploadOverlay: {

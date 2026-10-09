@@ -45,6 +45,8 @@ function contentTypeFor(extension: string) {
       return "video/mp4";
     case "mov":
       return "video/quicktime";
+    case "m4a":
+      return "audio/mp4";
     default:
       return "image/jpeg";
   }
@@ -166,6 +168,8 @@ export function mimeForPath(path: string): string {
       return "video/mp4";
     case "mov":
       return "video/quicktime";
+    case "m4a":
+      return "audio/mp4";
     case "pdf":
       return "application/pdf";
     default:
@@ -267,6 +271,24 @@ export async function signedChatMediaUrl(ref: string, expiresInSeconds = 3600) {
 }
 
 /** Uploads a new avatar and returns its public URL (avatars is a public bucket). */
+/** Group photos live in the uploading admin's own avatars/ folder (the
+ * storage policy only lets you write under your own user id), keyed by group
+ * so it never collides with that admin's personal avatar. */
+export async function uploadGroupAvatar(userId: string, conversationId: string, localUri: string) {
+  const extension = extensionFor(localUri, "jpg");
+  const path = `${userId}/group-${conversationId}.${extension}`;
+  const bytes = await readAsArrayBuffer(localUri);
+
+  const { error } = await supabase.storage.from("avatars").upload(path, bytes, {
+    contentType: contentTypeFor(extension),
+    upsert: true,
+  });
+  if (error) throw error;
+
+  const { data } = supabase.storage.from("avatars").getPublicUrl(path);
+  return `${data.publicUrl}?v=${Date.now()}`;
+}
+
 export async function uploadAvatar(userId: string, localUri: string) {
   const extension = extensionFor(localUri, "jpg");
   const path = `${userId}/avatar.${extension}`;

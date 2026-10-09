@@ -3,6 +3,14 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { uploadChatDocument, uploadChatMedia,
   parseMediaRef,
 } from "../lib/media";
+import {
+  bindLocalMessagesToUser,
+  deleteLocalMessages,
+  readLocalMessages,
+  reconcileLocalWindow,
+  upsertLocalMessages,
+} from "../lib/localMessages";
+import { primeMediaCache } from "../lib/mediaCache";
 import { supabase } from "../lib/supabase";
 import type { Database } from "../types/database";
 import { randomUUID } from "../lib/uuid";
@@ -129,6 +137,26 @@ export function useMessages(
       return;
     }
 
+    // Instant paint from the on-device copy (also what makes a chat readable
+    // with no connection). Best-effort: any cache failure just falls through
+    // to the server fetch below, exactly as before the cache existed.
+    let paintedFromCache = false;
+    try {
+      if (userId) await bindLocalMessagesToUser(userId);
+      const local = await readLocalMessages(conversationId, PAGE_SIZE);
+      if (local.length > 0 && runId === loadRunIdRef.current) {
+        const decoratedLocal = await decorateWithDecryption(local);
+        if (runId === loadRunIdRef.current) {
+          setMessages(decoratedLocal);
+          setHasMore(local.length === PAGE_SIZE);
+          setLoading(false);
+          paintedFromCache = true;
+        }
+      }
+    } catch {
+      // ignore — server fetch below is authoritative
+    }
+
     const { data, error: queryError } = await supabase
       .from("messages")
       .select("*")
@@ -137,9 +165,20 @@ export function useMessages(
       .limit(PAGE_SIZE);
 
     if (queryError) {
-      if (runId === loadRunIdRef.current) setError(queryError.message);
+      // Offline with a cached copy on screen: keep showing it, no error.
+      if (runId === loadRunIdRef.current && !paintedFromCache) setError(queryError.message);
     } else {
       const rows = data ?? [];
+      void reconcileLocalWindow(
+        conversationId,
+        rows,
+        rows.length === PAGE_SIZE ? rows[rows.length - 1].created_at : null,
+        // Bounded by the newest row the server returned, so a message that
+        // arrives via realtime while this fetch is in flight isn't treated as
+        // "deleted on the server" and dropped from the cache.
+        rows.length > 0 ? rows[0].created_at : null,
+        true
+      ).catch(() => {});
       const decorated = await decorateWithDecryption(rows);
       if (runId === loadRunIdRef.current) {
         setMessages(decorated);
@@ -147,7 +186,7 @@ export function useMessages(
       }
     }
     if (runId === loadRunIdRef.current) setLoading(false);
-  }, [conversationId, decorateWithDecryption]);
+  }, [conversationId, userId, decorateWithDecryption]);
 
   /** Loads the next page of older messages. Without this, anything past the
    * first 50 was permanently unreachable — scrolling up just hit a wall, and
@@ -160,7 +199,7 @@ export function useMessages(
 
     loadingOlderRef.current = true;
     try {
-      const { data } = await supabase
+      const { data, error: olderError } = await supabase
         .from("messages")
         .select("*")
         .eq("conversation_id", conversationId)
@@ -168,7 +207,17 @@ export function useMessages(
         .order("created_at", { ascending: false })
         .limit(PAGE_SIZE);
 
-      const rows = data ?? [];
+      let rows = data ?? [];
+      if (olderError) {
+        rows = await readLocalMessages(conversationId, PAGE_SIZE, oldest.created_at).catch(() => []);
+      } else {
+        void reconcileLocalWindow(
+          conversationId,
+          rows,
+          rows.length === PAGE_SIZE ? rows[rows.length - 1].created_at : null,
+          oldest.created_at
+        ).catch(() => {});
+      }
       setHasMore(rows.length === PAGE_SIZE);
       if (rows.length > 0) {
         const decorated = await decorateWithDecryption(rows);
@@ -203,6 +252,7 @@ export function useMessages(
         },
         (payload) => {
           const incoming = payload.new as MessageRow;
+          void upsertLocalMessages([incoming]).catch(() => {});
 
           void (async () => {
             const [decorated] = await decorateWithDecryption([incoming]);
@@ -242,6 +292,7 @@ export function useMessages(
         },
         (payload) => {
           const updated = payload.new as MessageRow;
+          void upsertLocalMessages([updated]).catch(() => {});
           void (async () => {
             const [decorated] = await decorateWithDecryption([updated]);
             setMessages((current) =>
@@ -260,6 +311,7 @@ export function useMessages(
         },
         (payload) => {
           const removed = payload.old as Partial<MessageRow>;
+          if (removed.id) void deleteLocalMessages([removed.id]).catch(() => {});
           setMessages((current) => current.filter((message) => message.id !== removed.id));
         }
       )
@@ -311,6 +363,8 @@ export function useMessages(
         expires_at: expiresAt,
         document_name: null,
         document_size_bytes: null,
+        media_duration_ms: null,
+        waveform: null,
         created_at: new Date().toISOString(),
         pending: true,
       };
@@ -437,6 +491,8 @@ export function useMessages(
         expires_at: expiresAt,
         document_name: null,
         document_size_bytes: null,
+        media_duration_ms: null,
+        waveform: null,
         created_at: new Date().toISOString(),
         pending: true,
       };
@@ -453,6 +509,7 @@ export function useMessages(
           sender_id: userId,
           kind,
           media_url: path,
+          expires_at: expiresAt,
         });
         if (insertError) throw insertError;
         playMessageSentSound();
@@ -501,6 +558,8 @@ export function useMessages(
         expires_at: expiresAt,
         document_name: name,
         document_size_bytes: sizeBytes,
+        media_duration_ms: null,
+        waveform: null,
         created_at: new Date().toISOString(),
         pending: true,
       };
@@ -520,6 +579,7 @@ export function useMessages(
           media_url: path,
           document_name: name,
           document_size_bytes: sizeBytes,
+          expires_at: expiresAt,
         });
         if (insertError) throw insertError;
         playMessageSentSound();
@@ -530,6 +590,69 @@ export function useMessages(
           error instanceof Error ? error.message : error,
           { conversationId, isEncrypted }
         );
+        setMessages((current) =>
+          current.map((message) =>
+            message.id === optimisticId ? { ...message, pending: false, failed: true } : message
+          )
+        );
+        throw error;
+      }
+    },
+    [conversationId, userId, isEncrypted, encryptBytesForConversation, selfDestructSeconds]
+  );
+
+  const sendVoice = useCallback(
+    async (localUri: string, durationMs: number, waveform: string) => {
+      const expiresAt = selfDestructSeconds
+        ? new Date(Date.now() + selfDestructSeconds * 1000).toISOString()
+        : null;
+      if (!conversationId || !userId) return;
+
+      const optimisticId = `optimistic-${randomUUID()}`;
+      const optimistic: ChatMessage = {
+        id: optimisticId,
+        conversation_id: conversationId,
+        sender_id: userId,
+        kind: "voice",
+        body: null,
+        media_url: localUri,
+        shared_activity_id: null,
+        shared_profile_id: null,
+        reply_to_id: null,
+        edited_at: null,
+        forwarded_from_message_id: null,
+        forwarded_from_sender_id: null,
+        expires_at: expiresAt,
+        document_name: null,
+        document_size_bytes: null,
+        media_duration_ms: durationMs,
+        waveform,
+        created_at: new Date().toISOString(),
+        pending: true,
+      };
+      setMessages((current) => [optimistic, ...current]);
+
+      try {
+        const path = await uploadChatMedia(
+          conversationId,
+          localUri,
+          isEncrypted ? (data) => encryptBytesForConversation(conversationId, data) : undefined
+        );
+        // The sender already has the audio — seed the cache so their own
+        // voice note never downloads again.
+        primeMediaCache(path, localUri);
+        const { error: insertError } = await supabase.from("messages").insert({
+          conversation_id: conversationId,
+          sender_id: userId,
+          kind: "voice",
+          media_url: path,
+          media_duration_ms: durationMs,
+          waveform,
+          expires_at: expiresAt,
+        });
+        if (insertError) throw insertError;
+        playMessageSentSound();
+      } catch (error) {
         setMessages((current) =>
           current.map((message) =>
             message.id === optimisticId ? { ...message, pending: false, failed: true } : message
@@ -569,6 +692,7 @@ export function useMessages(
 
       // Optimistically remove; the realtime DELETE event is a no-op afterwards.
       setMessages((current) => current.filter((message) => message.id !== messageId));
+      void deleteLocalMessages([messageId]).catch(() => {});
       const { error } = await supabase.from("messages").delete().eq("id", messageId);
       if (error) throw error;
     },
@@ -604,6 +728,7 @@ export function useMessages(
             void supabase.from("messages").delete().eq("id", message.id);
           }
         }
+        void deleteLocalMessages(expired.map((message) => message.id)).catch(() => {});
         const expiredIds = new Set(expired.map((message) => message.id));
         return current.filter((message) => !expiredIds.has(message.id));
       });
@@ -689,6 +814,7 @@ export function useMessages(
     error,
     hasMore,
     loadOlder,
+    sendVoice,
     sendMessage,
     editMessage,
     sendImage,
