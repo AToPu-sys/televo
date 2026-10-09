@@ -8,7 +8,7 @@
     "scheme": "televo",
     "userInterfaceStyle": "automatic",
     "ios": {
-      "supportsTablet": true,
+      "supportsTablet": false,
       "bundleIdentifier": "com.televo.app",
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": true,
@@ -31,6 +31,14 @@
     },
     "android": {
       "package": "com.televo.app",
+      "googleServicesFile": "./google-services.json",
+      "permissions": [
+        "android.permission.POST_NOTIFICATIONS",
+        "android.permission.FOREGROUND_SERVICE",
+        "android.permission.FOREGROUND_SERVICE_MICROPHONE",
+        "android.permission.FOREGROUND_SERVICE_CAMERA",
+        "android.permission.USE_FULL_SCREEN_INTENT"
+      ],
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/android-icon-foreground.png",
@@ -38,7 +46,7 @@
         "monochromeImage": "./assets/android-icon-monochrome.png"
       },
       "predictiveBackGestureEnabled": false,
-      "versionCode": 1
+      "versionCode": 87
     },
     "web": {
       "favicon": "./assets/favicon.png",
@@ -63,12 +71,20 @@
         "expo-notifications",
         {
           "icon": "./assets/icon.png",
-          "color": "#3390EC"
+          "color": "#3390EC",
+          "sounds": ["./assets/ringtone.wav"]
         }
       ],
       "expo-audio",
       "expo-video",
-      "@config-plugins/react-native-webrtc"
+      "@config-plugins/react-native-webrtc",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Televo uses your camera to scan QR codes for signing in on a new device."
+        }
+      ],
+      "expo-sqlite"
     ],
     "experiments": {
       "typedRoutes": true

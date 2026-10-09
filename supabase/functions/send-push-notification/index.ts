@@ -33,6 +33,8 @@ function previewFor(kind: string, body: string | null, isEncrypted: boolean): st
       return "🎬 Video";
     case "document":
       return "📄 Document";
+    case "voice":
+      return "🎤 Voice message";
     default:
       return body ?? "sent a message";
   }
@@ -62,6 +64,12 @@ Deno.serve(async (req) => {
   if (!message || message.sender_id === ASSISTANT_USER_ID) {
     return new Response("ignored", { status: 200 });
   }
+  // Group events ("Bek added Ali") are timeline entries, not messages
+  // someone sent — their body is JSON meant for the app to render, and
+  // pushing it would show that raw.
+  if (message.kind === "system") {
+    return new Response("system event, no push", { status: 200 });
+  }
 
   const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
   const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
@@ -89,9 +97,24 @@ Deno.serve(async (req) => {
     .eq("conversation_id", message.conversation_id)
     .neq("user_id", message.sender_id);
 
-  const recipientIds = (participants ?? []).map((p) => p.user_id);
-  if (recipientIds.length === 0) {
+  const allRecipientIds = (participants ?? []).map((p) => p.user_id);
+  if (allRecipientIds.length === 0) {
     return new Response("no recipients", { status: 200 });
+  }
+
+  // Excludes anyone who turned message notifications off (Settings →
+  // Notifications, added 2026-09-28) — checked here rather than at the
+  // client, so a stale/cached client preference can never re-enable a push
+  // the user explicitly asked to stop.
+  const { data: recipientProfiles } = await admin
+    .from("profiles")
+    .select("id, notify_messages")
+    .in("id", allRecipientIds);
+  const recipientIds = (recipientProfiles ?? [])
+    .filter((p) => p.notify_messages)
+    .map((p) => p.id);
+  if (recipientIds.length === 0) {
+    return new Response("all recipients muted messages", { status: 200 });
   }
 
   const { data: tokenRows } = await admin

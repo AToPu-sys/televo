@@ -10,6 +10,8 @@ import {
 } from "react";
 
 import { normalizePhone } from "../lib/phone";
+import { wipeLocalMessages } from "../lib/localMessages";
+import { clearMediaCache } from "../lib/mediaCache";
 import { supabase } from "../lib/supabase";
 
 /** Verifies a password against the CURRENT account without disturbing the
@@ -27,7 +29,14 @@ export async function verifyCurrentPassword(email: string, password: string): Pr
   const scratchClient = createClient(url, key, {
     auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
   });
-  const { error } = await scratchClient.auth.signInWithPassword({ email: email.trim(), password });
+  // See signInWithEmail's own comment: a pasted password can carry a
+  // trailing space/newline the source text never meant to include, and
+  // Supabase treats that as simply the wrong password — trimming here is
+  // what makes a copy-pasted password behave the same as a typed one.
+  const { error } = await scratchClient.auth.signInWithPassword({
+    email: email.trim(),
+    password: password.trim(),
+  });
   return !error;
 }
 
@@ -133,6 +142,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       // see a valid session and drop them straight into the app still using
       // the old password they came here to replace.
       if (event === "PASSWORD_RECOVERY") setRecoveringPassword(true);
+      // Any sign-out (button, remote sign-out from another device, expired
+      // session): erase this device's copy of the account's chats and media,
+      // so the next person to sign in on this phone can't see them.
+      if (event === "SIGNED_OUT") {
+        void wipeLocalMessages().catch(() => {});
+        try {
+          clearMediaCache();
+        } catch {
+          // best-effort
+        }
+      }
       setSession(nextSession);
       if (nextSession) void checkMfaLevel();
       else setNeedsMfaChallenge(false);
@@ -143,9 +163,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const signInWithEmail = useCallback(
     async (email: string, password: string) => {
+      // Trimmed the same way email already was: a password pasted in from
+      // the Desktop review-notes file (Clipboard on iOS sometimes carries a
+      // trailing newline/space from how the source text was selected) fails
+      // auth with the generic "Invalid login credentials" — indistinguishable
+      // from an actually wrong password — unless this trims it first.
       const { error } = await supabase.auth.signInWithPassword({
         email: email.trim(),
-        password,
+        password: password.trim(),
       });
       if (error) throw error;
       await checkMfaLevel();

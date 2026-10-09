@@ -1,6 +1,12 @@
-import { onCallKitAudioSessionInterruption, reportMuteState } from "expo-callkit";
+import {
+  onCallKitAudioSessionActivated,
+  onCallKitAudioSessionInterruption,
+  reportMuteState,
+} from "expo-callkit";
+import { isBackgroundCameraSupported } from "expo-call-pip";
 import { resetAudioRoute, setSpeakerphoneOn } from "expo-speaker-toggle";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { AppState, Platform } from "react-native";
 
 import type { BridgeEvent, WebRtcBridgeHandle } from "../components/WebRtcBridge";
 import {
@@ -39,7 +45,14 @@ type Signal =
   // original offer -- sent while the callee was still resolving the peer and
   // subscribing -- was simply dropped, leaving Accept doing nothing and the
   // caller stuck on "Ringing...". The caller re-sends the offer on this.
-  | { type: "callee-ready" };
+  | { type: "callee-ready" }
+  // Tells the peer this side's camera turned on/off, so the peer can show an
+  // avatar in place of the video instead of a frozen last frame. The remote
+  // video TRACK's own enabled/muted state is not a reliable signal here —
+  // it's not consistently reflected on the receiving side across platforms —
+  // so this is sent explicitly, the same way mute state used to be
+  // (CallKit-only) before this.
+  | { type: "camera-state"; enabled: boolean };
 
 /**
  * The media engine is native WebRTC (see WebRtcBridge, backed by
@@ -155,6 +168,29 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
     return () => sub.remove();
   }, [trace]);
 
+  // 2026-09-29: "loud before the peer answers, quiet after" — CallKit
+  // activates the shared AVAudioSession itself the moment the OTHER side
+  // answers (didActivate fires natively, independent of anything this file
+  // does), which rebuilds the native audio route from scratch. The
+  // speakerOn REACT STATE survived that untouched (still true from
+  // local-ready's initial setSpeakerphoneOn(true) for a video call), but
+  // the ACTUAL route CallKit just rebuilt lands back on the earpiece by
+  // default — the lit speaker icon was lying about what was actually
+  // playing, and required exactly the "turn it off, turn it back on" the
+  // user described to force a real route change back to the speaker.
+  // Re-asserting the route here, exactly when CallKit hands control back,
+  // is what the "second setSpeakerphoneOn on 'connected'" comment above
+  // used to warn against doing mid-call — but this fires at a DIFFERENT,
+  // safe moment: right as CallKit finishes its own route rebuild, not into
+  // an already-stable live route.
+  useEffect(() => {
+    const sub = onCallKitAudioSessionActivated(() => {
+      trace("audio session activated", `reasserting speakerOn=${speakerOnRef.current}`);
+      setSpeakerphoneOn(speakerOnRef.current);
+    });
+    return () => sub.remove();
+  }, [trace]);
+
   /** Formats the trace as readable text — call time deltas in ms from the
    * first entry, so it reads as a timeline. */
   const getDiagnosticsReport = useCallback(() => {
@@ -186,6 +222,11 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
 
   const [muted, setMuted] = useState(false);
   const [cameraOff, setCameraOff] = useState(false);
+  // The PEER's camera state, from the "camera-state" signal — see its own
+  // comment for why the remote video track's own enabled flag isn't used
+  // instead. Reset on every new call (see the phase-idle reset elsewhere in
+  // this file) so a stale true doesn't leak into the next call's first frame.
+  const [peerCameraOff, setPeerCameraOff] = useState(false);
   const [bridgeReady, setBridgeReady] = useState(false);
   // Video calls default to speaker on: nobody holds the phone to their ear
   // while looking at the screen, so the earpiece default made every video
@@ -219,6 +260,26 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
   // The call id answerCall has already run for — see its guard. Cleared in
   // cleanup() so the next call can be answered normally.
   const answeredCallIdRef = useRef<string | null>(null);
+  // Callee side: the SDP of the restart offer currently being (or just
+  // finished being) renegotiated, so a duplicate delivery of the SAME
+  // restart doesn't call renegotiate-answer a second time.
+  //
+  // Realtime broadcast has no replay or exactly-once guarantee, and the
+  // caller's own callee-ready handler re-sends its pending offer completely
+  // unconditionally on every callee-ready it receives (see useCall.ts's
+  // caller-side joinSignalChannel) — so a flaky cross-network connection
+  // that causes the channel to reconnect, or simply duplicates a frame, can
+  // deliver the exact same restart offer two or three times within a
+  // second. Each one used to call sendCommand({ type: "renegotiate-answer" })
+  // unconditionally, and WebRtcBridge has no queue for that command — a
+  // second setRemoteDescription/createAnswer pair starting before the first
+  // finished hit the peer connection in "stable" state (already
+  // renegotiated by the first) and threw "Called in wrong state: stable",
+  // which tore the whole call down. A real call between two different
+  // networks (2026-10-02, Bek<->Firuza, call_diagnostics) hit exactly this:
+  // three near-simultaneous "offer received" events, the third one's
+  // renegotiate-answer throwing and ending the call outright.
+  const lastRenegotiatedSdpRef = useRef<string | null>(null);
   // True once this call ever reached phase "active", on EITHER side —
   // answeredCallIdRef above only ever gets set on the callee. Used by
   // flushCallDiagnostics to decide whether a call that ended with no
@@ -418,6 +479,7 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
     activeCallRowRef.current = null;
     answeredCallIdRef.current = null;
     answerAppliedForCallIdRef.current = null;
+    lastRenegotiatedSdpRef.current = null;
     wasActiveRef.current = false;
     // Disarm the CallKit audio-session wait, so it can never leak into the
     // NEXT call.
@@ -1064,6 +1126,8 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
         } else if (signal.type === "hangup") {
           setState({ phase: "ended", reason: "hangup" });
           cleanup();
+        } else if (signal.type === "camera-state") {
+          setPeerCameraOff(!signal.enabled);
         }
       });
 
@@ -1167,6 +1231,15 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
             answeredCallIdRef.current === call.id &&
             (answeredPhase === "connecting" || answeredPhase === "active")
           ) {
+            // A duplicate/redelivered copy of a restart offer we're already
+            // renegotiating (or just finished renegotiating) — see
+            // lastRenegotiatedSdpRef's own comment for why this happens on a
+            // real cross-network call and what applying it twice used to do.
+            if (lastRenegotiatedSdpRef.current === signal.sdp) {
+              trace("offer received", "duplicate ICE restart — ignored");
+              return;
+            }
+            lastRenegotiatedSdpRef.current = signal.sdp;
             trace("offer received", "ICE restart from caller — renegotiating");
             sendCommand({ type: "renegotiate-answer", sdp: signal.sdp });
             return;
@@ -1191,6 +1264,8 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
         } else if (signal.type === "ice-candidate") {
           trace("ice-candidate received");
           sendCommand({ type: "ice-candidate", candidate: signal.candidate });
+        } else if (signal.type === "camera-state") {
+          setPeerCameraOff(!signal.enabled);
         }
       });
 
@@ -1381,20 +1456,71 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
   // which reports the desired state directly rather than "flip whatever it
   // currently is" — using toggleMute here would desync in-app and system UI
   // the moment the two disagreed about the starting state even once.
+  //
+  // Ignores a mute=true that arrives before the call is "active" (callee
+  // hasn't answered yet). Real trace, 2026-10-03 (Bekhzod, outgoing video
+  // call to Tttt): the mic's native track read enabled:false for the WHOLE
+  // call — audioBytes on the Android callee's side stuck at ~34KB over 15s
+  // vs 546KB sent by the caller — while the app's own `muted` state had
+  // never been toggled by the user (no toggleMute in the trace) and
+  // CallKit's mute button was never touched either. The only path that
+  // disables the native track is this function, which only onCallKitMuteChanged
+  // calls — meaning CXSetMutedCallAction fired on its own. This IS a known
+  // iOS quirk: CallKit can issue a spurious auto-mute right after
+  // CXStartCallAction is fulfilled, before the user could possibly have
+  // intended to mute a call nobody has answered yet. A real user tapping
+  // CallKit's mute button mid-conversation is unaffected — "active" covers
+  // the entire connected call, this guard only blocks the specific window
+  // where a system-issued mute cannot be a real user action.
   const setMuteState = useCallback(
     (next: boolean) => {
       if (next === muted) return;
+      if (next && stateRef.current.phase !== "active") {
+        trace("setMuteState IGNORED", `CallKit mute=true before call active (phase=${stateRef.current.phase})`);
+        return;
+      }
       sendCommand({ type: "set-mic", enabled: !next });
       setMuted(next);
     },
-    [muted, sendCommand]
+    [muted, sendCommand, trace]
   );
 
   const toggleCamera = useCallback(() => {
     const next = !cameraOff;
     sendCommand({ type: "set-camera", enabled: !next });
     setCameraOff(next);
-  }, [cameraOff, sendCommand]);
+    sendSignal({ type: "camera-state", enabled: !next });
+  }, [cameraOff, sendCommand, sendSignal]);
+
+  // Without multitasking camera access (see expo-call-pip's
+  // isBackgroundCameraSupported), iOS pauses this device's camera the moment
+  // the app goes to PiP, and the peer is left staring at the last frame —
+  // reported 2026-10-04 as "the camera freezes when I leave the app". Until
+  // the entitlement exists, tell the peer the camera is off for that window
+  // (they see the avatar, like a deliberate camera-off) and restore the
+  // real state on return. Only the SIGNAL changes; the local track and the
+  // user's own cameraOff choice are untouched.
+  // A ref, not a local, so an effect re-run while backgrounded (sendSignal
+  // changes identity when the E2EE keypair loads) still knows to restore.
+  // Nothing is sent from the cleanup: it runs when the call ends, and a
+  // signal queued then could leak into the next call.
+  const cameraPausedForBackgroundRef = useRef(false);
+  const callKind = state.phase === "active" ? state.call.kind : null;
+  useEffect(() => {
+    if (callKind === null) cameraPausedForBackgroundRef.current = false;
+    if (Platform.OS !== "ios" || callKind !== "video" || cameraOff) return;
+    if (isBackgroundCameraSupported()) return;
+    const sub = AppState.addEventListener("change", (next) => {
+      if (next === "background" && !cameraPausedForBackgroundRef.current) {
+        cameraPausedForBackgroundRef.current = true;
+        sendSignal({ type: "camera-state", enabled: false });
+      } else if (next === "active" && cameraPausedForBackgroundRef.current) {
+        cameraPausedForBackgroundRef.current = false;
+        sendSignal({ type: "camera-state", enabled: true });
+      }
+    });
+    return () => sub.remove();
+  }, [callKind, cameraOff, sendSignal]);
 
   const toggleSpeaker = useCallback(() => {
     const next = !speakerOn;
@@ -1422,6 +1548,7 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
     // previous call's state and "Unmute" actually mutes you.
     setMuted(false);
     setCameraOff(false);
+    setPeerCameraOff(false);
     // resetAudioRoute rather than setSpeakerphoneOn(false): the latter would
     // re-apply a playAndRecord session on a call that's already over, which
     // leaves the recording indicator lit. This just clears the remembered
@@ -1826,6 +1953,7 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
     muted,
     setMuteState,
     cameraOff,
+    peerCameraOff,
     bridgeReady,
     startCall,
     listenForOffer,

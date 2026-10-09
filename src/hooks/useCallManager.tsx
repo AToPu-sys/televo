@@ -7,9 +7,10 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { Alert, AppState, Keyboard } from "react-native";
+import { Alert, AppState, Keyboard, Platform } from "react-native";
 
 import * as Device from "expo-device";
+import * as Notifications from "expo-notifications";
 
 import {
   consumeAnsweredCall,
@@ -27,7 +28,7 @@ import {
 } from "expo-callkit";
 
 import { markNextCallAsAnsweredViaCallKit } from "../components/WebRtcBridge";
-import { supabase } from "../lib/supabase";
+import { decodeSessionIdFromAccessToken, supabase } from "../lib/supabase";
 import { callsSupported } from "../lib/webrtcModule";
 import type { Database } from "../types/database";
 import { useAuth } from "./useAuth";
@@ -53,6 +54,17 @@ type PeerInfo = {
 type CallManagerValue = ReturnType<typeof useCall> & {
   peer: PeerInfo | null;
   placeCall: (conversationId: string, kind: CallKind) => Promise<void>;
+  /** Whether CallOverlay is currently showing the minimized swipe-down
+   * widget instead of the full-screen call UI. Lifted up from CallOverlay
+   * into this shared context — rather than kept as that component's own
+   * local state — specifically so RootNavigator (app/_layout.tsx) can read
+   * it too: the minimized widget's green bar needs the REST of the app to
+   * make room for it (push its content down, the way iOS's own "call in
+   * progress" status bar banner does for every app), which only the root
+   * layout can do. CallOverlay still owns setting it; this context is
+   * just where the value lives so both places can see it. */
+  minimized: boolean;
+  setMinimized: (value: boolean) => void;
 };
 
 const CallManagerContext = createContext<CallManagerValue | undefined>(undefined);
@@ -93,9 +105,15 @@ export function CallManagerProvider({ children }: { children: ReactNode }) {
       // being called may have no usable row at all. Removing the other
       // account's row needs SECURITY DEFINER; RLS only lets a client delete
       // its own.
+      const { data: sessionData } = await supabase.auth.getSession();
+      const sessionId = sessionData.session
+        ? decodeSessionIdFromAccessToken(sessionData.session.access_token)
+        : null;
       const { error } = await supabase.rpc("claim_voip_push_token", {
         p_token: token,
         p_device_name: Device.deviceName ?? undefined,
+        p_session_id: sessionId ?? undefined,
+        p_device_model: Device.modelName ?? undefined,
       });
       if (!error || cancelled) return;
 
@@ -490,6 +508,68 @@ export function CallManagerProvider({ children }: { children: ReactNode }) {
 
   useIncomingCalls(user?.id, handleIncoming);
 
+  // Android's whole path to an incoming call, since there is no
+  // ConnectionService/CallKit-equivalent integration here (deliberately out
+  // of scope — see send-call-push's header comment). useIncomingCalls alone
+  // only rings while this device's JS is ALREADY running and subscribed,
+  // which is exactly the gap that made "calling Android, or Android calling
+  // out" not work at all: an Android recipient whose app was backgrounded
+  // or killed had a Realtime subscription that wasn't live yet, and the
+  // push that reached them (send-call-push, routed through
+  // notify_incoming_call) carried no way for the client to tell a call push
+  // apart from a message push — so tapping it just opened the chat, with
+  // nothing on screen that could ever answer.
+  //
+  // Two listeners cover the two ways a push reaches this device:
+  //  - received: the app is alive (foreground or background, not killed) —
+  //    fires the instant the push lands, same as a live Realtime row, so
+  //    the ringer/CallOverlay comes up immediately rather than waiting for
+  //    a tap that may never come if the caller hangs up first.
+  //  - response (tap): covers both a backgrounded app and, critically, a
+  //    COLD START — Notifications queues the response and this listener
+  //    receives it the moment this effect mounts, same mechanism
+  //    consumePendingIncomingCall uses for iOS's VoIP-push cold launch.
+  //
+  // iOS is deliberately excluded (Platform.OS check below): it already has
+  // the strictly better VoIP-push + CallKit path above, which wakes the
+  // process even when fully killed — something a plain Expo push cannot do
+  // on either platform. Running this on iOS too would just mean a second,
+  // redundant handleIncoming call for the same call id once a VoIP-token
+  // build is in use (harmless — handleIncoming dedupes on call id — but
+  // pointless, and it would be the ONLY path for an iOS build that somehow
+  // has no VoIP token, which would mask that misconfiguration).
+  useEffect(() => {
+    if (Platform.OS !== "android") return;
+
+    const handleCallPush = (data: unknown) => {
+      if (!callsSupported()) return;
+      if (typeof data !== "object" || data === null) return;
+      const { kind, callId } = data as { kind?: unknown; callId?: unknown };
+      if (kind !== "call" || typeof callId !== "string") return;
+
+      void (async () => {
+        const { data: callRow } = await supabase.from("calls").select("*").eq("id", callId).single();
+        // The call may already have ended (caller hung up, or it was
+        // answered/declined on another device) by the time this push is
+        // processed — nothing to do.
+        if (!callRow || callRow.status !== "ringing") return;
+        await handleIncomingRef.current(callRow);
+      })();
+    };
+
+    const receivedSubscription = Notifications.addNotificationReceivedListener((event) => {
+      handleCallPush(event.request.content.data);
+    });
+    const responseSubscription = Notifications.addNotificationResponseReceivedListener((response) => {
+      handleCallPush(response.notification.request.content.data);
+    });
+
+    return () => {
+      receivedSubscription.remove();
+      responseSubscription.remove();
+    };
+  }, []);
+
   // accept/decline/hangup each branch on call.state.phase directly (not a
   // ref), so a copy of them captured once at mount would forever see phase
   // from that first render — the exact stale-closure shape that broke
@@ -818,8 +898,22 @@ export function CallManagerProvider({ children }: { children: ReactNode }) {
     };
   }, []);
 
+  const [minimized, setMinimized] = useState(false);
+  // Reset on "ended" too, not just "idle" — the auto-reset from "ended" to
+  // "idle" runs on a 1.5s timer (see CallOverlay's onDismissEnded effect),
+  // and if the call was minimized when it ended, `minimized` stayed true for
+  // that whole window: TouchPassthrough kept passthroughEnabled on, and the
+  // ended-call Modal content kept rendering shrunk/transparent instead of
+  // full-screen. Real device log (2026-10-03, rootkali) showed exactly this —
+  // the call ended, then touches stopped reaching anything for ~1.5s+, with
+  // CallOverlay's own render tree still thinking it was minimized for a
+  // phase it was never designed to be minimized through.
+  useEffect(() => {
+    if (call.state.phase === "idle" || call.state.phase === "ended") setMinimized(false);
+  }, [call.state.phase]);
+
   return (
-    <CallManagerContext.Provider value={{ ...call, peer, placeCall }}>
+    <CallManagerContext.Provider value={{ ...call, peer, placeCall, minimized, setMinimized }}>
       {children}
     </CallManagerContext.Provider>
   );

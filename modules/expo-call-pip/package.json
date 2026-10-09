@@ -1,0 +1,9 @@
+{
+  "name": "expo-call-pip",
+  "version": "1.0.0",
+  "description": "System-level Picture-in-Picture for active video calls, using AVPictureInPictureVideoCallViewController — keeps a call's video floating above the home screen/other apps when Televo is backgrounded, instead of the camera freezing.",
+  "main": "src/index.ts",
+  "author": "Televo",
+  "license": "MIT",
+  "homepage": ""
+}

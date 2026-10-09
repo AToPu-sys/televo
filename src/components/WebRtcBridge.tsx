@@ -1,7 +1,7 @@
 import { setAudioModeAsync } from "expo-audio";
-import { audioRouteSnapshot } from "expo-speaker-toggle";
+import { audioRouteSnapshot, configureForVoiceCall } from "expo-speaker-toggle";
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react";
-import { StyleSheet, View } from "react-native";
+import { Animated, Platform, StyleSheet, View } from "react-native";
 import type {
   MediaStream,
   RTCPeerConnection as RTCPeerConnectionType,
@@ -76,6 +76,17 @@ export type BridgeEvent =
 
 export type WebRtcBridgeHandle = {
   send: (command: object) => void;
+  /** The peer's current streamURL (the same string passed to <RTCView>'s
+   * streamURL prop below), or null if no remote stream exists yet. This is
+   * what expo-call-pip's startCallPip needs — it resolves this exact string
+   * back to a real RTCMediaStream natively, via the same
+   * WebRTCModule.streamForReactTag: lookup <RTCView> itself uses. */
+  getRemoteStreamUrl: () => string | null;
+  /** Same idea as getRemoteStreamUrl, for this device's OWN camera stream —
+   * expo-call-pip composites this as a small corner thumbnail over the
+   * peer's full-size video inside the PiP window, matching FaceTime's own
+   * PiP layout (both people visible, not just the peer). */
+  getLocalStreamUrl: () => string | null;
 };
 
 // Set by useCallManager right before it calls call.accept() for a call that
@@ -164,6 +175,25 @@ type WebRtcBridgeProps = {
    * reclaimed it on backgrounding. Deriving teardown from state instead of
    * a message makes it impossible to miss. */
   callActive: boolean;
+  /** Swaps which stream is full-screen: false (default) is peer-big/self-
+   * corner, true is self-big/peer-corner. Geometry only — never changes
+   * which RTCView carries the remote (peer) AUDIO track, which always stays
+   * the full-size "remote" RTCView underneath. See CallOverlay's own
+   * comment on why swap is done this way rather than swapping the actual
+   * remote/local RTCView instances. */
+  swapped?: boolean;
+  /** Live drag offset for the corner box, in screen points from its resting
+   * corner position — an Animated.ValueXY so the drag can run on the native
+   * thread without round-tripping through React state on every touch move.
+   * Undefined/omitted pins the box to its resting position. */
+  cornerDrag?: Animated.ValueXY;
+  /** Which corner the small box rests in when not being dragged. */
+  cornerAnchor?: "top-right" | "top-left" | "bottom-right" | "bottom-left";
+  /** True hides the corner box entirely (still capturing/sending video —
+   * only the picture-in-picture-style thumbnail is hidden), so a "restore"
+   * button elsewhere in the UI can bring it back without touching the call
+   * itself. */
+  cornerHidden?: boolean;
 };
 
 type Command =
@@ -203,7 +233,16 @@ type Command =
  * is a native module and is not present in Expo Go.
  */
 export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(function WebRtcBridge(
-  { onEvent, visible, peerVideoVisible, callActive },
+  {
+    onEvent,
+    visible,
+    peerVideoVisible,
+    callActive,
+    swapped = false,
+    cornerDrag,
+    cornerAnchor = "top-right",
+    cornerHidden = false,
+  },
   ref
 ) {
   const pcRef = useRef<RTCPeerConnectionType | null>(null);
@@ -217,6 +256,19 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
   const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
   const [localUrl, setLocalUrl] = useState<string | null>(null);
   const [remoteUrl, setRemoteUrl] = useState<string | null>(null);
+  // Mirrors remoteUrl for the imperative handle below, which is pinned with
+  // an empty dependency array (see its own comment on why) and so can never
+  // read a state value directly without going stale — reading a ref instead
+  // always sees the current value regardless of when the handle itself was
+  // built.
+  const remoteUrlRef = useRef<string | null>(null);
+  remoteUrlRef.current = remoteUrl;
+  // Same mirroring reasoning as remoteUrlRef — needed for the imperative
+  // handle's getLocalStreamUrl(), which expo-call-pip uses to also composite
+  // the self-view inside the PiP window (FaceTime-style small corner
+  // thumbnail over the peer's full-size video), not just the peer alone.
+  const localUrlRef = useRef<string | null>(null);
+  localUrlRef.current = localUrl;
   // getUserMedia always opens facingMode "user", so every call starts on the
   // front camera; switch-camera toggles this.
   const [usingFrontCamera, setUsingFrontCamera] = useState(true);
@@ -381,6 +433,12 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
       send(command: object) {
         void handleCommand(command as Command);
       },
+      getRemoteStreamUrl() {
+        return remoteUrlRef.current;
+      },
+      getLocalStreamUrl() {
+        return localUrlRef.current;
+      },
     }),
     // Pinned with [] deliberately — this is load-bearing.
     //
@@ -515,6 +573,19 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
     if (mediaCancelledRef.current) {
       ((stream as MediaStream).getTracks() as MediaTrackHandle[]).forEach(releaseTrack);
       throw new Error("call ended before media was ready");
+    }
+
+    // Android has no RTCAudioSession-equivalent that claims the
+    // communication audio path on its own — unlike iOS (see this function's
+    // doc comment), where WebRTC's own native session owns this entirely and
+    // calling anything here would be redundant. Without this, Android's
+    // audio stream defaults to a plain media-playback mode: calls still
+    // carry RTP (confirmed in call_diagnostics — audioBytes grows normally
+    // on both legs) but play back through the wrong audio path, measured as
+    // quiet/muffled compared to the iOS leg of the same call (2026-10-02).
+    // iOS is untouched: this is a no-op there.
+    if (Platform.OS === "android") {
+      configureForVoiceCall();
     }
 
     localStreamRef.current = stream as MediaStream;
@@ -1249,22 +1320,27 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
       remoteStreamRef.current = stream;
       setRemoteUrl(stream.toURL());
 
-      // NO gain call here anymore — removed 2026-09-21.
-      //
-      // This used to call track._setVolume(2.5) on every inbound audio
-      // track. _setVolume is a non-standard react-native-webrtc extension
-      // (mediaStreamTrackSetVolume -> RTCAudioTrack.source.volume), and it
-      // is the ONLY thing that sat between arriving RTP and the speaker.
-      // Telemetry from 2026-09-21 showed calls where inbound audio packets
-      // arrived continuously and symmetrically (59-60 packets in 8s on both
-      // legs, counts still climbing) on a direct srflx/srflx path — data
-      // was demonstrably being received — while the user still heard
-      // nothing. With the route, the session, the track state and the
-      // packet counts all verified healthy, this was the last remaining
-      // link in the chain that had never been ruled out.
-      //
-      // Left out rather than reduced to 1.0: setting source.volume at all
-      // is what is under suspicion, not the particular value.
+      // Gain boost re-added 2026-10-03. Removed 2026-09-21 only because it
+      // was, at the time, the last untested link in a total-silence bug —
+      // not because it was ever confirmed to cause anything. That bug's
+      // real cause (createAudioPlayer missing keepAudioSessionActive, killing
+      // the shared iOS session — see project memory) was found and fixed
+      // 2026-09-24/2026-10-02, so _setVolume was never actually at fault.
+      // 2.5x brings both legs of a call up from "audible but quiet" to
+      // comfortable at normal device volume, on top of (not instead of) the
+      // Android communication-mode fix in acquireMedia and the ringer volume
+      // bump in useRinger — same intent (louder everywhere), three different
+      // links in the chain (the ringtone before answer, the OS audio route
+      // during the call, and now the signal gain itself).
+      ((event as { streams: MediaStream[] }).streams[0]
+        ?.getAudioTracks() as unknown as { _setVolume?: (v: number) => void }[] | undefined
+      )?.forEach((track) => {
+        try {
+          track._setVolume?.(2.5);
+        } catch {
+          // Best-effort — a call must never fail over a volume tweak.
+        }
+      });
     };
 
     pc.onconnectionstatechange = () => {
@@ -1675,37 +1751,129 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
   // area outside the visible bounds is not reliably rendered at all — so the
   // remote audio track was decoded but never played. Audio must never depend
   // on video layout.
+  // 2026-09-26: tapping the corner thumbnail swaps which video is
+  // full-screen. This is the one place that has to disagree with the
+  // "remote RTCView must always stay full-size for its audio" rule above —
+  // the user explicitly asked for peer-in-corner as an option, after being
+  // told the risk (the peer's audio is bound to this same view, and
+  // shrinking a view that carries live audio is exactly the bug fixed on
+  // 2026-09-24). It is being tried deliberately, not by accident: verify
+  // audio still survives an actual swap on a real call before trusting this.
+  const remoteIsCorner = swapped && peerVideoVisible;
+  const localIsCorner = !swapped && peerVideoVisible;
+
+  // 2026-09-26: the swap feature crashed a real call (camera toggle stopped
+  // working, then the app crashed outright) when this used to render a
+  // DIFFERENT JSX subtree per RTCView depending on corner-vs-full state — a
+  // bare <RTCView> in one branch, the same stream wrapped in an
+  // <Animated.View><RTCView> in the other. React has no way to know those
+  // are "the same" view across a re-render (different element types at the
+  // same tree position), so it unmounted and remounted the native RTCView
+  // on every swap/geometry change — tearing down and rebuilding the native
+  // binding to a LIVE MediaStream. react-native-webrtc is not documented as
+  // safe against that, and this is consistent with what was observed: video
+  // state corrupted after a toggle, then a native-level crash.
+  //
+  // Fixed by always rendering exactly ONE persistent RTCView per stream —
+  // never remounted — and moving only its wrapping View's style/transform
+  // between "corner" and "full" geometry. The element identity (and so the
+  // native view instance) never changes, only where it's drawn.
+  const remoteBoxStyle = remoteIsCorner
+    ? [
+        styles.cornerBox,
+        cornerAnchorStyle(cornerAnchor),
+        cornerHidden ? styles.cornerBoxHidden : null,
+        cornerDrag ? { transform: cornerDrag.getTranslateTransform() } : null,
+      ]
+    : visible
+      ? styles.remote
+      : styles.remoteAudioOnly;
+
+  // 2026-09-27: swapping to self-full-screen went to a black screen — this
+  // fallback used to read `peerVideoVisible ? styles.local : styles.localFull`
+  // unconditionally, which is pre-swap logic ("corner if there's a peer,
+  // full screen only if there's no call yet"). With swapped=true and a
+  // peer video present, localIsCorner is false NOT because there's no
+  // peer, but because local is supposed to take over the full screen — yet
+  // this still resolved to styles.local, the small FIXED top-right corner
+  // box (not full-screen, and not even the draggable corner — that's
+  // cornerBox/cornerAnchorStyle). The self video kept rendering pinned
+  // to that stale spot while remote had already moved to the real corner
+  // box, leaving nothing rendering full-screen at all.
+  const localBoxStyle = localIsCorner
+    ? [
+        styles.cornerBox,
+        cornerAnchorStyle(cornerAnchor),
+        cornerHidden ? styles.cornerBoxHidden : null,
+        cornerDrag ? { transform: cornerDrag.getTranslateTransform() } : null,
+      ]
+    : swapped
+      ? styles.localFull
+      : peerVideoVisible
+        ? styles.local
+        : styles.localFull;
+
   return (
     <View
       style={visible ? styles.visible : styles.audioOnly}
       pointerEvents="none"
     >
+      {/* 2026-09-29: zOrder is react-native-webrtc's OWN native z-stack —
+          separate from, and not governed by, React Native's usual
+          later-sibling-paints-on-top rule. It used to be hardcoded
+          local=1/remote=(implicit 0), which was only ever correct for the
+          UN-swapped layout (local small in a corner ON TOP of remote
+          full-screen). After a swap, local becomes full-screen and remote
+          moves into the corner — but local kept the higher zOrder, so
+          local's full-screen surface kept painting OVER remote's corner
+          box even though remote's corner sits geometrically inside local's
+          full-screen area. That's the "tap self to go full-screen and the
+          peer's corner thumbnail vanishes" bug: it was there the whole
+          time, just fully hidden behind local. Whichever side is
+          CURRENTLY in the corner needs the higher zOrder now, so it always
+          paints above whichever side is full-screen underneath it. */}
       {RTCView && remoteUrl ? (
-        <RTCView
-          streamURL={remoteUrl}
-          style={visible ? styles.remote : styles.remoteAudioOnly}
-          objectFit="cover"
-        />
+        <Animated.View style={remoteBoxStyle}>
+          <RTCView
+            streamURL={remoteUrl}
+            style={styles.fill}
+            objectFit="cover"
+            zOrder={remoteIsCorner ? 1 : 0}
+          />
+        </Animated.View>
       ) : null}
       {RTCView && localUrl && visible ? (
-        <RTCView
-          streamURL={localUrl}
-          // Full screen while waiting, corner thumbnail once the peer's
-          // video is up. Animating between the two is handled by the
-          // overlay; this just picks the target geometry.
-          style={peerVideoVisible ? styles.local : styles.localFull}
-          objectFit="cover"
-          zOrder={1}
-          // Only the front camera is mirrored. Mirroring is what makes a
-          // self-view feel like a mirror, but applying it to the REAR camera
-          // flips the world horizontally — text reads backwards and anything
-          // pointed at appears on the wrong side.
-          mirror={usingFrontCamera}
-        />
+        <Animated.View style={localBoxStyle}>
+          <RTCView
+            streamURL={localUrl}
+            style={styles.fill}
+            objectFit="cover"
+            zOrder={localIsCorner ? 1 : 0}
+            // Only the front camera is mirrored. Mirroring is what makes a
+            // self-view feel like a mirror, but applying it to the REAR
+            // camera flips the world horizontally — text reads backwards and
+            // anything pointed at appears on the wrong side.
+            mirror={usingFrontCamera}
+          />
+        </Animated.View>
       ) : null}
     </View>
   );
 });
+
+function cornerAnchorStyle(anchor: "top-right" | "top-left" | "bottom-right" | "bottom-left") {
+  switch (anchor) {
+    case "top-left":
+      return { top: 60, left: 16 };
+    case "bottom-right":
+      return { bottom: 100, right: 16 };
+    case "bottom-left":
+      return { bottom: 100, left: 16 };
+    case "top-right":
+    default:
+      return { top: 60, right: 16 };
+  }
+}
 
 const styles = StyleSheet.create({
   visible: StyleSheet.absoluteFillObject,
@@ -1728,4 +1896,20 @@ const styles = StyleSheet.create({
   },
   // Pre-connection: the user's own camera fills the screen.
   localFull: { ...StyleSheet.absoluteFillObject },
+  fill: { width: "100%", height: "100%" },
+  // Base geometry for the draggable/swappable corner box — position (top/
+  // left/right/bottom) is added per-anchor by cornerAnchorStyle, and drag
+  // offset by the cornerDrag transform, both applied where this is used.
+  cornerBox: {
+    position: "absolute",
+    width: 100,
+    height: 150,
+    borderRadius: 12,
+    overflow: "hidden",
+  },
+  // Hides the box visually without unmounting it — the stream underneath
+  // keeps flowing (this is cosmetic only, see cornerHidden's own doc
+  // comment), and pointerEvents keeps a hidden box from eating touches meant
+  // for whatever's now behind it.
+  cornerBoxHidden: { opacity: 0 },
 });

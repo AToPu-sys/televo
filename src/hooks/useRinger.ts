@@ -71,7 +71,18 @@ export function useRinger(active: boolean, mode: "incoming" | "outgoing") {
         // IIFE, it could land AFTER the mic was already live and quietly
         // drop the session out of playAndRecord. That is one of the ways a
         // call reached "Connected" carrying no audio at all.
-        await setAudioModeAsync({ playsInSilentMode: true, allowsRecording: true });
+        // interruptionMode: 'doNotMix' — without an explicit value here the
+        // session stayed in whatever mixing mode a previous setAudioModeAsync
+        // call (or expo-audio's own default) had left it in, which plays the
+        // ringtone ducked/mixed rather than at full, exclusive volume. This is
+        // very likely why a real incoming call "rings but very quietly" even
+        // with player.volume = 1.0 above: the SOURCE volume was maxed, but the
+        // session itself was never asked for full focus.
+        await setAudioModeAsync({
+          playsInSilentMode: true,
+          allowsRecording: true,
+          interruptionMode: "doNotMix",
+        });
 
         // keepAudioSessionActive: true — 2026-09-24, same fix and same real
         // trace as useConnectingTone.ts. This player's stop() runs exactly

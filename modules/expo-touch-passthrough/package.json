@@ -1,0 +1,9 @@
+{
+  "name": "expo-touch-passthrough",
+  "version": "1.0.0",
+  "description": "A native view that lets touches fall through to whatever is behind it (other UIKit windows included) outside a configurable set of still-interactive child rects. Exists because RN's <Modal> presents in its own UIViewController whose root content view has no pointerEvents concept of its own — a tap that RN's own box-none/none views correctly decline still lands on that bare root view and never reaches the window underneath.",
+  "main": "src/index.tsx",
+  "author": "Televo",
+  "license": "MIT",
+  "homepage": ""
+}

@@ -1,3 +1,4 @@
+import { setAudioModeAsync } from "expo-audio";
 import { requireNativeModule } from "expo-modules-core";
 import { Platform } from "react-native";
 
@@ -52,6 +53,19 @@ if (Platform.OS === "ios") {
  * flowing) is what was silently killing audio a few seconds into a
  * CallKit-answered call. A real user tap always goes through regardless. */
 export function setSpeakerphoneOn(enabled: boolean, userInitiated: boolean = false): void {
+  if (Platform.OS === "android") {
+    // Android has no CallKit-equivalent concept to race against here — there
+    // is no second system component that can also own the audio session —
+    // so this can apply unconditionally on every call, automatic or not.
+    // expo-audio's shouldRouteThroughEarpiece is exactly the "move audio
+    // between the earpiece and loudspeaker" primitive this module exists
+    // for; a real native module (ConnectionService/AudioManager, matching
+    // the iOS CallKit module's depth) is still the right long-term answer
+    // for the system-incoming-call UI, but the actual audio route for a
+    // call in progress needs nothing more than this.
+    void setAudioModeAsync({ shouldRouteThroughEarpiece: !enabled }).catch(() => {});
+    return;
+  }
   nativeModule?.setSpeakerphoneOn(enabled, userInitiated);
 }
 
@@ -60,12 +74,29 @@ export function setSpeakerphoneOn(enabled: boolean, userInitiated: boolean = fal
  * connects — the session is reconfigured by expo-audio, WebRTC and CallKit
  * at different points, and each reset drops the route. No-op off iOS. */
 export function configureForVoiceCall(): void {
+  if (Platform.OS === "android") {
+    // allowsRecording/interruptionMode matter here for the same reason as
+    // useRinger.ts's own setAudioModeAsync call: without 'doNotMix' the
+    // session can stay in whatever ducked/mixed mode a previous call left
+    // it in, and without allowsRecording a call connects with an open mic
+    // track but no audio actually captured.
+    void setAudioModeAsync({
+      allowsRecording: true,
+      playsInSilentMode: true,
+      interruptionMode: "doNotMix",
+    }).catch(() => {});
+    return;
+  }
   nativeModule?.configureForVoiceCall();
 }
 
 /** Clears the remembered loudspeaker preference so the next call starts on
  * the earpiece. Call when a call ends. */
 export function resetAudioRoute(): void {
+  if (Platform.OS === "android") {
+    void setAudioModeAsync({ shouldRouteThroughEarpiece: true }).catch(() => {});
+    return;
+  }
   nativeModule?.resetAudioRoute();
 }
 

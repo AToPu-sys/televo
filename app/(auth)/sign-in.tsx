@@ -6,6 +6,7 @@ import { KeyboardAvoidingView, Linking, Platform, Pressable, ScrollView, StyleSh
 import { PRIVACY_URL, TERMS_URL } from "../../src/lib/legal";
 import { validatePassword } from "../../src/lib/password";
 import { isPlausiblePhone } from "../../src/lib/phone";
+import { checkUsername, quickUsernameProblem, usernameProblemMessage } from "../../src/lib/username";
 import { SafeAreaView } from "react-native-safe-area-context";
 
 import { Button } from "../../src/components/Button";
@@ -36,6 +37,14 @@ function describeAuthError(caught: unknown, awaitingEmailCode: boolean): string 
   if (lowered.includes("rate limit") || lowered.includes("too many")) {
     return "Too many attempts. Wait a minute before trying again.";
   }
+  // GoTrue's own text for auth.users.banned_until being in the future — the
+  // same mechanism delete_own_account() sets permanently (063_soft_delete_account.sql),
+  // so this is the message a deleted account's owner sees if they try to
+  // sign back in. Also covers a moderation suspension, which uses the same
+  // column via a different path.
+  if (lowered.includes("banned")) {
+    return "This account is no longer available.";
+  }
   if (lowered.includes("phone") && lowered.includes("duplicate")) {
     return "That phone number is already used by another account. Sign in instead, or use a different number.";
   }
@@ -49,11 +58,26 @@ function describeAuthError(caught: unknown, awaitingEmailCode: boolean): string 
   return raw;
 }
 
+// App Review accounts sign in with password only: Apple's reviewers can't
+// receive the emailed code, and an app they can't sign into is an automatic
+// rejection (Guideline 2.1). Exactly these two addresses, each with a long
+// random password; every other account keeps the email-code second step.
+const PASSWORD_ONLY_REVIEW_ACCOUNTS = new Set([
+  "appreview1@gettelevo.space",
+  "appreview2@gettelevo.space",
+]);
+
 export default function SignInScreen() {
   const { theme } = useTheme();
   const router = useRouter();
-  const { signUpWithEmail, resendConfirmation, verifyPasswordOnly, sendEmailCode, verifyEmailCode } =
-    useAuth();
+  const {
+    signInWithEmail,
+    signUpWithEmail,
+    resendConfirmation,
+    verifyPasswordOnly,
+    sendEmailCode,
+    verifyEmailCode,
+  } = useAuth();
 
   const [mode, setMode] = useState<"sign-in" | "sign-up">("sign-in");
   const [email, setEmail] = useState("");
@@ -134,13 +158,12 @@ export default function SignInScreen() {
         return;
       }
     }
-    if (isSignUp && username.trim().length < 3) {
-      setError("Username must be at least 3 characters (letters, numbers, _ or .).");
-      return;
-    }
-    if (isSignUp && !/^[a-zA-Z0-9_.]+$/.test(username.trim())) {
-      setError("Username can only contain letters, numbers, underscores and dots.");
-      return;
+    if (isSignUp) {
+      const quick = quickUsernameProblem(username);
+      if (quick) {
+        setError(usernameProblemMessage(quick));
+        return;
+      }
     }
     // Required at signup, not optional: it's the only thing that lets a
     // friend find this account via their phone's contacts (useContactDiscovery)
@@ -154,6 +177,14 @@ export default function SignInScreen() {
     setBusy(true);
     try {
       if (isSignUp) {
+        // Offensive/reserved/taken are only known server-side. Checked before
+        // signUp because a rejected username inside the sign-up trigger
+        // surfaces from GoTrue as an opaque "Database error saving new user".
+        const problem = await checkUsername(username);
+        if (problem) {
+          setError(usernameProblemMessage(problem));
+          return;
+        }
         const { needsConfirmation } = await signUpWithEmail(email, password, {
           username: username.trim(),
           displayName: displayName.trim() || username.trim(),
@@ -169,6 +200,8 @@ export default function SignInScreen() {
       } else if (awaitingEmailCode) {
         // Second step: the emailed code is what actually creates the session.
         await verifyEmailCode(email, emailCode);
+      } else if (PASSWORD_ONLY_REVIEW_ACCOUNTS.has(email.trim().toLowerCase())) {
+        await signInWithEmail(email, password);
       } else {
         // First step: prove the password is right, then immediately drop that
         // session and require the mailbox too. verifyPassword signs in and

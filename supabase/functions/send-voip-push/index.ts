@@ -161,9 +161,26 @@ Deno.serve(async (req) => {
       .neq("user_id", call.caller_id),
   ]);
 
-  const recipientIds = (participants ?? []).map((p) => p.user_id);
-  if (recipientIds.length === 0) {
+  const allRecipientIds = (participants ?? []).map((p) => p.user_id);
+  if (allRecipientIds.length === 0) {
     return new Response("no recipients", { status: 200 });
+  }
+
+  // Excludes anyone who turned call notifications off (Settings →
+  // Notifications, added 2026-09-28). This only affects whether the VoIP
+  // push (and so the system incoming-call screen) is sent — it never
+  // affects the call itself: the recipient's app can still join the
+  // signaling channel and see the call in-app if it's already open, and
+  // this has no effect on notify_messages or on THEM placing a call.
+  const { data: recipientProfiles } = await admin
+    .from("profiles")
+    .select("id, notify_calls")
+    .in("id", allRecipientIds);
+  const recipientIds = (recipientProfiles ?? [])
+    .filter((p) => p.notify_calls)
+    .map((p) => p.id);
+  if (recipientIds.length === 0) {
+    return new Response("all recipients muted calls", { status: 200 });
   }
 
   const { data: tokenRows } = await admin
