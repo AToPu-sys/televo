@@ -53,6 +53,8 @@
       "bundler": "metro"
     },
     "plugins": [
+      "./plugins/ios-scene-delegate/withIosSceneLifecycle.js",
+      "./plugins/ios-pods-deployment-target/withPodsDeploymentTarget.js",
       "expo-router",
       "expo-secure-store",
       [
