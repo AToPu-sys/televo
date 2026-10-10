@@ -40,6 +40,16 @@ const OPERATOR_EMAIL = "operator@televo.invalid";
 const SUPPORT_FROM = "Televo <hello@gettelevo.space>";
 const APPEAL_WINDOW_DAYS = 3;
 
+// Accounts the agent can never queue a ban against, no matter what the
+// email says or how the model reads it — the operator/owner account, so a
+// report (genuine or not) can't result in Bek or Akbarjon's own account
+// getting auto-suspended while they're the only ones who can approve the
+// unban. Still replies normally, and a report against one of these still
+// goes in content_reports and reaches operatorContext — this only
+// withholds the BAN action itself, the same way unban is withheld from a
+// non-owner below. Lowercased usernames, without the @.
+const BAN_EXEMPT_USERNAMES = new Set(["theceo"]);
+
 // Resend's real email.received webhook carries METADATA only — email_id,
 // from (a plain "Name <addr>" string), subject — never the body. The body
 // has to be fetched from GET /emails/receiving/{email_id}. The first version
@@ -458,6 +468,7 @@ async function handleInboundEmail(
   let operatorContext = "";
   let targetUserId: string | null = null;
   let targetDisplayName: string | null = null;
+  let targetUsername: string | null = null;
   let supportBanCount = 0;
   // True only when the mail passed DMARC AND came from the exact address
   // registered on the account it names. Anyone can paste someone else's ID
@@ -486,6 +497,7 @@ async function handleInboundEmail(
     } else {
       targetUserId = profile.id;
       targetDisplayName = profile.display_name;
+      targetUsername = profile.username;
 
       const { data: authUser } = await admin.auth.admin.getUserById(profile.id);
       senderIsOwner =
@@ -639,6 +651,16 @@ async function handleInboundEmail(
   // out of that — this is the check the model can't be argued past.
   if (actionKind === "unban" && !senderIsOwner) {
     return new Response("handled (unban withheld: sender not verified owner)", { status: 200 });
+  }
+
+  // A ban is never queued against an exempt account (BAN_EXEMPT_USERNAMES
+  // above), regardless of what the report says or how the model reads it.
+  // Everything else still happens normally: the report is on file, the
+  // reply still sends, and operatorContext still carries it — only the
+  // auto-queued ban itself is withheld, same shape as the unban/owner check
+  // just above.
+  if (actionKind === "ban" && targetUsername && BAN_EXEMPT_USERNAMES.has(targetUsername.toLowerCase())) {
+    return new Response("handled (ban withheld: exempt account)", { status: 200 });
   }
 
   const actionLabel =
