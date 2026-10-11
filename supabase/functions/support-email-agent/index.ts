@@ -254,11 +254,11 @@ const SYSTEM_PROMPT = `You are Televo's support specialist, answering email sent
 - Privacy policy: gettelevo.space/privacy; terms: gettelevo.space/terms.
 
 # Accounts, bans and appeals
-You will get an ACCOUNT CHECK block computed by the system. Follow it exactly — it is the only source of truth about any account:
-- No ID in the thread and the person asks about their account or a ban → kindly ask for their Televo ID (Settings → Televo ID, or shown on the suspension screen) and ask them to write from the email registered on the account.
-- ID not found → say gently that no account with this ID was found and ask them to double-check it (copy it from Settings → Televo ID).
-- ID found but the sender is NOT verified as the owner → reveal nothing about that account (not its status, not a reason, not reports). Explain kindly that for their safety we only discuss an account with its owner, and ask them to write from the email registered on that account. If they are REPORTING that account instead, that's fine — accept the report.
-- Verified owner → tell them their account status clearly and kindly:
+You will get an ACCOUNT CHECK block computed by the system, starting with a line "ACCOUNT_STATUS: <one of NO_ID | NOT_FOUND | FOUND_NOT_OWNER | FOUND_OWNER>". That single field is the only source of truth about the account — base your reply on ACCOUNT_STATUS alone, never on your own reading of the surrounding sentences (they are for context and phrasing only, and "found"/"not found" can appear in either one, so do not pattern-match on those words):
+- ACCOUNT_STATUS: NO_ID — no ID in the thread yet. If the person asks about their account or a ban, kindly ask for their Televo ID (Settings → Televo ID, or shown on the suspension screen) and ask them to write from the email registered on the account.
+- ACCOUNT_STATUS: NOT_FOUND — say gently that no account with this ID was found and ask them to double-check it (copy it from Settings → Televo ID).
+- ACCOUNT_STATUS: FOUND_NOT_OWNER — an account exists but the sender is NOT verified as its owner → reveal nothing about that account (not its status, not a reason, not reports). Explain kindly that for their safety we only discuss an account with its owner, and ask them to write from the email registered on that account. If they are REPORTING that account instead, that's fine — accept the report.
+- ACCOUNT_STATUS: FOUND_OWNER — verified owner → tell them their account status clearly and kindly:
   - Active: reassure them there are no restrictions on the account.
   - Suspended: say until when (or that it's indefinite) and explain the reason in plain human words (paraphrase the reason on file — never quote internal codes or technical text). Never reveal who reported them.
   - Then handle the appeal: if the reported messages read as banter, a joke between friends or a misunderstanding (words like "тупой" between friends aren't automatically abuse), say you've passed the request on and, if everything checks out, the restriction will usually be lifted within 24 hours — set action {"kind":"unban"}. If something reads as genuine hostility, threats or repeated targeted abuse, gently quote the specific message back, explain why the team takes it seriously, and invite them to explain within ${APPEAL_WINDOW_DAYS} days — set action null this round; decide on a later message in the same thread.
@@ -481,6 +481,13 @@ async function handleInboundEmail(
   // decided here, in code, not by how persuasive the email is.
   const senderLine = `Sender: ${email.fromName ?? "(no name)"} <${fromEmail}>, sender authentication (DMARC): ${email.dmarcPass ? "pass" : "FAIL"}.`;
   let accountCheck = "No Televo ID found anywhere in the thread yet.";
+  // The model is told exactly one of these four values and must base its
+  // reply on this field alone — see the fix for the 2026-10-11 incident
+  // where gpt-oss-120b misread the free-text accountCheck sentence (which
+  // contains the word "found" in both the FOUND_OWNER and NOT_FOUND cases)
+  // and told a verified, existing account owner that their account didn't
+  // exist. A single unambiguous enum the model can't pattern-match wrong.
+  let accountStatus: "NO_ID" | "NOT_FOUND" | "FOUND_NOT_OWNER" | "FOUND_OWNER" = "NO_ID";
 
   if (claimedIdMatch) {
     const candidateId = claimedIdMatch[0].toLowerCase();
@@ -491,8 +498,10 @@ async function handleInboundEmail(
       .maybeSingle();
 
     if (!profile) {
+      accountStatus = "NOT_FOUND";
       accountCheck = `Televo ID ${candidateId}: no account with this ID exists.`;
     } else if (profile.is_deleted) {
+      accountStatus = "NOT_FOUND";
       accountCheck = `Televo ID ${candidateId}: this account was deleted by its owner and can't be restored.`;
     } else {
       targetUserId = profile.id;
@@ -549,13 +558,14 @@ async function handleInboundEmail(
         .join("\n");
 
       operatorContext = ownerDetails;
+      accountStatus = senderIsOwner ? "FOUND_OWNER" : "FOUND_NOT_OWNER";
       accountCheck = senderIsOwner
         ? `Televo ID ${profile.id}: account FOUND, and the sender IS its verified owner (registered email matches, authentication passed). You may discuss this account with them.\n${ownerDetails}`
         : `Televo ID ${profile.id}: account FOUND, but the sender is NOT its verified owner (${email.dmarcPass ? "their address is not the one registered on this account" : "the email failed sender authentication"}). Reveal nothing about this account. If they are reporting it, accept the report.`;
     }
   }
 
-  const modelContext = `\n\nACCOUNT CHECK (computed by the system — the only source of truth about accounts):\n${senderLine}\n${accountCheck}`;
+  const modelContext = `\n\nACCOUNT CHECK (computed by the system — the only source of truth about accounts):\nACCOUNT_STATUS: ${accountStatus}\n${senderLine}\n${accountCheck}`;
 
   // Groq's Chat Completions endpoint is OpenAI-compatible: system prompt
   // goes in the messages array (not a separate top-level field like
