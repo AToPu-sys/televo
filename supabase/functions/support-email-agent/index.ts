@@ -498,7 +498,18 @@ async function handleInboundEmail(
     .eq("thread_id", threadId)
     .order("created_at", { ascending: true });
 
-  const threadText = (threadSoFar ?? [])
+  // Groq's on-demand tier caps openai/gpt-oss-120b at 8000 tokens/minute —
+  // a long-lived thread (this one's been re-tested many times in one day)
+  // can grow threadText past that on its own, and every request fails with
+  // a 413/429 ("Request too large" / "Rate limit exceeded") until someone
+  // notices the operator-error emails (happened 2026-10-11). Keep only the
+  // most recent messages: old back-and-forth is rarely needed to answer the
+  // newest one, and claimedIdMatch below already prefers the newest inbound
+  // message for the ID anyway, so trimming history here doesn't reintroduce
+  // the earlier "stuck on a stale ID" bug.
+  const MAX_THREAD_MESSAGES = 10;
+  const trimmedThread = (threadSoFar ?? []).slice(-MAX_THREAD_MESSAGES);
+  const threadText = trimmedThread
     .map((m) => `[${m.direction === "inbound" ? m.from_email : "Televo support"} — ${m.created_at}]\n${m.body}`)
     .join("\n\n---\n\n");
 
