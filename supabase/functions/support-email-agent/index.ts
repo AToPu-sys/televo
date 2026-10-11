@@ -502,9 +502,33 @@ async function handleInboundEmail(
     .map((m) => `[${m.direction === "inbound" ? m.from_email : "Televo support"} — ${m.created_at}]\n${m.body}`)
     .join("\n\n---\n\n");
 
-  // Look for a user ID ANYWHERE in the thread — the sender may have
-  // included it in an earlier message, not necessarily this one.
-  const claimedIdMatch = threadText.match(UUID_RE);
+  // Look for a user ID, preferring the sender's MOST RECENT inbound message
+  // and only falling back to earlier ones if the latest message has none —
+  // e.g. they gave their ID once, then just replied "any update?" later.
+  //
+  // This used to be `threadText.match(UUID_RE)` over the WHOLE thread
+  // (oldest message first), which with a non-global regex always returns
+  // the FIRST UUID anywhere in the thread's entire history. On a thread
+  // that started as a report against someone else's account (containing
+  // THEIR id early on), every later message from the reporter asking about
+  // their OWN account — even giving their own ID explicitly, repeatedly —
+  // got silently re-pinned to that stale first ID. The system then
+  // computed a real, correct-looking ACCOUNT_STATUS for the WRONG account
+  // and the agent coherently told a verified owner it was handling a
+  // report they weren't making (2026-10-11 incident). Always prefer the
+  // newest inbound message's own ID over anything from earlier history.
+  const inboundNewestFirst = (threadSoFar ?? [])
+    .filter((m) => m.direction === "inbound")
+    .slice()
+    .reverse();
+  let claimedIdMatch: RegExpMatchArray | null = null;
+  for (const m of inboundNewestFirst) {
+    const found = m.body.match(UUID_RE);
+    if (found) {
+      claimedIdMatch = found;
+      break;
+    }
+  }
   let operatorContext = "";
   let targetUserId: string | null = null;
   let targetDisplayName: string | null = null;
