@@ -26,8 +26,11 @@ export default function ForwardMessageScreen() {
 
   useEffect(() => {
     if (!messageId) return;
+    // messages_decrypted: scripts/sql/076_at_rest_message_encryption.sql —
+    // source.body below must be the DB-decrypted value, same reasoning as
+    // useMessages.ts's load().
     supabase
-      .from("messages")
+      .from("messages_decrypted")
       .select("*")
       .eq("id", messageId)
       .single()

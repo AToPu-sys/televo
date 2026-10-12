@@ -38,9 +38,15 @@ as $$
      where cp.user_id = auth.uid()
   ),
   latest as (
+    -- m.body is decrypted here because this function reads the raw
+    -- messages table directly (scripts/sql/076_at_rest_message_encryption.sql
+    -- made that column DB-level ciphertext at rest) and is SECURITY DEFINER,
+    -- so it can call decrypt_message_body itself rather than going through
+    -- messages_decrypted. Found live via a user screenshot of the chat list
+    -- showing raw ciphertext as the preview text (2026-10-12).
     select distinct on (m.conversation_id)
            m.conversation_id,
-           m.body,
+           public.decrypt_message_body(m.body) as body,
            m.kind,
            m.created_at,
            m.sender_id

@@ -112,8 +112,12 @@ Deno.serve(async (req) => {
     return new Response("not an assistant conversation", { status: 200 });
   }
 
+  // messages_decrypted (not the raw table): scripts/sql/076_at_rest_message_encryption.sql
+  // encrypts body at rest — this is service_role, which bypasses RLS same
+  // as always, but still needs the view to get real text back instead of
+  // DB-level ciphertext.
   const { data: history } = await admin
-    .from("messages")
+    .from("messages_decrypted")
     .select("sender_id, body, kind, created_at")
     .eq("conversation_id", message.conversation_id)
     .eq("kind", "text")

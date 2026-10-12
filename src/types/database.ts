@@ -1251,7 +1251,34 @@ export type Database = {
       }
     }
     Views: {
-      [_ in never]: never
+      // scripts/sql/076_at_rest_message_encryption.sql — same shape as
+      // messages, but `body` is transparently decrypted through the
+      // DB-level at-rest encryption layer. Read-only (views aren't
+      // writable here); all inserts/updates still go through `messages`
+      // itself, which the trigger encrypts on the way in.
+      messages_decrypted: {
+        Row: {
+          id: string
+          conversation_id: string
+          sender_id: string
+          kind: Database["public"]["Enums"]["message_kind"]
+          body: string | null
+          media_url: string | null
+          shared_activity_id: string | null
+          shared_profile_id: string | null
+          document_name: string | null
+          document_size_bytes: number | null
+          media_duration_ms: number | null
+          waveform: string | null
+          reply_to_id: string | null
+          forwarded_from_message_id: string | null
+          forwarded_from_sender_id: string | null
+          created_at: string
+          edited_at: string | null
+          expires_at: string | null
+        }
+        Relationships: []
+      }
     }
     Functions: {
       add_group_members: {

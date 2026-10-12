@@ -157,8 +157,13 @@ export function useMessages(
       // ignore — server fetch below is authoritative
     }
 
+    // messages_decrypted (not the raw messages table): scripts/sql/076_at_rest_message_encryption.sql
+    // transparently decrypts the DB-level encryption layer for every row —
+    // for a Secret Chat that still leaves the {ciphertext,nonce} E2E
+    // envelope in body, which decorateWithDecryption below then decrypts
+    // the rest of the way client-side, same as always.
     const { data, error: queryError } = await supabase
-      .from("messages")
+      .from("messages_decrypted")
       .select("*")
       .eq("conversation_id", conversationId)
       .order("created_at", { ascending: false })
@@ -200,7 +205,7 @@ export function useMessages(
     loadingOlderRef.current = true;
     try {
       const { data, error: olderError } = await supabase
-        .from("messages")
+        .from("messages_decrypted")
         .select("*")
         .eq("conversation_id", conversationId)
         .lt("created_at", oldest.created_at)
@@ -251,11 +256,24 @@ export function useMessages(
           filter: `conversation_id=eq.${conversationId}`,
         },
         (payload) => {
-          const incoming = payload.new as MessageRow;
-          void upsertLocalMessages([incoming]).catch(() => {});
-
+          // payload.new carries the RAW table row — since
+          // 076_at_rest_message_encryption.sql, that's the DB-level
+          // ciphertext, not real content. postgres_changes streams straight
+          // off the table/WAL and has no way to run the decrypt function, so
+          // this is now a signal ("a row with this id was inserted"), not
+          // the content itself: re-fetch the one row through
+          // messages_decrypted, which does. One extra round trip per
+          // message, not per keystroke.
+          const incomingRaw = payload.new as MessageRow;
           void (async () => {
-            const [decorated] = await decorateWithDecryption([incoming]);
+            const { data: incoming } = await supabase
+              .from("messages_decrypted")
+              .select("*")
+              .eq("id", incomingRaw.id)
+              .maybeSingle();
+            if (!incoming) return;
+            void upsertLocalMessages([incoming as MessageRow]).catch(() => {});
+            const [decorated] = await decorateWithDecryption([incoming as MessageRow]);
 
             setMessages((current) => {
               // Our own optimistic copy is already on screen — swap it for the
@@ -291,10 +309,18 @@ export function useMessages(
           filter: `conversation_id=eq.${conversationId}`,
         },
         (payload) => {
-          const updated = payload.new as MessageRow;
-          void upsertLocalMessages([updated]).catch(() => {});
+          // See the INSERT handler's comment: payload.new is ciphertext,
+          // re-fetch the decrypted row by id instead of trusting it.
+          const updatedRaw = payload.new as MessageRow;
           void (async () => {
-            const [decorated] = await decorateWithDecryption([updated]);
+            const { data: updated } = await supabase
+              .from("messages_decrypted")
+              .select("*")
+              .eq("id", updatedRaw.id)
+              .maybeSingle();
+            if (!updated) return;
+            void upsertLocalMessages([updated as MessageRow]).catch(() => {});
+            const [decorated] = await decorateWithDecryption([updated as MessageRow]);
             setMessages((current) =>
               current.map((message) => (message.id === decorated.id ? decorated : message))
             );

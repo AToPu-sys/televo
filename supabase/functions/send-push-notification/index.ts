@@ -127,12 +127,24 @@ Deno.serve(async (req) => {
     return new Response("no push tokens registered", { status: 200 });
   }
 
+  // The webhook payload's message.body is the RAW table row as it existed
+  // the instant the INSERT trigger ran — since
+  // scripts/sql/076_at_rest_message_encryption.sql that's DB-level
+  // ciphertext, not real content (for a Secret Chat it's always been an
+  // E2E envelope, same as before; previewFor already hides that case via
+  // is_encrypted and never needed the real text). decrypt_message_body is
+  // granted directly to service_role for exactly this: a non-SELECT read
+  // path that can't go through the messages_decrypted view.
+  const { data: decryptedBody } = await admin.rpc("decrypt_message_body", {
+    p_ciphertext: message.body,
+  });
+
   const senderName = sender?.display_name ?? "Someone";
   const title = conversation.kind === "group" ? conversation.title ?? "Group" : senderName;
   const body =
     conversation.kind === "group"
-      ? `${senderName}: ${previewFor(message.kind, message.body, conversation.is_encrypted)}`
-      : previewFor(message.kind, message.body, conversation.is_encrypted);
+      ? `${senderName}: ${previewFor(message.kind, decryptedBody, conversation.is_encrypted)}`
+      : previewFor(message.kind, decryptedBody, conversation.is_encrypted);
 
   const notifications = tokens.map((token) => ({
     to: token,
