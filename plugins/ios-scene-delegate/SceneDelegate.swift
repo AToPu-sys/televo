@@ -36,7 +36,7 @@ import UIKit
 /// runs on — not an iOS-27-only branch living alongside the old path. No
 /// `@available` gate or legacy fallback is needed or present here.
 public class SceneDelegate: UIResponder, UIWindowSceneDelegate {
-  var window: UIWindow?
+  public var window: UIWindow?
 
   public func scene(
     _ scene: UIScene,

@@ -38,10 +38,14 @@ function patchAppDelegate(contents) {
   // our delegate class, and scene:willConnectToSession:options: never
   // fires at all.
   if (!contents.includes("configurationForConnecting")) {
+    // No `override`: ExpoAppDelegate doesn't implement this itself, so
+    // it's a plain UIApplicationDelegate protocol conformance, not an
+    // override of a superclass method — `override` here fails to compile
+    // ("method does not override any method from its superclass").
     contents = contents.replace(
       /\}\n\nclass ReactNativeDelegate/,
       "\n" +
-        "  public override func application(\n" +
+        "  public func application(\n" +
         "    _ application: UIApplication,\n" +
         '    configurationForConnecting connectingSceneSession: UISceneSession,\n' +
         "    options: UIScene.ConnectionOptions\n" +
