@@ -25,7 +25,7 @@ export default function VerifySafetyNumberScreen() {
   const { theme } = useTheme();
   const router = useRouter();
   const { user } = useAuth();
-  const { publicKey } = useE2ee();
+  const { publicKey, confirmPeerKeyChange } = useE2ee();
   const { peerId, peerName, conversationId } = useLocalSearchParams<{
     peerId: string;
     peerName: string;
@@ -67,6 +67,12 @@ export default function VerifySafetyNumberScreen() {
   async function handleConfirmMatch() {
     if (!conversationId || !peerPublicKey) return;
     await setPeerKeyVerified(conversationId, peerPublicKey);
+    // This is the ONE place a changed key may be re-trusted — the user just
+    // compared the safety number out of band and confirmed it matches, the
+    // actual check that rules out a man-in-the-middle. See
+    // confirmPeerKeyChange's comment for why the banner's bare "X" dismiss
+    // must never do this instead.
+    await confirmPeerKeyChange(conversationId);
     setConfirmed(true);
   }
 

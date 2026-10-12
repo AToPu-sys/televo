@@ -71,9 +71,17 @@ type E2eeContextValue = {
    * screen can show a "peer's key changed, re-verify" banner instead of
    * silently accepting it. */
   peerKeyChanged: Set<string>;
-  /** Call once the user has seen and acknowledged a key-change banner (e.g.
-   * after re-verifying the safety number), so it doesn't keep reappearing. */
+  /** Hides the key-change banner for the current session WITHOUT trusting
+   * the new key — tapping the banner's dismiss "X" calls this, not
+   * confirmPeerKeyChange. Security-critical distinction: see
+   * confirmPeerKeyChange's own comment for why dismiss must never silently
+   * re-pin trust. The banner reappears next time this conversation's
+   * session key is loaded, until the key is actually verified. */
   acknowledgeKeyChange: (conversationId: string) => void;
+  /** The ONLY action that may re-arm trust-on-first-use for a changed peer
+   * key — call after the user has compared and confirmed the safety number
+   * out of band (verify-safety-number.tsx), never from a bare dismiss. */
+  confirmPeerKeyChange: (conversationId: string) => Promise<void>;
   /** Deposits a wrapped copy of an already-established session key for any
    * participant who's missing one — never mints a new key, so it can't
    * desync anyone who already has a working copy. No-ops if this device
@@ -304,8 +312,35 @@ export function E2eeProvider({
     [userId, keyPair]
   );
 
-  const acknowledgeKeyChange = useCallback(
-    (conversationId: string) => {
+  // SECURITY: dismissing the key-change warning (the banner's "X") must
+  // NEVER silently re-pin trust to the new key — that would make tapping it
+  // functionally identical to clicking through a TLS certificate warning.
+  // Someone actually under a man-in-the-middle attack would see the red
+  // banner, instinctively tap "X" to make it go away, and the app would
+  // then trust the attacker's key forever with no further warning. Only an
+  // explicit, successful safety-number comparison (verify-safety-number.tsx
+  // calling confirmPeerKeyChange below) may re-pin trust. This function only
+  // hides the banner for the current session; it reappears on next launch
+  // (or next time this conversation's key is loaded) until actually
+  // verified — the same tradeoff Signal makes, favoring a safe default over
+  // a quiet one.
+  const acknowledgeKeyChange = useCallback((conversationId: string) => {
+    setPeerKeyChanged((current) => {
+      if (!current.has(conversationId)) return current;
+      const next = new Set(current);
+      next.delete(conversationId);
+      return next;
+    });
+  }, []);
+
+  /** The ONLY path that may re-arm trust-on-first-use for a changed key —
+   * called after the user has actually compared and confirmed the safety
+   * number out of band (verify-safety-number.tsx), never from a bare
+   * dismiss. Scoped to this device's own row: a group chat has one row per
+   * recipient, and every other recipient's sender_public_key is a different
+   * person's key entirely. */
+  const confirmPeerKeyChange = useCallback(
+    async (conversationId: string) => {
       setPeerKeyChanged((current) => {
         if (!current.has(conversationId)) return current;
         const next = new Set(current);
@@ -313,21 +348,14 @@ export function E2eeProvider({
         return next;
       });
       if (!userId) return;
-      // Re-arm trust-on-first-use for the new key so the banner doesn't
-      // reappear on the same key next launch — the user has now (re)verified
-      // it. Scoped to this device's own row: a group chat has one row per
-      // recipient, and every other recipient's sender_public_key is a
-      // different person's key entirely.
       sessionKeys.current.delete(conversationId);
-      void supabase
+      const { data } = await supabase
         .from("encrypted_session_keys")
         .select("sender_public_key")
         .eq("conversation_id", conversationId)
         .eq("recipient_id", userId)
-        .maybeSingle()
-        .then(({ data }) => {
-          if (data?.sender_public_key) void setTrustedPeerKey(conversationId, data.sender_public_key);
-        });
+        .maybeSingle();
+      if (data?.sender_public_key) await setTrustedPeerKey(conversationId, data.sender_public_key);
     },
     [userId]
   );
@@ -797,6 +825,7 @@ export function E2eeProvider({
       decryptForConversation,
       peerKeyChanged,
       acknowledgeKeyChange,
+      confirmPeerKeyChange,
       repairMissingSessionKeys,
       repairAllSessionKeys,
       hasWorkingSessionKey,
@@ -816,6 +845,7 @@ export function E2eeProvider({
       decryptForConversation,
       peerKeyChanged,
       acknowledgeKeyChange,
+      confirmPeerKeyChange,
       repairMissingSessionKeys,
       repairAllSessionKeys,
       hasWorkingSessionKey,
