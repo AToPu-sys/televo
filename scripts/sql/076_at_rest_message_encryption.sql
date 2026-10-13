@@ -113,13 +113,21 @@ $$;
 
 revoke all on function public.encrypt_message_body(text) from public, anon, authenticated;
 revoke all on function public.decrypt_message_body(text) from public, anon, authenticated;
--- authenticated needs decrypt (via the view/RPCs below, which call it) but
--- the raw function itself is only ever invoked FROM another SECURITY
--- DEFINER context (the view, the trigger, the RPCs) -- granting it directly
--- to authenticated would let any signed-in user decrypt ANY row's body by
--- id, bypassing conversation-membership RLS entirely. Only service_role
--- (edge functions) gets direct execute.
 grant execute on function public.decrypt_message_body(text) to service_role;
+-- Also needed by `authenticated`: messages_decrypted below is a
+-- `security_invoker = true` view, so when IT calls decrypt_message_body the
+-- EXECUTE check runs against the querying user's own role, not the view
+-- owner -- unlike a SECURITY DEFINER function (chat_list_summary, etc.),
+-- which calls this function as its own owner regardless of who invoked it.
+-- Without this grant every authenticated client read through the view (and
+-- therefore every chat screen) failed with "permission denied for function
+-- decrypt_message_body" -- found live in production on 2026-10-13, the
+-- morning after this migration first shipped. decrypt_message_body still
+-- only takes raw ciphertext text, not a row id, so this doesn't bypass
+-- conversation-membership RLS: a user can only ever obtain another
+-- conversation's ciphertext bytes to begin with if some OTHER bug already
+-- leaked them past the messages table's own RLS.
+grant execute on function public.decrypt_message_body(text) to authenticated;
 
 -- Encrypts body transparently on write. Runs for every message, regardless
 -- of is_encrypted -- an E2E envelope is just another string to this layer.

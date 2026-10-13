@@ -11,7 +11,7 @@
       "supportsTablet": false,
       "bundleIdentifier": "com.televo.app",
       "infoPlist": {
-        "ITSAppUsesNonExemptEncryption": true,
+        "ITSAppUsesNonExemptEncryption": false,
         "NSMicrophoneUsageDescription": "Televo uses your microphone for voice and video calls.",
         "NSCameraUsageDescription": "Televo uses your camera for video calls.",
         "NSPhotoLibraryUsageDescription": "Televo needs access to your photos so you can send them in chats.",
@@ -24,7 +24,7 @@
           "remote-notification"
         ]
       },
-      "buildNumber": "1",
+      "buildNumber": "89",
       "associatedDomains": [
         "applinks:gettelevo.space"
       ]

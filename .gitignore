@@ -51,3 +51,6 @@ firebase-debug.*
 # generated native folders
 /ios
 /android
+
+# local archive/export output from xcodebuild
+/build
