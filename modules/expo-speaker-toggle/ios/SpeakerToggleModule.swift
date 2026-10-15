@@ -116,8 +116,123 @@ public class SpeakerToggleModule: Module {
     }
   }
 
+  // MARK: - Choosing where the call's sound goes (iPhone, speaker, AirPods…)
+
+  private static let externalKinds: [AVAudioSession.Port: String] = [
+    .bluetoothHFP: "bluetooth", .bluetoothA2DP: "bluetooth", .bluetoothLE: "bluetooth",
+    .headphones: "headphones", .headsetMic: "headphones", .carAudio: "car",
+    .usbAudio: "usb", .airPlay: "airplay",
+  ]
+
+  /// Every place the call's sound can go right now. Built-in routes have
+  /// fixed ids ("receiver", "speaker"); external devices use the port's uid,
+  /// which is what setPreferredInput needs to select them.
+  static func audioRoutes() -> [String: Any] {
+    let session = AVAudioSession.sharedInstance()
+    var routes: [[String: String]] = [
+      ["id": "receiver", "name": "iPhone", "kind": "receiver"],
+      ["id": "speaker", "name": "Speaker", "kind": "speaker"],
+    ]
+    for input in session.availableInputs ?? [] {
+      guard let kind = externalKinds[input.portType] else { continue }
+      routes.append(["id": input.uid, "name": input.portName, "kind": kind])
+    }
+    return ["routes": routes, "current": currentRouteId()]
+  }
+
+  static func currentRouteId() -> String {
+    let route = AVAudioSession.sharedInstance().currentRoute
+    guard let output = route.outputs.first else { return "receiver" }
+    switch output.portType {
+    case .builtInSpeaker: return "speaker"
+    case .builtInReceiver: return "receiver"
+    default:
+      // AirPods & co. are one device with the same name on both sides; the
+      // input's uid is the id setAudioRoute selects them by.
+      if let input = route.inputs.first, externalKinds[input.portType] != nil { return input.uid }
+      if let input = AVAudioSession.sharedInstance().availableInputs?.first(where: { $0.portName == output.portName }) {
+        return input.uid
+      }
+      return output.uid
+    }
+  }
+
+  /// Moves the call to `id`. Never calls setCategory (see applyAudioRoute for
+  /// why a category rebuild mid-call kills the audio): built-in routes go
+  /// through the existing mode/override path, external devices through
+  /// setPreferredInput, which is a plain route change WebRTC follows.
+  static func selectAudioRoute(_ id: String) -> Bool {
+    let session = AVAudioSession.sharedInstance()
+    let rtcSession = RTCAudioSession.sharedInstance()
+    let builtInMic = session.availableInputs?.first { $0.portType == .builtInMic }
+    switch id {
+    case "speaker", "receiver":
+      speakerEnabled = id == "speaker"
+      rtcSession.lockForConfiguration()
+      try? session.setPreferredInput(builtInMic)
+      rtcSession.unlockForConfiguration()
+      applyAudioRoute()
+      return true
+    default:
+      guard let port = session.availableInputs?.first(where: { $0.uid == id }) else { return false }
+      speakerEnabled = false
+      rtcSession.lockForConfiguration()
+      defer { rtcSession.unlockForConfiguration() }
+      do {
+        try session.overrideOutputAudioPort(.none)
+        if session.mode != .voiceChat { try session.setMode(.voiceChat) }
+        try session.setPreferredInput(port)
+        return true
+      } catch {
+        NSLog("[SpeakerToggle] selecting \(port.portName) failed: \(error)")
+        return false
+      }
+    }
+  }
+
+  private static func reasonName(_ value: UInt) -> String {
+    switch AVAudioSession.RouteChangeReason(rawValue: value) {
+    case .newDeviceAvailable: return "newDevice"
+    case .oldDeviceUnavailable: return "deviceRemoved"
+    case .override: return "override"
+    case .categoryChange: return "category"
+    default: return "other"
+    }
+  }
+
+  private var routeObserver: NSObjectProtocol?
+
   public func definition() -> ModuleDefinition {
     Name("SpeakerToggle")
+
+    Events("onAudioRouteChange")
+
+    // iOS itself moves a call to AirPods the moment they connect and back to
+    // the iPhone when they're removed; this reports every such move so the
+    // call screen always shows where the sound really is.
+    OnStartObserving {
+      self.routeObserver = NotificationCenter.default.addObserver(
+        forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main
+      ) { [weak self] note in
+        let reason = (note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt) ?? 0
+        var payload = SpeakerToggleModule.audioRoutes()
+        payload["reason"] = SpeakerToggleModule.reasonName(reason)
+        self?.sendEvent("onAudioRouteChange", payload)
+      }
+    }
+
+    OnStopObserving {
+      if let observer = self.routeObserver { NotificationCenter.default.removeObserver(observer) }
+      self.routeObserver = nil
+    }
+
+    Function("getAudioRoutes") { () -> [String: Any] in
+      SpeakerToggleModule.audioRoutes()
+    }
+
+    Function("setAudioRoute") { (id: String) -> Bool in
+      SpeakerToggleModule.selectAudioRoute(id)
+    }
 
     // `userInitiated` distinguishes an explicit tap on the in-app speaker
     // button from the automatic re-asserts useCall.ts fires on "local-ready"

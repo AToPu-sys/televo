@@ -1,4 +1,5 @@
 import { endCallPip, onCallPipFailedToStart, startCallPip } from "expo-call-pip";
+import { addAudioRouteListener, getAudioRoutes, setAudioRoute, type AudioRoute } from "expo-speaker-toggle";
 import { activateKeepAwakeAsync, deactivateKeepAwake } from "expo-keep-awake";
 import { useEffect, useRef, useState } from "react";
 import {
@@ -26,6 +27,7 @@ import { useRinger } from "../hooks/useRinger";
 import { useTheme } from "../hooks/useTheme";
 import { HAS_NO_TURN } from "../lib/webrtc";
 import { spacing } from "../theme";
+import { ActionSheet } from "./ActionSheet";
 import { Avatar } from "./Avatar";
 import { CallButton } from "./CallButton";
 
@@ -144,6 +146,42 @@ export function CallOverlay({
   minimized,
   onMinimizedChange,
 }: CallOverlayProps) {
+  // Where the sound goes: iPhone, speaker, or a connected headset/AirPods/car.
+  const [audioRoutes, setAudioRoutes] = useState(() => getAudioRoutes());
+  const [routeSheetOpen, setRouteSheetOpen] = useState(false);
+  const routeContext = useRef({ speakerOn, isVideo, onToggleSpeaker });
+  routeContext.current = { speakerOn, isVideo, onToggleSpeaker };
+
+  useEffect(() => {
+    setAudioRoutes(getAudioRoutes());
+    return addAudioRouteListener((change) => {
+      setAudioRoutes({ routes: change.routes, current: change.current });
+      const current = change.routes.find((route) => route.id === change.current);
+      if (!current) return;
+      const { speakerOn: onSpeaker, isVideo: video, onToggleSpeaker: toggle } = routeContext.current;
+      if (change.reason === "newDevice" && isExternalRoute(current) && onSpeaker) {
+        // iOS moved the call onto headphones that just connected; keep the
+        // speaker state in step instead of showing a stale "Speaker on".
+        toggle();
+      } else if (change.reason === "deviceRemoved" && current.kind === "receiver" && video) {
+        // AirPods taken out mid video call: iOS falls back to the earpiece,
+        // which nobody holding a video call can hear.
+        setAudioRoute("speaker");
+        if (!onSpeaker) toggle();
+      }
+    });
+  }, []);
+
+  const currentRoute = audioRoutes.routes.find((route) => route.id === audioRoutes.current);
+  const hasExternalRoute = audioRoutes.routes.some(isExternalRoute);
+
+  const chooseRoute = (route: AudioRoute) => {
+    setRouteSheetOpen(false);
+    setAudioRoute(route.id);
+    // Keep useCall's speaker state (and the native speaker flag) in step.
+    if ((route.kind === "speaker") !== speakerOn) onToggleSpeaker();
+    setAudioRoutes(getAudioRoutes());
+  };
   const { theme } = useTheme();
 
   // Silence the ringtone the moment Accept is tapped, rather than waiting for
@@ -1045,14 +1083,27 @@ export function CallOverlay({
                     small
                   />
                 ) : null}
-                <CallButton
-                  icon={speakerOn ? "volume-high" : "volume-medium-outline"}
-                  color={speakerOn ? theme.accent : theme.surfaceElevated}
-                  iconColor={speakerOn ? "#FFFFFF" : showVideo ? "#FFFFFF" : theme.text}
-                  onPress={onToggleSpeaker}
-                  label={speakerOn ? "Speaker on" : "Speaker off"}
-                  small
-                />
+                {hasExternalRoute && currentRoute ? (
+                  // A headset or AirPods is connected: the button opens a
+                  // picker instead of toggling, and shows where sound is now.
+                  <CallButton
+                    icon={routeIcon(currentRoute)}
+                    color={currentRoute.kind === "receiver" ? theme.surfaceElevated : theme.accent}
+                    iconColor={currentRoute.kind === "receiver" && !showVideo ? theme.text : "#FFFFFF"}
+                    onPress={() => setRouteSheetOpen(true)}
+                    label={routeLabel(currentRoute)}
+                    small
+                  />
+                ) : (
+                  <CallButton
+                    icon={speakerOn ? "volume-high" : "volume-medium-outline"}
+                    color={speakerOn ? theme.accent : theme.surfaceElevated}
+                    iconColor={speakerOn ? "#FFFFFF" : showVideo ? "#FFFFFF" : theme.text}
+                    onPress={onToggleSpeaker}
+                    label={speakerOn ? "Speaker on" : "Speaker off"}
+                    small
+                  />
+                )}
                 <CallButton icon="call" color={theme.danger} onPress={onHangup} label="End" rotate />
               </View>
             ) : null}
@@ -1060,8 +1111,40 @@ export function CallOverlay({
         </SafeAreaView>
       </View>
       </TouchPassthrough>
+      <ActionSheet
+        visible={routeSheetOpen}
+        onClose={() => setRouteSheetOpen(false)}
+        title="Audio output"
+        options={audioRoutes.routes.map((route) => ({
+          key: route.id,
+          label: route.id === audioRoutes.current ? `${routeLabel(route)}  ✓` : routeLabel(route),
+          icon: routeIcon(route),
+          onPress: () => chooseRoute(route),
+        }))}
+      />
     </Modal>
   );
+}
+
+function isExternalRoute(route: AudioRoute): boolean {
+  return route.kind !== "receiver" && route.kind !== "speaker";
+}
+
+function routeLabel(route: AudioRoute): string {
+  if (route.kind === "receiver") return "iPhone";
+  if (route.kind === "speaker") return "Speaker";
+  return route.name;
+}
+
+function routeIcon(route: AudioRoute): "phone-portrait-outline" | "volume-high" | "bluetooth" | "headset" | "car" | "tv-outline" {
+  switch (route.kind) {
+    case "receiver": return "phone-portrait-outline";
+    case "speaker": return "volume-high";
+    case "bluetooth": return "bluetooth";
+    case "car": return "car";
+    case "airplay": return "tv-outline";
+    default: return "headset";
+  }
 }
 
 /** The green status bar + tap-to-restore hint shown while a call is
