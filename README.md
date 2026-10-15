@@ -11,6 +11,11 @@ Built on **Expo SDK 54** (React Native 0.81, React 19.1). Calls use the
 native `react-native-webrtc` module, so the app needs a **development
 build** — it no longer runs in plain Expo Go. See "Running the app" below.
 
+**License:** source-available, all rights reserved — see [LICENSE](LICENSE).
+The code is public so anyone can read it and check how the encryption works;
+it may not be copied, built, deployed or used for another app without written
+permission.
+
 **Site:** [gettelevo.space](https://gettelevo.space) — landing page, privacy
 policy, terms of service, and support/FAQ, all served from one domain (repo:
 [televo-site](https://github.com/AToPu-sys/televo-site)).

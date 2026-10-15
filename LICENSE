@@ -1,21 +1,39 @@
-The MIT License (MIT)
+Televo — Source-Available License (All Rights Reserved)
 
-Copyright (c) 2015-present 650 Industries, Inc. (aka Expo)
+Copyright (c) 2025-2026 Akbarjon Sirojov. All rights reserved.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+The source code in this repository is published so that anyone can read it
+and verify how Televo works, in particular how messages, calls and keys are
+encrypted. Publishing it does not make it open source.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+You MAY:
+  - view and read the source code on GitHub;
+  - review it, including for security research, and report what you find to
+    the copyright holder.
+
+You MAY NOT, without prior written permission from the copyright holder:
+  - copy, reproduce or redistribute the code or any substantial part of it;
+  - modify it, translate it, or create derivative works based on it;
+  - compile, build, run, deploy or host it, or any derivative of it, for any
+    purpose, commercial or not;
+  - publish an app, service or product that is based on this code or that
+    imitates Televo's name, branding or design;
+  - use the code, in whole or in part, to train or fine-tune machine-learning
+    models.
+
+The only exception is the limited right GitHub's Terms of Service give other
+GitHub users to view and fork public repositories within GitHub; a fork made
+that way carries no other permission under this license.
+
+The names "Televo" and "gettelevo.space", the logo and the app's visual design
+are not licensed under any terms.
+
+Third-party components keep their own licenses (see their headers and the
+package manifests).
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+IMPLIED. IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM,
+DAMAGES OR OTHER LIABILITY ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR ITS USE.
+
+For permissions, licensing or security reports: ssirojov@gmail.com

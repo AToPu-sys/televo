@@ -52,14 +52,16 @@
  *   - ExpressTURN  https://www.expressturn.com  (probed above; server is up)
  *   - Metered      https://www.metered.ca/tools/openrelay/ (free tier)
  *
- * Paste the credentials the provider gives you here and rebuild. Multiple
+ * Put the credentials the provider gives you in .env and rebuild. Multiple
  * URLs are supported — list every transport the provider offers (UDP 3478,
  * TCP 443, TLS 5349), because which one survives depends on the carrier.
  */
-const TURN_USERNAME = "<set EXPO_PUBLIC_TURN_USERNAME in .env>";
-const TURN_CREDENTIAL = "<set EXPO_PUBLIC_TURN_CREDENTIAL in .env>";
+// Kept out of the repository (the code is public): set both in .env, see
+// .env.example. Without them calls fall back to STUN only.
+const TURN_USERNAME = process.env.EXPO_PUBLIC_TURN_USERNAME ?? "";
+const TURN_CREDENTIAL = process.env.EXPO_PUBLIC_TURN_CREDENTIAL ?? "";
 
-const DEDICATED_TURN: { urls: string; username: string; credential: string }[] = [
+const DEDICATED_TURN: { urls: string; username: string; credential: string }[] = !TURN_USERNAME ? [] : [
   // VERIFIED 2026-09-19 with a real TURN Allocate request (not just a port
   // check): this account successfully allocated relay address
   // 62.210.205.50:59885 from free.expressturn.com:3478 over UDP. That is

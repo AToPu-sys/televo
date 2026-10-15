@@ -54,3 +54,6 @@ firebase-debug.*
 
 # local archive/export output from xcodebuild
 /build
+
+# Supabase CLI local state (linked project, versions) — machine-specific
+supabase/.temp/
