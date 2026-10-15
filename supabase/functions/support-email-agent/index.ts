@@ -36,7 +36,8 @@ import { createClient } from "jsr:@supabase/supabase-js@2";
 // `reasoning` field before the actual `content`, so max_tokens is set
 // higher than Claude needed for the same prompt to leave room for both.
 const GROQ_MODEL = "openai/gpt-oss-120b";
-const OPERATOR_EMAIL = "operator@televo.invalid";
+// Set with `supabase secrets set OPERATOR_EMAIL=...`; kept out of the public repo.
+const OPERATOR_EMAIL = Deno.env.get("OPERATOR_EMAIL") ?? "";
 const SUPPORT_FROM = "Televo <hello@gettelevo.space>";
 const APPEAL_WINDOW_DAYS = 3;
 
@@ -556,7 +557,7 @@ async function handleInboundEmail(
   // practice that was too strict: Resend reported "none"/"neutral" (no
   // DMARC policy evaluated — common and NOT suspicious on its own) for a
   // routine Gmail reply-chain sent by the genuine registered owner
-  // (operator@televo.invalid, 2026-10-11), and the exact-match owner was told
+  // (2026-10-11), and the exact-match owner was told
   // they weren't verified. A failing-shut check that rejects ordinary
   // webmail replies isn't fit for purpose. The real spoofing signal is an
   // EXPLICIT "fail" verdict (see authFailed on ReceivedEmail) — that's what

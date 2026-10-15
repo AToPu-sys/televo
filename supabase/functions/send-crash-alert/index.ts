@@ -8,7 +8,8 @@ import "@supabase/functions-js/edge-runtime.d.ts";
 import { renderEmail } from "./emailTemplate.ts";
 
 const FROM = "Televo <hello@gettelevo.space>";
-const OPERATOR_EMAIL = "operator@televo.invalid";
+// Set with `supabase secrets set OPERATOR_EMAIL=...`; kept out of the public repo.
+const OPERATOR_EMAIL = Deno.env.get("OPERATOR_EMAIL") ?? "";
 
 type WebhookPayload = {
   record: {
