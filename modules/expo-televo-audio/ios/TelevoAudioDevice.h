@@ -19,6 +19,9 @@ NS_ASSUME_NONNULL_BEGIN
 @property(readonly) float voiceProbability;
 /// The unit is running (diagnostics).
 @property(readonly) BOOL isUnitRunning;
+/// Loudness 0…1 of what the wearer says (after denoising) and what they hear.
+@property(readonly) float microphoneLevel;
+@property(readonly) float speakerLevel;
 
 - (instancetype)initWithWeights:(NSData *)weights NS_DESIGNATED_INITIALIZER;
 - (instancetype)init NS_UNAVAILABLE;

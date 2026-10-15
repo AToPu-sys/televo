@@ -22,6 +22,11 @@ NS_ASSUME_NONNULL_BEGIN
 
 + (NSDictionary<NSString *, id> *)diagnostics;
 
+/// Loudness 0…1 for the call screen: the user's voice and the other side's.
+/// 0 when the custom device isn't in use.
++ (float)microphoneLevel;
++ (float)speakerLevel;
+
 @end
 
 NS_ASSUME_NONNULL_END

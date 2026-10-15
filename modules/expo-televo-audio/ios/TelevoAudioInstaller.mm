@@ -64,6 +64,14 @@ static TelevoAudioDevice *gDevice = nil;
   gDevice.noiseSuppressionEnabled = enabled;
 }
 
++ (float)microphoneLevel {
+  return gDevice.microphoneLevel;
+}
+
++ (float)speakerLevel {
+  return gDevice.speakerLevel;
+}
+
 + (NSDictionary<NSString *, id> *)diagnostics {
   return @{
     @"customDevice" : @(gDevice != nil),

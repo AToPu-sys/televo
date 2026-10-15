@@ -6,6 +6,8 @@
 #include <atomic>
 #include <memory>
 
+#include <cmath>
+
 #include "TelevoNoiseSuppressor.h"
 #include "rnnoise.h"
 
@@ -14,8 +16,22 @@ static const UInt32 kMaxFrames = 8192;
 
 /// Everything the real-time callbacks touch, in one plain struct: no
 /// Objective-C messaging and no allocation on the audio thread.
+/// Loudness of a block of 16-bit samples on a 0…1 scale (-50 dBFS…0 dBFS),
+/// for the call screen's voice waves.
+static float TelevoLevel(const int16_t *samples, UInt32 count) {
+  if (count == 0) return 0;
+  double sum = 0;
+  for (UInt32 i = 0; i < count; i++) sum += double(samples[i]) * double(samples[i]);
+  double rms = std::sqrt(sum / count) / 32768.0;
+  if (rms <= 0) return 0;
+  double db = 20.0 * std::log10(rms);
+  return float(std::fmin(1.0, std::fmax(0.0, (db + 50.0) / 50.0)));
+}
+
 struct TelevoAudioContext {
   AudioUnit unit = nullptr;
+  std::atomic<float> microphoneLevel{0};
+  std::atomic<float> speakerLevel{0};
   std::atomic<bool> playing{false};
   std::atomic<bool> recording{false};
   int16_t inputSamples[kMaxFrames];
@@ -40,6 +56,7 @@ static OSStatus TelevoInputCallback(void *refCon, AudioUnitRenderActionFlags *fl
   if (!ctx->recording.load(std::memory_order_relaxed)) return noErr;
 
   if (ctx->suppressor) ctx->suppressor->process(ctx->inputSamples, frames);
+  ctx->microphoneLevel.store(TelevoLevel(ctx->inputSamples, frames), std::memory_order_relaxed);
   RTCAudioDeviceDeliverRecordedDataBlock deliver = ctx->deliver;
   return deliver ? deliver(flags, timestamp, bus, frames, &list, nullptr, nil) : noErr;
 }
@@ -50,8 +67,14 @@ static OSStatus TelevoRenderCallback(void *refCon, AudioUnitRenderActionFlags *f
   auto *ctx = static_cast<TelevoAudioContext *>(refCon);
   RTCAudioDeviceGetPlayoutDataBlock playout = ctx->playout;
   if (ctx->playing.load(std::memory_order_relaxed) && playout) {
-    return playout(flags, timestamp, bus, frames, data);
+    OSStatus status = playout(flags, timestamp, bus, frames, data);
+    if (status == noErr && data->mNumberBuffers > 0) {
+      ctx->speakerLevel.store(TelevoLevel(static_cast<const int16_t *>(data->mBuffers[0].mData), frames),
+                              std::memory_order_relaxed);
+    }
+    return status;
   }
+  ctx->speakerLevel.store(0, std::memory_order_relaxed);
   for (UInt32 i = 0; i < data->mNumberBuffers; i++) {
     memset(data->mBuffers[i].mData, 0, data->mBuffers[i].mDataByteSize);
   }
@@ -112,6 +135,14 @@ static OSStatus TelevoRenderCallback(void *refCon, AudioUnitRenderActionFlags *f
 
 - (BOOL)isUnitRunning {
   return _unitRunning;
+}
+
+- (float)microphoneLevel {
+  return _ctx->microphoneLevel.load(std::memory_order_relaxed);
+}
+
+- (float)speakerLevel {
+  return _ctx->speakerLevel.load(std::memory_order_relaxed);
 }
 
 #pragma mark - RTCAudioDevice: formats

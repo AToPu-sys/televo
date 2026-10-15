@@ -44,3 +44,6 @@ export function setCustomAudioDeviceEnabled(enabled: boolean): void {
 export function audioDiagnostics(): Record<string, unknown> {
   return nativeModule?.diagnostics() ?? {};
 }
+
+export { TelevoCallView, isNativeCallScreenAvailable } from "./TelevoCallView";
+export type { CallScreenAction, TelevoCallViewProps } from "./TelevoCallView";

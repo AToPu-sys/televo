@@ -1,5 +1,6 @@
 import { endCallPip, onCallPipFailedToStart, startCallPip } from "expo-call-pip";
 import { addAudioRouteListener, getAudioRoutes, setAudioRoute, type AudioRoute } from "expo-speaker-toggle";
+import { TelevoCallView, isNativeCallScreenAvailable, type CallScreenAction } from "expo-televo-audio";
 import { activateKeepAwakeAsync, deactivateKeepAwake } from "expo-keep-awake";
 import { useEffect, useRef, useState } from "react";
 import {
@@ -173,6 +174,37 @@ export function CallOverlay({
   }, []);
 
   const currentRoute = audioRoutes.routes.find((route) => route.id === audioRoutes.current);
+
+  const handleNativeAction = (action: CallScreenAction) => {
+    switch (action) {
+      case "mute":
+        onToggleMute();
+        break;
+      case "route":
+        if (audioRoutes.routes.some(isExternalRoute)) setRouteSheetOpen(true);
+        else onToggleSpeaker();
+        break;
+      case "hangup":
+        onHangup();
+        break;
+      case "decline":
+        onDecline();
+        break;
+      case "accept":
+        setAnswering(true);
+        onAccept();
+        break;
+      case "minimize":
+        onMinimizedChange(true);
+        Animated.timing(minimizeAnim, {
+          toValue: 1,
+          duration: 200,
+          useNativeDriver: false,
+          easing: Easing.out(Easing.cubic),
+        }).start();
+        break;
+    }
+  };
   const hasExternalRoute = audioRoutes.routes.some(isExternalRoute);
 
   const chooseRoute = (route: AudioRoute) => {
@@ -1109,6 +1141,30 @@ export function CallOverlay({
             ) : null}
           </Animated.View>
         </SafeAreaView>
+
+        {/* iOS voice calls: the native SwiftUI screen, drawn over the React
+            Native one (which stays mounted underneath, WebRtcBridge
+            included). Video calls and Android keep the screen above. */}
+        {isNativeCallScreenAvailable && !isVideo && !minimized ? (
+          <TelevoCallView
+            style={StyleSheet.absoluteFill}
+            peerName={peerName}
+            avatarUrl={peerAvatarUrl ?? undefined}
+            statusText={statusLabel(state, elapsedSeconds, mediaConfirmed, connectingSeconds)}
+            phase={state.phase}
+            connected={mediaConfirmed}
+            reconnecting={
+              (state.phase === "connecting" || (state.phase === "active" && !mediaConfirmed)) &&
+              connectingSeconds >= SLOW_CONNECT_SECONDS
+            }
+            muted={muted}
+            routeKind={hasExternalRoute && currentRoute ? currentRoute.kind : speakerOn ? "speaker" : "receiver"}
+            routeLabel={hasExternalRoute && currentRoute ? routeLabel(currentRoute) : "Speaker"}
+            routeIsPicker={hasExternalRoute}
+            canMinimize={minimizeEligible}
+            onAction={handleNativeAction}
+          />
+        ) : null}
       </View>
       </TouchPassthrough>
       <ActionSheet
