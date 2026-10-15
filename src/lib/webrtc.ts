@@ -146,3 +146,45 @@ export const USING_PUBLIC_TURN = DEDICATED_TURN.length === 0;
  * user who cannot connect is told why, instead of watching "Connecting…"
  * until it fails. */
 export const HAS_NO_TURN = DEDICATED_TURN.length === 0;
+
+/**
+ * Opus parameters for speech over lossy mobile links, written into our own
+ * offer/answer (an fmtp line tells the PEER how to encode what it sends us,
+ * and both phones run this, so both directions get it):
+ *   - useinbandfec=1: forward error correction — a lost packet is rebuilt
+ *     from redundancy in the next one instead of becoming a click or a gap.
+ *   - usedtx=0: no discontinuous transmission; DTX saves a few kbit/s in
+ *     silences but clips the first syllable after a pause.
+ *   - stereo=0 / sprop-stereo=0: voice is mono; stereo only spends bits.
+ *   - maxaveragebitrate=48000, maxplaybackrate=48000: full-band speech. Left
+ *     unset, libwebrtc targets ~32 kbit/s; the sender's maxBitrate (64k) is a
+ *     ceiling, not a target.
+ *   - minptime=10: keep libwebrtc's default packetisation floor.
+ * Telegram's tgcalls applies the same kind of Opus tuning on top of WebRTC.
+ */
+const OPUS_PARAMS: Record<string, string> = {
+  minptime: "10",
+  useinbandfec: "1",
+  usedtx: "0",
+  stereo: "0",
+  "sprop-stereo": "0",
+  maxaveragebitrate: "48000",
+  maxplaybackrate: "48000",
+};
+
+export function tuneOpusSdp(sdp: string): string {
+  const rtpmap = sdp.match(/a=rtpmap:(\d+) opus\/48000\/2/i);
+  if (!rtpmap) return sdp;
+  const payloadType = rtpmap[1];
+  const fmtpLine = new RegExp(`^a=fmtp:${payloadType} ([^\\r\\n]*)`, "m");
+  const params = new Map<string, string>();
+  const existing = sdp.match(fmtpLine);
+  existing?.[1].split(";").forEach((pair) => {
+    const [key, value = ""] = pair.split("=");
+    if (key.trim()) params.set(key.trim(), value.trim());
+  });
+  for (const [key, value] of Object.entries(OPUS_PARAMS)) params.set(key, value);
+  const line = `a=fmtp:${payloadType} ` + [...params].map(([k, v]) => `${k}=${v}`).join(";");
+  if (existing) return sdp.replace(fmtpLine, line);
+  return sdp.replace(new RegExp(`^(a=rtpmap:${payloadType} opus/48000/2[^\\r\\n]*)`, "mi"), `$1\r\n${line}`);
+}

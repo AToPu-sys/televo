@@ -7,6 +7,7 @@ import type {
   RTCPeerConnection as RTCPeerConnectionType,
 } from "react-native-webrtc";
 
+import { tuneOpusSdp } from "../lib/webrtc";
 import { getWebRtc } from "../lib/webrtcModule";
 
 export type BridgeEvent =
@@ -1177,7 +1178,7 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
             // is working" where a sharp-but-choppy one reads as "call is
             // breaking up," and smoothness is also what keeps audio (bundled
             // on the same transport) from getting starved by video retries.
-            encoding.degradationPreference = "maintain-resolution";
+            encoding.degradationPreference = "maintain-framerate";
           }
         }
 
@@ -1516,9 +1517,10 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
         const pc = pcRef.current ?? createPeer(command.iceServers);
         stream.getTracks().forEach((track) => pc.addTrack(track, stream));
 
-        const offer = await pc.createOffer({});
+        const created = await pc.createOffer({});
+        const offer = { type: created.type, sdp: tuneOpusSdp(created.sdp ?? "") };
         await pc.setLocalDescription(offer);
-        post({ type: "offer", sdp: offer.sdp ?? "" });
+        post({ type: "offer", sdp: offer.sdp });
         return;
       }
 
@@ -1586,9 +1588,10 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
         }
         stream.getTracks().forEach((track) => pc.addTrack(track, stream));
 
-        const answer = await pc.createAnswer();
+        const created = await pc.createAnswer();
+        const answer = { type: created.type, sdp: tuneOpusSdp(created.sdp ?? "") };
         await pc.setLocalDescription(answer);
-        post({ type: "answer", sdp: answer.sdp ?? "" });
+        post({ type: "answer", sdp: answer.sdp });
         return;
       }
 
@@ -1603,9 +1606,10 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
         await pc.setRemoteDescription(
           new webrtc.RTCSessionDescription({ type: "offer", sdp: command.sdp })
         );
-        const answer = await pc.createAnswer();
+        const created = await pc.createAnswer();
+        const answer = { type: created.type, sdp: tuneOpusSdp(created.sdp ?? "") };
         await pc.setLocalDescription(answer);
-        post({ type: "answer", sdp: answer.sdp ?? "" });
+        post({ type: "answer", sdp: answer.sdp });
         // Same reasoning as the caller's restart-ice branch: arm the
         // watchdog here so the callee also observes whether the restarted
         // connection actually carries media. Generation-guarded, so this
@@ -1628,7 +1632,8 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
         // the media pipeline stays intact and only the network path is
         // renegotiated — which is the entire point, since the tracks were
         // never the problem, the dead relay was.
-        const offer = await pc.createOffer({ iceRestart: true });
+        const created = await pc.createOffer({ iceRestart: true });
+        const offer = { type: created.type, sdp: tuneOpusSdp(created.sdp ?? "") };
         await pc.setLocalDescription(offer);
         post({ type: "offer", sdp: offer.sdp ?? "" });
         // Re-arm the watchdog explicitly rather than relying on
