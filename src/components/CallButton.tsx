@@ -9,6 +9,9 @@ type CallButtonProps = {
   label: string;
   small?: boolean;
   rotate?: boolean;
+  /** Show `label` as a caption under the circle (the call screen's style). */
+  showLabel?: boolean;
+  labelColor?: string;
 };
 
 export function CallButton({
@@ -19,8 +22,10 @@ export function CallButton({
   label,
   small = false,
   rotate = false,
+  showLabel = false,
+  labelColor = "#FFFFFF",
 }: CallButtonProps) {
-  const size = small ? 52 : 68;
+  const size = small ? 60 : 68;
 
   return (
     <View style={styles.wrapper}>
@@ -41,17 +46,23 @@ export function CallButton({
       >
         <Ionicons
           name={icon}
-          size={small ? 22 : 28}
+          size={small ? 24 : 28}
           color={iconColor}
           style={rotate ? styles.rotated : undefined}
         />
       </Pressable>
+      {showLabel ? (
+        <Text style={[styles.label, { color: labelColor }]} numberOfLines={1}>
+          {label}
+        </Text>
+      ) : null}
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  wrapper: { alignItems: "center" },
+  wrapper: { alignItems: "center", gap: 6 },
+  label: { fontSize: 12, fontWeight: "500", maxWidth: 76, textAlign: "center" },
   button: { alignItems: "center", justifyContent: "center" },
   rotated: { transform: [{ rotate: "135deg" }] },
 });

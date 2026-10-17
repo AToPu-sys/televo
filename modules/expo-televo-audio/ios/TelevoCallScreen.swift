@@ -11,6 +11,8 @@ final class CallScreenModel: ObservableObject {
   /// Media is actually flowing (not just "connected" on paper).
   @Published var connected = false
   @Published var reconnecting = false
+  /// Signal quality from the call's stats: 0 poor … 3 excellent, -1 = unknown.
+  @Published var quality = -1
   @Published var muted = false
   /// receiver | speaker | bluetooth | headphones | car | usb | airplay
   @Published var routeKind = "receiver"
@@ -78,12 +80,18 @@ struct CallScreen: View {
         Color.clear.frame(width: 44, height: 44)
       }
       Spacer()
-      Label("Encrypted", systemImage: "lock.fill")
-        .font(.system(size: 13, weight: .medium))
-        .foregroundColor(.white.opacity(0.85))
-        .padding(.horizontal, 12)
-        .padding(.vertical, 6)
-        .background(Color.white.opacity(0.12), in: Capsule())
+HStack(spacing: 8) {
+        Label("Encrypted", systemImage: "lock.fill")
+          .font(.system(size: 13, weight: .medium))
+          .foregroundColor(.white.opacity(0.85))
+        if model.quality >= 0 {
+          SignalBars(level: model.quality)
+        }
+      }
+      .padding(.horizontal, 12)
+      .padding(.vertical, 6)
+      .background(Color.white.opacity(0.12), in: Capsule())
+      .animation(.easeInOut(duration: 0.25), value: model.quality)
       Spacer()
       Color.clear.frame(width: 44, height: 44)
     }
@@ -348,5 +356,25 @@ struct PressScaleStyle: ButtonStyle {
 extension Color {
   init(rgb: UInt32) {
     self.init(red: Double((rgb >> 16) & 0xFF) / 255, green: Double((rgb >> 8) & 0xFF) / 255, blue: Double(rgb & 0xFF) / 255)
+  }
+}
+
+/// Four signal bars, 0 (poor) … 3 (excellent): white when good, amber when
+/// weak, red when poor — the same scale the video screen uses.
+struct SignalBars: View {
+  let level: Int
+
+  var body: some View {
+    let lit = min(max(level, 0), 3) + 1
+    let tint: Color = level >= 2 ? .white : (level == 1 ? Color(rgb: 0xF2B33D) : Color(rgb: 0xEB4D4B))
+    HStack(alignment: .bottom, spacing: 2) {
+      ForEach(0..<4, id: \.self) { index in
+        RoundedRectangle(cornerRadius: 1.5)
+          .fill(index < lit ? tint : Color.white.opacity(0.28))
+          .frame(width: 3, height: CGFloat(5 + index * 3))
+      }
+    }
+    .frame(height: 14, alignment: .bottom)
+    .accessibilityLabel(["Poor connection", "Weak connection", "Good connection", "Excellent connection"][min(max(level, 0), 3)])
   }
 }

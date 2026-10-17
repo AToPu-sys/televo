@@ -7,6 +7,19 @@ type TelevoAudioModuleType = {
   isCustomDeviceEnabled: () => boolean;
   setCustomDeviceEnabled: (enabled: boolean) => void;
   diagnostics: () => Record<string, unknown>;
+  currentNetwork?: () => NetworkPath;
+  addListener?: (event: string, listener: (path: NetworkPath) => void) => { remove: () => void };
+};
+
+export type NetworkPath = {
+  status: "satisfied" | "unsatisfied" | "satisfiable" | "unknown";
+  interface: "wifi" | "cellular" | "wired" | "other" | "none";
+  /** First gateway address — tells two Wi-Fi networks apart. */
+  gateway: string;
+  expensive: boolean;
+  constrained: boolean;
+  ipv4: boolean;
+  ipv6: boolean;
 };
 
 // Same guard as expo-speaker-toggle: a binary built before this module
@@ -43,6 +56,16 @@ export function setCustomAudioDeviceEnabled(enabled: boolean): void {
 
 export function audioDiagnostics(): Record<string, unknown> {
   return nativeModule?.diagnostics() ?? {};
+}
+
+/** Every real change of the network path (Wi-Fi <-> cellular, another Wi-Fi,
+ * lost / regained). iOS only; a no-op subscription elsewhere. */
+export function addNetworkChangeListener(listener: (path: NetworkPath) => void): { remove: () => void } {
+  return nativeModule?.addListener?.("onNetworkChange", listener) ?? { remove: () => {} };
+}
+
+export function currentNetwork(): NetworkPath | null {
+  return nativeModule?.currentNetwork?.() ?? null;
 }
 
 export { TelevoCallView, isNativeCallScreenAvailable } from "./TelevoCallView";

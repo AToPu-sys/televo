@@ -188,3 +188,87 @@ export function tuneOpusSdp(sdp: string): string {
   if (existing) return sdp.replace(fmtpLine, line);
   return sdp.replace(new RegExp(`^(a=rtpmap:${payloadType} opus/48000/2[^\\r\\n]*)`, "mi"), `$1\r\n${line}`);
 }
+
+/**
+ * Video tuning applied to every local SDP alongside the Opus tuning above.
+ *
+ * - H.264 first on iOS. iPhones encode and decode it in hardware
+ *   (VideoToolbox), which gives a noticeably sharper picture at the same
+ *   bitrate than libwebrtc's software VP8, and runs cooler on a long call.
+ *   Only reordered when this device is an iPhone: an Android peer keeps its
+ *   own default order in its answer, so a phone without a hardware H.264
+ *   encoder is never pushed onto one. Packetization-mode 1 entries go first
+ *   because that is the mode iOS's hardware path implements.
+ * - libwebrtc's bandwidth estimator starts every call around 300 kbit/s and
+ *   climbs from there, which is why the first seconds of a video call looked
+ *   blurry even on a fast connection. x-google-start-bitrate starts it at a
+ *   level a typical LTE/Wi-Fi link sustains, max lifts the ceiling for a
+ *   genuinely good network, and min keeps the encoder from collapsing into
+ *   unreadable blocks before congestion control has had a chance to react.
+ */
+const VIDEO_BITRATE_PARAMS: Record<string, string> = {
+  "x-google-start-bitrate": "1200",
+  "x-google-min-bitrate": "150",
+  "x-google-max-bitrate": "2500",
+};
+
+export function tuneVideoSdp(sdp: string, preferH264: boolean): string {
+  const eol = sdp.includes("\r\n") ? "\r\n" : "\n";
+  const lines = sdp.split(eol);
+  const mIndex = lines.findIndex((line) => line.startsWith("m=video"));
+  if (mIndex === -1) return sdp;
+  let end = lines.findIndex((line, i) => i > mIndex && line.startsWith("m="));
+  if (end === -1) end = lines.length;
+  const section = lines.slice(mIndex, end);
+
+  const rtpmap = new Map<string, string>();
+  const fmtp = new Map<string, string>();
+  for (const line of section) {
+    const r = line.match(/^a=rtpmap:(\d+) ([^/\s]+)/);
+    if (r) rtpmap.set(r[1], r[2].toUpperCase());
+    const f = line.match(/^a=fmtp:(\d+) (.*)$/);
+    if (f) fmtp.set(f[1], f[2]);
+  }
+  const isMedia = (pt: string) => {
+    const name = rtpmap.get(pt);
+    return !!name && !["RTX", "RED", "ULPFEC", "FLEXFEC-03"].includes(name);
+  };
+
+  // 1) codec order on the m= line
+  const mParts = section[0].split(" ");
+  const payloads = mParts.slice(3);
+  let ordered = payloads;
+  if (preferH264) {
+    const h264 = payloads.filter((pt) => rtpmap.get(pt) === "H264");
+    const pm1 = h264.filter((pt) => /packetization-mode=1/.test(fmtp.get(pt) ?? ""));
+    const first = [...pm1, ...h264.filter((pt) => !pm1.includes(pt))];
+    ordered = [...first, ...payloads.filter((pt) => !first.includes(pt))];
+  }
+  section[0] = [...mParts.slice(0, 3), ...ordered].join(" ");
+
+  // 2) bitrate hints on every real video codec's fmtp line
+  const withFmtp = new Set<string>();
+  for (let i = 0; i < section.length; i++) {
+    const f = section[i].match(/^a=fmtp:(\d+) (.*)$/);
+    if (!f || !isMedia(f[1])) continue;
+    withFmtp.add(f[1]);
+    const params = new Map(f[2].split(";").map((pair) => {
+      const [k, v = ""] = pair.split("=");
+      return [k.trim(), v.trim()] as [string, string];
+    }).filter(([k]) => k));
+    for (const [k, v] of Object.entries(VIDEO_BITRATE_PARAMS)) params.set(k, v);
+    section[i] = `a=fmtp:${f[1]} ` + [...params].map(([k, v]) => (v ? `${k}=${v}` : k)).join(";");
+  }
+  const hint = Object.entries(VIDEO_BITRATE_PARAMS).map(([k, v]) => `${k}=${v}`).join(";");
+  for (let i = section.length - 1; i >= 1; i--) {
+    const r = section[i].match(/^a=rtpmap:(\d+) /);
+    if (r && isMedia(r[1]) && !withFmtp.has(r[1])) section.splice(i + 1, 0, `a=fmtp:${r[1]} ${hint}`);
+  }
+
+  return [...lines.slice(0, mIndex), ...section, ...lines.slice(end)].join(eol);
+}
+
+/** Opus + video tuning for one local description. */
+export function tuneSdp(sdp: string, preferH264: boolean): string {
+  return tuneVideoSdp(tuneOpusSdp(sdp), preferH264);
+}

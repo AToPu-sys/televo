@@ -14,7 +14,9 @@ import {
   markNextCallAsAnsweredViaCallKit,
 } from "../components/WebRtcBridge";
 import { supabase } from "../lib/supabase";
-import { ICE_SERVERS, USING_PUBLIC_TURN } from "../lib/webrtc";
+import { USING_PUBLIC_TURN } from "../lib/webrtc";
+import { getIceServers, warmIceServers } from "../lib/iceServers";
+import { addNetworkChangeListener, type NetworkPath } from "expo-televo-audio";
 import type { Database } from "../types/database";
 import { useE2ee } from "./useE2ee";
 import type { SignalEnvelope } from "../lib/e2e";
@@ -52,7 +54,12 @@ type Signal =
   // it's not consistently reflected on the receiving side across platforms —
   // so this is sent explicitly, the same way mute state used to be
   // (CallKit-only) before this.
-  | { type: "camera-state"; enabled: boolean };
+  | { type: "camera-state"; enabled: boolean }
+  // Callee -> caller: "my network changed (or my connection dropped), please
+  // restart ICE". Only the caller ever re-offers — two sides restarting at
+  // once glares — so this is how the CALLEE's Wi-Fi <-> cellular switch gets
+  // a fresh path instead of 15s of silence followed by a dropped call.
+  | { type: "restart-request"; reason: string };
 
 /**
  * The media engine is native WebRTC (see WebRtcBridge, backed by
@@ -355,6 +362,29 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
   // pass before giving up on a call the user is still holding the phone up
   // for.
   const MAX_ICE_RESTARTS = 3;
+  // Restarts triggered by the network itself (interface change, a connection
+  // that dropped mid-call) have their own budget: they are not failures of
+  // the call, and a commute can legitimately produce several in a row.
+  const networkRestartCountRef = useRef(0);
+  const MAX_NETWORK_RESTARTS = 6;
+  /** When the in-flight restart began. A restart can be orphaned (the other
+   * side was offline when the offer went out), and restartInFlightRef must
+   * not then block every later restart for the rest of the call. */
+  const restartStartedAtRef = useRef(0);
+  const lastRestartRequestAtRef = useRef(0);
+  const earlyRestartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** Which ICE server set this call was built with (diagnostics). */
+  const iceSourceRef = useRef<"server" | "fallback">("fallback");
+  /** True while the call is recovering a dropped or changed network path. */
+  const [reconnecting, setReconnecting] = useState(false);
+  /** Signal quality 0 (bad) … 3 (excellent) from RTT and packet loss, or null
+   * before the first stats sample. */
+  const [quality, setQuality] = useState<0 | 1 | 2 | 3 | null>(null);
+  const qualitySamplesRef = useRef<number[]>([]);
+  const lastLossCountersRef = useRef<{ lost: number; received: number } | null>(null);
+  /** Assigned every render below, once sendSignal/sendCommand exist. Returns
+   * whether a restart (or a restart request) actually went out. */
+  const restartIceRef = useRef<(reason: string, network: boolean) => boolean>(() => false);
   /** True once any restart has happened — for diagnostics labelling. */
   const iceRestartedRef = { get current() { return iceRestartCountRef.current > 0; } };
   // Latest connection stats from the bridge, held until the call ends so
@@ -440,7 +470,7 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
 
   /** Opens the local mic/camera, deferring until the bridge exists. */
   const requestLocalMedia = useCallback(
-    (video: boolean, iceServers?: typeof ICE_SERVERS) => {
+    (video: boolean, iceServers?: { urls: string | string[]; username?: string; credential?: string }[]) => {
       // iceServers is passed ONLY by the caller (startCall). It makes the
       // bridge build the peer connection immediately and begin gathering
       // ICE while the camera is still opening — see start-local's branch in
@@ -462,6 +492,17 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
     roleRef.current = null;
     iceRestartCountRef.current = 0;
     restartInFlightRef.current = false;
+    networkRestartCountRef.current = 0;
+    restartStartedAtRef.current = 0;
+    lastRestartRequestAtRef.current = 0;
+    if (earlyRestartTimerRef.current) {
+      clearTimeout(earlyRestartTimerRef.current);
+      earlyRestartTimerRef.current = null;
+    }
+    setReconnecting(false);
+    setQuality(null);
+    qualitySamplesRef.current = [];
+    lastLossCountersRef.current = null;
     // Drop the loudspeaker preference the moment a call ends, not on the 3s
     // auto-dismiss timer in reset().
     //
@@ -574,7 +615,7 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
           outcome ?? (stats?.msToMedia != null ? "connected" : "ended_no_media_event"),
         selected_candidate_pair: stats?.selectedCandidatePair ?? null,
         turn_server: stats?.turnServer ?? null,
-        using_public_turn: USING_PUBLIC_TURN,
+        using_public_turn: iceSourceRef.current === "fallback" && USING_PUBLIC_TURN,
         ms_to_media: stats?.msToMedia ?? null,
         bytes_received: stats?.bytesReceived ?? null,
         packets_lost: stats?.packetsLost ?? null,
@@ -1074,7 +1115,12 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
       // its permission prompt while the phone is ringing instead of only
       // once the peer answers. create-offer below reuses the same stream, so
       // this costs nothing and makes the prompt appear when the user expects.
-      requestLocalMedia(kind === "video", ICE_SERVERS);
+      // Cloudflare TURN credentials (warm cache: instant; cold: ≤2.5s, then
+      // the bundled fallback) — see lib/iceServers.
+      const ice = await getIceServers();
+      iceSourceRef.current = ice.source;
+      trace("ice-servers", ice.source);
+      requestLocalMedia(kind === "video", ice.servers);
 
       joinSignalChannel(call.id, async (signal) => {
         if (signal.type === "callee-ready") {
@@ -1128,10 +1174,13 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
           cleanup();
         } else if (signal.type === "camera-state") {
           setPeerCameraOff(!signal.enabled);
+        } else if (signal.type === "restart-request") {
+          trace("restart-request received", signal.reason);
+          restartIceRef.current(`peer: ${signal.reason}`, true);
         }
       });
 
-      sendCommand({ type: "create-offer", iceServers: ICE_SERVERS, video: kind === "video" });
+      sendCommand({ type: "create-offer", iceServers: ice.servers, video: kind === "video" });
       // The bridge replies with a "offer" BridgeEvent once ready; see
       // handleBridgeEvent below, which forwards it as the signal.
       pendingOfferRef.current = { sdp: "", kind };
@@ -1165,9 +1214,13 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
       trace("answerCall", `kind=${kind}`);
       setState({ phase: "connecting", call });
       roleRef.current = "callee";
+      // Normally already warm (listenForOffer starts the fetch while it rings).
+      const ice = await getIceServers();
+      iceSourceRef.current = ice.source;
+      trace("ice-servers", ice.source);
       sendCommand({
         type: "create-answer",
-        iceServers: ICE_SERVERS,
+        iceServers: ice.servers,
         sdp: offerSdp,
         video: kind === "video",
       });
@@ -1207,6 +1260,7 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
     (call: CallRow) => {
       diagnosticsRef.current = [];
       trace("listenForOffer", `peerKey=${peerPublicKeyRef.current ? "present" : "MISSING"}`);
+      warmIceServers();
       // Claim the callee role HERE, not in answerCall. The first outgoing
       // signal ("callee-ready", sent at the end of this function) is encoded
       // before answerCall ever runs, and encodeForWire decides whether to
@@ -1579,6 +1633,79 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
   }, [state.phase, reset]);
 
   /** Wired to WebRtcBridge's onEvent prop by the component that renders it. */
+  // One way to restart ICE, used by the network monitor, a mid-call drop,
+  // and the callee's restart-request. Only the caller re-offers (two sides
+  // re-offering at once glares — see restartInFlightRef); the callee asks.
+  restartIceRef.current = (reason: string, network: boolean) => {
+    const phase = stateRef.current.phase;
+    if (phase !== "connecting" && phase !== "active") return false;
+    if (roleRef.current === "callee") {
+      const now = Date.now();
+      if (now - lastRestartRequestAtRef.current < 3000) return true;
+      lastRestartRequestAtRef.current = now;
+      trace("restart-request", `asking caller to restart ICE (${reason})`);
+      if (mediaConfirmedRef.current) setReconnecting(true);
+      sendSignal({ type: "restart-request", reason });
+      return true;
+    }
+    if (roleRef.current !== "caller") return false;
+    if (restartInFlightRef.current && Date.now() - restartStartedAtRef.current < 8000) return true;
+    if (network) {
+      if (networkRestartCountRef.current >= MAX_NETWORK_RESTARTS) return false;
+      networkRestartCountRef.current += 1;
+    } else {
+      if (iceRestartCountRef.current >= MAX_ICE_RESTARTS) return false;
+      iceRestartCountRef.current += 1;
+    }
+    trace("restart-ice", reason);
+    // A restart produces a fresh answer for this same call.id; without
+    // clearing this the caller would discard it as a duplicate.
+    answerAppliedForCallIdRef.current = null;
+    restartInFlightRef.current = true;
+    restartStartedAtRef.current = Date.now();
+    if (mediaConfirmedRef.current) setReconnecting(true);
+    sendCommand({ type: "restart-ice" });
+    return true;
+  };
+
+  // Network handover: restart ICE the moment the path under the call changes
+  // (Wi-Fi <-> cellular, a different Wi-Fi, connectivity back after a gap),
+  // instead of waiting for WebRTC to notice the old path went silent. The
+  // native monitor reports the current path first — that's the baseline.
+  const callLive = state.phase === "connecting" || state.phase === "active";
+  useEffect(() => {
+    if (!callLive) return;
+    let last: NetworkPath | null = null;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const subscription = addNetworkChangeListener((path) => {
+      const previous = last;
+      last = path;
+      if (!previous) return;
+      trace("network", `${previous.interface}/${previous.status} -> ${path.interface}/${path.status}`);
+      if (path.status !== "satisfied") {
+        if (mediaConfirmedRef.current) setReconnecting(true);
+        return;
+      }
+      const changed =
+        previous.status !== "satisfied" || previous.interface !== path.interface || previous.gateway !== path.gateway;
+      if (!changed) return;
+      if (timer) clearTimeout(timer);
+      // A short settle: the new interface often reports before its address
+      // is usable, and a restart that gathers on a half-up interface wastes
+      // the attempt.
+      timer = setTimeout(() => restartIceRef.current(`network changed to ${path.interface}`, true), 600);
+    });
+    return () => {
+      subscription.remove();
+      if (timer) clearTimeout(timer);
+    };
+  }, [callLive, trace]);
+
+  // TURN credentials ready before the first call, not fetched while it rings.
+  useEffect(() => {
+    if (userId) warmIceServers();
+  }, [userId]);
+
   const handleBridgeEvent = useCallback(
     (event: BridgeEvent) => {
       if (event.type === "ready") {
@@ -1661,6 +1788,22 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
         // connected (or that dropped mid-conversation) sat on "Connected"
         // forever with silence and no way out but a manual hangup.
         if (event.state === "failed") {
+          // Mid-call (media already flowed): this is a dead path, not a call
+          // that never worked — recover it from either side through the
+          // network-restart budget, and only give up if nothing comes back.
+          if (mediaConfirmedRef.current && restartIceRef.current("connection failed mid-call", true)) {
+            if (!disconnectTimerRef.current) {
+              disconnectTimerRef.current = setTimeout(() => {
+                disconnectTimerRef.current = null;
+                trace("recovery timed out", "ending call");
+                setState((current) =>
+                  current.phase === "idle" || current.phase === "ended" ? current : { phase: "ended", reason: "failed" }
+                );
+                cleanup();
+              }, 20000);
+            }
+            return;
+          }
           if (disconnectTimerRef.current) {
             clearTimeout(disconnectTimerRef.current);
             disconnectTimerRef.current = null;
@@ -1690,6 +1833,7 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
             // clearing this the caller would discard it as a duplicate.
             answerAppliedForCallIdRef.current = null;
             restartInFlightRef.current = true;
+            restartStartedAtRef.current = Date.now();
             sendCommand({ type: "restart-ice" });
             return;
           }
@@ -1706,6 +1850,19 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
           // about to be fine. But it never times out on its own either, so
           // without this a permanently dead route just sits on "Connected"
           // in silence until someone hangs up manually.
+          //
+          // 2026-10-17: don't just wait. WebRTC rarely comes back on its own
+          // from a real path change (it needs new candidates), so after 2.5s
+          // still disconnected, ask for an ICE restart — the caller restarts,
+          // the callee asks the caller to. The give-up timer moves to 20s to
+          // leave that restart room to land.
+          if (mediaConfirmedRef.current) setReconnecting(true);
+          if (!earlyRestartTimerRef.current) {
+            earlyRestartTimerRef.current = setTimeout(() => {
+              earlyRestartTimerRef.current = null;
+              restartIceRef.current("disconnected for 2.5s", true);
+            }, 2500);
+          }
           if (!disconnectTimerRef.current) {
             disconnectTimerRef.current = setTimeout(() => {
               disconnectTimerRef.current = null;
@@ -1716,7 +1873,7 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
                   : { phase: "ended", reason: "failed" }
               );
               cleanup();
-            }, 15000);
+            }, 20000);
           }
         } else if (event.state === "connected") {
           // Recovered — cancel the pending give-up timer.
@@ -1724,6 +1881,14 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
             clearTimeout(disconnectTimerRef.current);
             disconnectTimerRef.current = null;
           }
+          if (earlyRestartTimerRef.current) {
+            clearTimeout(earlyRestartTimerRef.current);
+            earlyRestartTimerRef.current = null;
+          }
+          // A mid-call restart doesn't produce a second media-flowing event,
+          // so "connected" is where it counts as finished.
+          if (mediaConfirmedRef.current) restartInFlightRef.current = false;
+          setReconnecting(false);
           // No audio-route re-assert here anymore — see the local-ready
           // handler's comment. Rebuilding the route at the exact moment
           // media starts flowing was actively harmful, not protective.
@@ -1747,6 +1912,26 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
         // until the call ends. A later snapshot (e.g. after an ICE restart)
         // legitimately replaces an earlier one.
         callStatsRef.current = event;
+        // Signal bars: loss RATE over the last sample interval (the counters
+        // are cumulative) and the current round trip, averaged over three
+        // samples (~6s) so the bars don't flicker on a single bad second.
+        if (mediaConfirmedRef.current && (typeof event.rttMs === "number" || typeof event.packetsReceived === "number")) {
+          const lost = event.packetsLost ?? 0;
+          const received = event.packetsReceived ?? 0;
+          const prev = lastLossCountersRef.current;
+          lastLossCountersRef.current = { lost, received };
+          let lossPct = 0;
+          if (prev) {
+            const dl = Math.max(0, lost - prev.lost);
+            const dr = Math.max(0, received - prev.received);
+            lossPct = dl + dr > 0 ? (dl / (dl + dr)) * 100 : 0;
+          }
+          const rtt = event.rttMs ?? 0;
+          const score = rtt < 150 && lossPct < 2 ? 3 : rtt < 300 && lossPct < 5 ? 2 : rtt < 600 && lossPct < 12 ? 1 : 0;
+          const samples = [...qualitySamplesRef.current, score].slice(-3);
+          qualitySamplesRef.current = samples;
+          setQuality(Math.round(samples.reduce((a, b) => a + b, 0) / samples.length) as 0 | 1 | 2 | 3);
+        }
         trace(
           "call-stats",
           `pair=${event.selectedCandidatePair ?? "?"} relay=${event.turnServer ?? "none"} ` +
@@ -1802,6 +1987,7 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
             // clearing this the caller would discard it as a duplicate.
             answerAppliedForCallIdRef.current = null;
             restartInFlightRef.current = true;
+            restartStartedAtRef.current = Date.now();
             sendCommand({ type: "restart-ice" });
         }
         return;
@@ -1836,6 +2022,7 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
             // clearing this the caller would discard it as a duplicate.
             answerAppliedForCallIdRef.current = null;
             restartInFlightRef.current = true;
+            restartStartedAtRef.current = Date.now();
             sendCommand({ type: "restart-ice" });
             return;
           }
@@ -1973,5 +2160,7 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
     setPeerKyberPublicKey,
     handleBridgeEvent,
     getDiagnosticsReport,
+    reconnecting,
+    quality,
   };
 }

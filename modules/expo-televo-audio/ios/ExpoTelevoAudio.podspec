@@ -13,13 +13,14 @@ Pod::Spec.new do |s|
   s.source         = { git: 'https://github.com/AToPu-sys/televo.git' }
   s.static_framework = true
 
+  s.frameworks = 'Network'
   s.dependency 'ExpoModulesCore'
   s.dependency 'JitsiWebRTC'
   # WebRTCModuleOptions: where the custom audio device and field trials go.
   s.dependency 'react-native-webrtc'
 
   s.source_files = '*.{h,m,mm,swift}', 'rnnoise/include/*.h', 'rnnoise/src/**/*.{c,h}'
-  s.public_header_files = 'TelevoAudioInstaller.h'
+  s.public_header_files = 'TelevoAudioInstaller.h', 'TelevoNetworkMonitor.h'
   s.resource_bundles = { 'TelevoAudioResources' => ['Resources/rnnoise_weights.bin'] }
 
   s.pod_target_xcconfig = {

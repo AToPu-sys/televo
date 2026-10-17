@@ -12,6 +12,8 @@ export type TelevoCallViewProps = {
   phase: "outgoing" | "incoming" | "connecting" | "active" | "ended";
   connected: boolean;
   reconnecting: boolean;
+  /** Signal bars 0 (poor) … 3 (excellent); -1 hides them. */
+  quality?: number;
   muted: boolean;
   routeKind: string;
   routeLabel: string;

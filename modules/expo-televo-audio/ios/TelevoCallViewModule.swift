@@ -19,6 +19,7 @@ public class TelevoCallViewModule: Module {
       Prop("phase") { (view: TelevoCallNativeView, value: String) in view.model.phase = value }
       Prop("connected") { (view: TelevoCallNativeView, value: Bool) in view.model.connected = value }
       Prop("reconnecting") { (view: TelevoCallNativeView, value: Bool) in view.model.reconnecting = value }
+      Prop("quality") { (view: TelevoCallNativeView, value: Int) in view.model.quality = value }
       Prop("muted") { (view: TelevoCallNativeView, value: Bool) in view.model.muted = value }
       Prop("routeKind") { (view: TelevoCallNativeView, value: String) in view.model.routeKind = value }
       Prop("routeLabel") { (view: TelevoCallNativeView, value: String) in view.model.routeLabel = value }
