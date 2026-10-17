@@ -57,3 +57,9 @@ firebase-debug.*
 
 # Supabase CLI local state (linked project, versions) — machine-specific
 supabase/.temp/
+
+# AI-assistant and editor config, local backups — not part of the published source
+CLAUDE.md
+AGENTS.md
+.claude/
+*.bak
