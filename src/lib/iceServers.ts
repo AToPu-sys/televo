@@ -1,49 +1,97 @@
+import { addNetworkChangeListener, currentNetwork } from "expo-televo-audio";
+
 import { supabase } from "./supabase";
-import { ICE_SERVERS as FALLBACK_ICE_SERVERS } from "./webrtc";
+import { probeRelay } from "./turnProbe";
+import { ICE_SERVERS as FALLBACK_ICE_SERVERS, PUBLIC_STUN } from "./webrtc";
 
 /**
- * ICE servers for a call: short-lived Cloudflare TURN credentials minted by
- * the turn-credentials Edge Function, with the bundled list as a fallback.
+ * ICE servers for a call: TURN relays from the turn-credentials Edge
+ * Function — Televo's own servers, the free ExpressTURN pair, and Metered or
+ * Cloudflare when those are configured — ranked for the network the phone
+ * is on right now.
  *
- * Cloudflare's relay is anycast — a phone reaches the closest edge — where
- * the bundled relay is a free shared server in one region, which is what made
- * relayed calls slow to connect and laggy. Credentials are fetched ahead of
- * time (warmIceServers on sign-in and when a call starts ringing) and cached
- * until shortly before they expire, so placing or answering a call never waits
- * on this request; if it is slow or fails, the call goes ahead on the fallback.
+ * Ranking: every relay is probed in the background (src/lib/turnProbe.ts —
+ * time to a real TURN allocation) when the list arrives and whenever the
+ * network changes, never during a call. A call gets the fastest
+ * MAX_RELAYS, fastest first (libwebrtc prefers relays listed earlier);
+ * relays that failed from this network go last. When a relayed call turns
+ * bad, useCall penalises the relay it is on (penalizeRelayForUrl) and
+ * restarts ICE with the next best — so a congested or dying relay is left
+ * mid-call instead of being suffered.
+ *
+ * Credentials are fetched ahead of time (sign-in, an incoming ring) and
+ * cached until shortly before they expire, so placing or answering a call
+ * never waits on the network for them; if the function is slow or
+ * unreachable, the call goes ahead on the list bundled in the app.
  */
 
 type IceServer = { urls: string | string[]; username?: string; credential?: string };
+export type Relay = { id: string; provider: string; server: IceServer };
 
 const FETCH_TIMEOUT_MS = 2500;
-/** Refresh this long before Cloudflare's expiry so a call never starts on a
- * credential that runs out mid-call. */
+/** Refresh this long before expiry so a call never starts on a credential
+ * that runs out mid-call. */
 const REFRESH_MARGIN_MS = 60 * 60 * 1000;
+/** Relays handed to one call. Each costs an allocation and candidates to
+ * check, so not all of them — the fastest few. */
+const MAX_RELAYS = 3;
+/** A measurement is trusted this long, on the same network. */
+const PROBE_TTL_MS = 10 * 60 * 1000;
+/** How long a relay that failed a call stays at the back of the line. */
+const PENALTY_MS = 10 * 60 * 1000;
 
-let cached: { servers: IceServer[]; expiresAt: number } | null = null;
-let inFlight: Promise<IceServer[] | null> | null = null;
+let cached: { relays: Relay[]; expiresAt: number } | null = null;
+let inFlight: Promise<boolean> | null = null;
+let measurement: { network: string; at: number; ms: Map<string, number | null> } | null = null;
+let probing: Promise<void> | null = null;
+let probingAllowed = true;
+let networkListening = false;
+const penalties = new Map<string, number>();
 
-/** Extra public STUN alongside Cloudflare's own — cheap, and a second
- * reflexive address source if one STUN host is unreachable. */
-const EXTRA_STUN: IceServer[] = [{ urls: "stun:stun.l.google.com:19302" }];
-
-function fresh(): IceServer[] | null {
-  if (!cached || cached.expiresAt - Date.now() < REFRESH_MARGIN_MS) return null;
-  return cached.servers;
+function urlsOf(server: IceServer): string[] {
+  return Array.isArray(server.urls) ? server.urls : [server.urls];
 }
 
-function fetchCloudflare(): Promise<IceServer[] | null> {
+function hostOf(url: string): string {
+  return url.replace(/^(turns?|stuns?):/, "").split(/[:?]/)[0];
+}
+
+function networkKey(): string {
+  const path = currentNetwork();
+  return path ? `${path.interface}|${path.gateway}` : "unknown";
+}
+
+/** Builds that predate `relays` in the response still get one relay per
+ * host out of the flat list. */
+function relaysFromFlatList(servers: IceServer[]): Relay[] {
+  const relays: Relay[] = [];
+  for (const server of servers) {
+    const turnUrls = urlsOf(server).filter((url) => url.startsWith("turn"));
+    if (turnUrls.length === 0) continue;
+    relays.push({ id: `server:${hostOf(turnUrls[0])}`, provider: "server", server: { ...server, urls: turnUrls } });
+  }
+  return relays;
+}
+
+function fresh() {
+  if (!cached || cached.expiresAt - Date.now() < REFRESH_MARGIN_MS) return null;
+  return cached;
+}
+
+function fetchFromServer(): Promise<boolean> {
   if (inFlight) return inFlight;
   inFlight = (async () => {
     try {
       const { data, error } = await supabase.functions.invoke("turn-credentials", { method: "POST" });
-      const servers = (data as { iceServers?: IceServer[] } | null)?.iceServers;
-      const expiresAt = (data as { expiresAt?: number } | null)?.expiresAt;
-      if (error || !servers?.length || !expiresAt) return null;
-      cached = { servers: [...servers, ...EXTRA_STUN], expiresAt };
-      return cached.servers;
+      const body = data as { iceServers?: IceServer[]; relays?: Relay[]; expiresAt?: number } | null;
+      if (error || !body?.expiresAt) return false;
+      const relays = body.relays?.length ? body.relays : relaysFromFlatList(body.iceServers ?? []);
+      if (relays.length === 0) return false;
+      cached = { relays, expiresAt: body.expiresAt };
+      void probeRelays();
+      return true;
     } catch {
-      return null;
+      return false;
     } finally {
       inFlight = null;
     }
@@ -51,29 +99,105 @@ function fetchCloudflare(): Promise<IceServer[] | null> {
   return inFlight;
 }
 
-/** Start fetching credentials in the background if the cache is cold. */
-export function warmIceServers(): void {
-  if (!fresh()) void fetchCloudflare();
+/** Relays in the order a call should try them. */
+export function rankedRelays(): Relay[] {
+  const relays = cached?.relays ?? [];
+  const now = Date.now();
+  const measured = measurement && measurement.network === networkKey() ? measurement.ms : null;
+  return relays
+    .map((relay, index) => {
+      const ms = measured?.get(relay.id);
+      // Unmeasured relays keep the server's order, after every relay that
+      // answered and before every one that didn't.
+      let score = ms === undefined ? 10_000 + index : ms === null ? 1_000_000 + index : ms;
+      if ((penalties.get(relay.id) ?? 0) > now) score += 10_000_000;
+      return { relay, score };
+    })
+    .sort((a, b) => a.score - b.score)
+    .map(({ relay }) => relay);
 }
 
-/** "server": credentials from the turn-credentials function (Cloudflare
- * when configured there, otherwise the free relay's credentials it holds).
- * "fallback": the list bundled in the app. */
+function buildServers(): IceServer[] {
+  // STUN is the app's own measured list (PUBLIC_STUN), not the server's.
+  return [...PUBLIC_STUN, ...rankedRelays().slice(0, MAX_RELAYS).map((relay) => relay.server)];
+}
+
+/** Measures every relay from the current network (in the background; skipped
+ * during calls and when a recent measurement for this network exists). */
+export function probeRelays(force = false): Promise<void> {
+  const relays = cached?.relays ?? [];
+  if (!probingAllowed || relays.length === 0) return Promise.resolve();
+  const network = networkKey();
+  if (!force && measurement && measurement.network === network && Date.now() - measurement.at < PROBE_TTL_MS) {
+    return Promise.resolve();
+  }
+  if (probing) return probing;
+  probing = (async () => {
+    const results = await Promise.all(relays.map(async (relay) => [relay.id, await probeRelay(relay.server)] as const));
+    measurement = { network, at: Date.now(), ms: new Map(results) };
+  })().finally(() => {
+    probing = null;
+  });
+  return probing;
+}
+
+function listenForNetworkChanges() {
+  if (networkListening) return;
+  networkListening = true;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  addNetworkChangeListener((path) => {
+    if (path.status !== "satisfied") return;
+    if (timer) clearTimeout(timer);
+    // Let the new path settle (DHCP, DNS) before measuring on it.
+    timer = setTimeout(() => void probeRelays(true), 2000);
+  });
+}
+
+/** Calls pause probing (no extra traffic or allocations mid-call). */
+export function setRelayProbingAllowed(allowed: boolean): void {
+  probingAllowed = allowed;
+  if (allowed) void probeRelays();
+}
+
+/** Start fetching credentials and measuring relays in the background. */
+export function warmIceServers(): void {
+  listenForNetworkChanges();
+  if (!fresh()) void fetchFromServer();
+  else void probeRelays();
+}
+
+/** "server": relays from the turn-credentials function. "fallback": the
+ * list bundled in the app. */
 export type IceServerSet = { servers: IceServer[]; source: "server" | "fallback" };
 
 /** The servers to build this call's peer connection with. Never waits longer
  * than FETCH_TIMEOUT_MS; on a miss the call uses the bundled list. */
 export async function getIceServers(): Promise<IceServerSet> {
-  const ready = fresh();
-  if (ready) return { servers: ready, source: "server" };
-  const servers = await Promise.race([
-    fetchCloudflare(),
-    new Promise<null>((resolve) => setTimeout(() => resolve(null), FETCH_TIMEOUT_MS)),
+  if (fresh()) return { servers: buildServers(), source: "server" };
+  const ok = await Promise.race([
+    fetchFromServer(),
+    new Promise<boolean>((resolve) => setTimeout(() => resolve(false), FETCH_TIMEOUT_MS)),
   ]);
-  return servers ? { servers, source: "server" } : { servers: FALLBACK_ICE_SERVERS, source: "fallback" };
+  return ok && cached ? { servers: buildServers(), source: "server" } : { servers: FALLBACK_ICE_SERVERS, source: "fallback" };
+}
+
+/**
+ * The call on the relay at `url` (a TURN URL from the call's stats) is
+ * going badly: send that relay to the back of the line and return the
+ * re-ranked servers — or null when there's no other relay to move to.
+ */
+export function penalizeRelayForUrl(url: string): { servers: IceServer[]; from: string; to: string } | null {
+  if (!cached) return null;
+  const host = hostOf(url);
+  const current = cached.relays.find((relay) => urlsOf(relay.server).some((candidate) => hostOf(candidate) === host));
+  if (!current) return null;
+  penalties.set(current.id, Date.now() + PENALTY_MS);
+  const next = rankedRelays()[0];
+  if (!next || next.id === current.id) return null;
+  return { servers: buildServers(), from: current.id, to: next.id };
 }
 
 /** True when the last fetched set includes a TURN relay. */
 export function hasServerRelay(): boolean {
-  return !!fresh()?.some((server) => (Array.isArray(server.urls) ? server.urls : [server.urls]).some((url) => url.startsWith("turn")));
+  return !!fresh()?.relays.length;
 }

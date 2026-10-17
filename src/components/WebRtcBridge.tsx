@@ -75,6 +75,10 @@ export type BridgeEvent =
       /** Inbound packets received across all tracks, for a loss RATE (the
        * lost counter alone only ever grows). */
       packetsReceived?: number | null;
+      /** The TURN server URL (as configured) behind this device's relay
+       * candidate when the call is relayed through it — what useCall uses to
+       * pick a different relay when this one performs badly. */
+      relayUrl?: string | null;
       msToMedia: number | null;
       bytesReceived: number | null;
       packetsLost: number | null;
@@ -220,6 +224,9 @@ type Command =
   // this after a media-timeout; see useCall's handler for why one retry is
   // worth it before declaring the call failed.
   | { type: "restart-ice" }
+  // Swaps the relay list on the live connection (keeping every other
+  // setting it was created with). Takes effect at the next ICE restart.
+  | { type: "set-ice-servers"; iceServers: RTCIceServer[] }
   // The callee's half of an ICE restart: applies the caller's re-offer to
   // the peer connection that is ALREADY up and answers it. Distinct from
   // "create-answer", which builds a brand new connection and re-opens the
@@ -368,6 +375,10 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
   // that otherwise both just look like "no relay in the selected pair" in
   // call-stats after the fact, with no way to say WHICH one happened.
   const relayCandidateCountRef = useRef(0);
+  // The configuration the live connection was built with. setConfiguration
+  // replaces it wholesale, and changing bundle/rtcp-mux policy afterwards is
+  // refused, so swapping relays has to resend everything else unchanged.
+  const peerConfigRef = useRef<object | null>(null);
 
   // True until this effect has seen callActive go true at least once, i.e.
   // until a call has actually started in this mount. Without it, the effect's
@@ -976,6 +987,7 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
           const port = relay.port ?? null;
           if (address) result.turnServer = port ? `${address}:${port}` : String(address);
         }
+        if (localType === "relay" && typeof local?.url === "string") result.relayUrl = local.url;
       }
     } catch {
       // Stats are diagnostics, never a reason to disturb a live call.
@@ -1241,7 +1253,7 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
     // mic, while candidates for the new one are applied to a connection
     // nobody reads.
     pcRef.current?.close();
-    const pc = new webrtc.RTCPeerConnection({
+    const config = {
       iceServers,
       // iceCandidatePoolSize (previously 4) REMOVED 2026-09-19: it was
       // added to gather candidates before the offer for a faster pickup,
@@ -1262,7 +1274,7 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
       //
       // Lets ICE re-pick a working route mid-call (e.g. Wi-Fi to cellular
       // handover) rather than dropping the call when the current path dies.
-      iceTransportPolicy: "all",
+      iceTransportPolicy: "all" as const,
       // Android only (iOS's react-native-webrtc doesn't read this key): keep
       // gathering candidates for the whole call, so a Wi-Fi <-> cellular
       // switch surfaces a working new path on its own. iOS gets the same
@@ -1287,9 +1299,11 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
       // checks. Both are universally supported by modern WebRTC stacks
       // (and by the identical react-native-webrtc build on both ends here),
       // so there is no fallback risk in requiring them.
-      bundlePolicy: "max-bundle",
-      rtcpMuxPolicy: "require",
-    });
+      bundlePolicy: "max-bundle" as const,
+      rtcpMuxPolicy: "require" as const,
+    };
+    peerConfigRef.current = config;
+    const pc = new webrtc.RTCPeerConnection(config);
 
     // react-native-webrtc types these callbacks as a bare Event<string>
     // without the payload fields, so the runtime shapes are annotated here.
@@ -1642,6 +1656,19 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
         // connection actually carries media. Generation-guarded, so this
         // supersedes rather than races any loop already running.
         void watchForInboundMedia(pc);
+        return;
+      }
+
+      if (command.type === "set-ice-servers") {
+        const pc = pcRef.current;
+        if (!pc || !peerConfigRef.current) return;
+        const config = { ...peerConfigRef.current, iceServers: command.iceServers };
+        try {
+          pc.setConfiguration(config);
+          peerConfigRef.current = config;
+        } catch (error) {
+          post({ type: "log", message: `set-ice-servers failed: ${String(error)}` });
+        }
         return;
       }
 

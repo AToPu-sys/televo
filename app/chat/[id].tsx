@@ -139,6 +139,7 @@ export default function ConversationScreen() {
     deleteMessage,
     markRead,
     retryDecryption,
+    retrySend,
   } = useMessages(id, user?.id, isEncrypted, conversation?.selfDestructSeconds ?? null);
   const loading = loadingConversation || loadingMessages;
   // renderItem looked up `messages.find(...)` per row to resolve a reply
@@ -1180,6 +1181,7 @@ export default function ConversationScreen() {
                   forwardedFrom={forwardedFrom}
                   peerLastReadAt={peerLastReadAt}
                   onRetryDecryption={retryDecryption}
+                  onRetrySend={retrySend}
                   onOpenMedia={handleOpenMedia}
                 />
               );

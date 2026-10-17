@@ -61,78 +61,49 @@
 const TURN_USERNAME = process.env.EXPO_PUBLIC_TURN_USERNAME ?? "";
 const TURN_CREDENTIAL = process.env.EXPO_PUBLIC_TURN_CREDENTIAL ?? "";
 
-const DEDICATED_TURN: { urls: string; username: string; credential: string }[] = !TURN_USERNAME ? [] : [
-  // VERIFIED 2026-09-19 with a real TURN Allocate request (not just a port
-  // check): this account successfully allocated relay address
-  // 62.210.205.50:59885 from free.expressturn.com:3478 over UDP. That is
-  // the first working relay this app has ever had — the previous one
-  // (openrelay.metered.ca) was silent on every transport, which is why no
-  // call in a full day of testing ever gathered a single relay candidate.
+const DEDICATED_TURN: { urls: string[]; username: string; credential: string }[] = !TURN_USERNAME ? [] : [
+  // free.expressturn.com is two servers behind one name — free1
+  // (62.210.205.50) and free2 (51.158.147.206), both Paris. Re-measured
+  // 2026-10-17 with real TURN Allocate requests: both allocate over UDP and
+  // TCP on 3478. Their TLS on 443 does NOT work: the certificate is issued
+  // to free1/free2, never to "free", so a turns: URL on the shared name
+  // fails the TLS check on every attempt; free2's certificate has expired
+  // and free1's 443 accepts the handshake but never answers the Allocate.
+  // So each server is named directly, 3478 only.
   {
-    urls: "turn:free.expressturn.com:3478",
+    urls: ["turn:free1.expressturn.com:3478", "turn:free1.expressturn.com:3478?transport=tcp"],
     username: TURN_USERNAME,
     credential: TURN_CREDENTIAL,
   },
-  // TLS on 443 for networks that block or throttle UDP to arbitrary ports —
-  // to a carrier middlebox this is indistinguishable from ordinary HTTPS.
-  // Probed as open; it rejects plain STUN (ECONNRESET), which is expected
-  // for a TLS listener and is why it's declared turns: rather than
-  // turn:...?transport=tcp. Listed second so ICE prefers the faster UDP
-  // path when that works, and only falls back here when it doesn't.
   {
-    urls: "turns:free.expressturn.com:443?transport=tcp",
-    username: TURN_USERNAME,
-    credential: TURN_CREDENTIAL,
-  },
-  // Plain TCP on 3478, added 2026-09-20 for cross-border reliability. Probed
-  // open (nc -zvw4 free.expressturn.com 3478 succeeds over TCP, distinct
-  // from the UDP probe on the same port above). An international path adds
-  // real packet loss on top of ordinary mobile-network loss, and UDP is
-  // where that loss actually breaks a TURN allocation — ICE has already
-  // fallen back this far because the direct and UDP-relay paths failed, so
-  // a THIRD option matters more here than on a same-country call where UDP
-  // almost always just works. Listed last: only tried when UDP (3478) and
-  // TLS (443) both fail.
-  {
-    urls: "turn:free.expressturn.com:3478?transport=tcp",
+    urls: ["turn:free2.expressturn.com:3478", "turn:free2.expressturn.com:3478?transport=tcp"],
     username: TURN_USERNAME,
     credential: TURN_CREDENTIAL,
   },
 ];
 
-export const ICE_SERVERS = [
-  // Cloudflare's STUN, added 2026-09-20 and listed FIRST. Measured
-  // 2026-09-20 against the others from this network: Cloudflare answered in
-  // 60ms versus 193-270ms for Google/Metered/Twilio — 3-4x faster. That gap
-  // is Cloudflare's anycast network answering from the nearest edge location
-  // rather than a single region, which matters most exactly for a
-  // cross-border call: whichever country either side is in, they hit a
-  // nearby edge instead of routing to wherever Google's or Metered's servers
-  // happen to be. ICE tries all configured servers, but ordering still
-  // matters — it ranks candidates partly by gathering latency, so the
-  // fastest STUN response tends to produce the fastest usable srflx
-  // candidate.
+/**
+ * Public STUN, re-measured 2026-10-17 with real Binding requests against a
+ * list of 268 known servers (101 still answer): only operators under 70 ms
+ * from the test network, at most a few of them — every STUN server is
+ * another request on every connection attempt, so more stops helping fast.
+ * Cloudflare (anycast, 12 ms) and Google (14-15 ms) first; then independent
+ * VoIP operators in other countries — Linphone (France, 30 ms), sipgate
+ * (Germany, 37 ms), Zadarma (47 ms, common across the CIS) and sipnet.ru
+ * (Russia, 68 ms) — for networks where Google or Cloudflare are blocked or
+ * throttled, which happens in Russia.
+ */
+export const PUBLIC_STUN = [
   { urls: "stun:stun.cloudflare.com:3478" },
-  // Port 53 (DNS) as a second Cloudflare path — probed 2026-09-20 at 59ms,
-  // matching :3478. A carrier that throttles/blocks arbitrary UDP ports
-  // often leaves 53 alone since it looks like ordinary DNS traffic; costs
-  // nothing when :3478 already works since ICE gathers all configured
-  // servers regardless.
-  { urls: "stun:stun.cloudflare.com:53" },
-  // The rest, kept as extra independent paths: a STUN server unreachable on
-  // one carrier costs this device its entire srflx path from that server,
-  // which — before TURN even comes into play — is the difference between a
-  // working call and no call at all. Every host below was individually
-  // probed 2026-09-20 (81-140ms each, all answering) — Google publishes
-  // five interchangeable STUN hosts precisely so a client isn't betting on
-  // one instance's uptime.
-  { urls: "stun:stun.l.google.com:19302" },
-  { urls: "stun:stun1.l.google.com:19302" },
-  { urls: "stun:stun2.l.google.com:19302" },
-  { urls: "stun:stun3.l.google.com:19302" },
-  { urls: "stun:stun4.l.google.com:19302" },
-  { urls: "stun:stun.l.google.com:5349" },
-  { urls: "stun:stun.relay.metered.ca:80" },
+  { urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"] },
+  { urls: "stun:stun.linphone.org:3478" },
+  { urls: "stun:stun.sipgate.net:3478" },
+  { urls: "stun:stun.zadarma.com:3478" },
+  { urls: "stun:stun.sipnet.ru:3478" },
+];
+
+export const ICE_SERVERS = [
+  ...PUBLIC_STUN,
   ...DEDICATED_TURN,
 ];
 

@@ -12,6 +12,7 @@ import {
 import { normalizePhone } from "../lib/phone";
 import { wipeLocalMessages } from "../lib/localMessages";
 import { clearMediaCache } from "../lib/mediaCache";
+import { clearOutbox } from "../lib/outbox";
 import { supabase } from "../lib/supabase";
 
 /** Verifies a password against the CURRENT account without disturbing the
@@ -146,6 +147,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       // session): erase this device's copy of the account's chats and media,
       // so the next person to sign in on this phone can't see them.
       if (event === "SIGNED_OUT") {
+        clearOutbox();
         void wipeLocalMessages().catch(() => {});
         try {
           clearMediaCache();

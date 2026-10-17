@@ -8,7 +8,10 @@ import type { Database } from "../types/database";
 // The server stays the source of truth: rows are stored exactly as the server
 // returned them — Secret Chat bodies remain ciphertext envelopes and are
 // decrypted at render time like before, so nothing readable is added to disk.
-// Only server-confirmed rows are written (never optimistic ones). Clearing the
+// Only server-confirmed rows are written to `messages`; text the user sent that
+// hasn't reached the server yet lives in the separate `outbox` table (see
+// src/lib/outbox.ts) — for a Secret Chat that's the E2E envelope, never the
+// plaintext. Clearing the
 // media cache in Settings never touches this database; signing out wipes it,
 // so the next account on the same phone can't read the previous one's chats.
 
@@ -33,6 +36,12 @@ function db(): Promise<SQLite.SQLiteDatabase> {
         CREATE INDEX IF NOT EXISTS messages_conv_created
           ON messages (conversation_id, created_at DESC);
         CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY NOT NULL, value TEXT);
+        CREATE TABLE IF NOT EXISTS outbox (
+          id TEXT PRIMARY KEY NOT NULL,
+          sender_id TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          entry TEXT NOT NULL
+        );
       `);
       return handle;
     })().catch((error) => {
@@ -55,7 +64,7 @@ export async function bindLocalMessagesToUser(userId: string): Promise<void> {
     "SELECT value FROM meta WHERE key = 'owner'"
   );
   if (owner && owner.value !== userId) {
-    await handle.execAsync("DELETE FROM messages;");
+    await handle.execAsync("DELETE FROM messages; DELETE FROM outbox;");
   }
   await handle.runAsync("INSERT OR REPLACE INTO meta (key, value) VALUES ('owner', ?)", userId);
 }
@@ -142,5 +151,49 @@ export async function reconcileLocalWindow(
 /** Erases every cached message (sign-out, account deletion). */
 export async function wipeLocalMessages(): Promise<void> {
   const handle = await db();
-  await handle.execAsync("DELETE FROM messages; DELETE FROM meta;");
+  await handle.execAsync("DELETE FROM messages; DELETE FROM meta; DELETE FROM outbox;");
 }
+
+/** Unsent messages, persisted so they survive the chat closing or the app
+ * being killed. `entry` is an OutboxEntry as JSON (src/lib/outbox.ts). */
+export async function readOutboxRows(senderId: string): Promise<string[]> {
+  const handle = await db();
+  const rows = await handle.getAllAsync<{ entry: string }>(
+    "SELECT entry FROM outbox WHERE sender_id = ? ORDER BY created_at ASC",
+    senderId
+  );
+  return rows.map((row) => row.entry);
+}
+
+export async function saveOutboxRow(id: string, senderId: string, createdAt: string, entry: string): Promise<void> {
+  const handle = await db();
+  await handle.runAsync(
+    "INSERT OR REPLACE INTO outbox (id, sender_id, created_at, entry) VALUES (?, ?, ?, ?)",
+    id,
+    senderId,
+    createdAt,
+    entry
+  );
+}
+
+export async function deleteOutboxRow(id: string): Promise<void> {
+  const handle = await db();
+  await handle.runAsync("DELETE FROM outbox WHERE id = ?", id);
+}
+
+/** The chat list as last shown, so it opens instantly and works offline.
+ * Stored per account; Secret Chat previews are never in it (see useChats). */
+export async function readChatListCache(userId: string): Promise<string | null> {
+  const handle = await db();
+  const row = await handle.getFirstAsync<{ value: string }>(
+    "SELECT value FROM meta WHERE key = ?",
+    `chat-list:${userId}`
+  );
+  return row?.value ?? null;
+}
+
+export async function writeChatListCache(userId: string, json: string): Promise<void> {
+  const handle = await db();
+  await handle.runAsync("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", `chat-list:${userId}`, json);
+}
+

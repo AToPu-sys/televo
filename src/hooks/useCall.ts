@@ -14,8 +14,9 @@ import {
   markNextCallAsAnsweredViaCallKit,
 } from "../components/WebRtcBridge";
 import { supabase } from "../lib/supabase";
+import { subscribeUserEvents } from "../lib/userChannel";
 import { USING_PUBLIC_TURN } from "../lib/webrtc";
-import { getIceServers, warmIceServers } from "../lib/iceServers";
+import { getIceServers, penalizeRelayForUrl, setRelayProbingAllowed, warmIceServers } from "../lib/iceServers";
 import { addNetworkChangeListener, type NetworkPath } from "expo-televo-audio";
 import type { Database } from "../types/database";
 import { useE2ee } from "./useE2ee";
@@ -367,6 +368,7 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
   // the call, and a commute can legitimately produce several in a row.
   const networkRestartCountRef = useRef(0);
   const MAX_NETWORK_RESTARTS = 6;
+  const MAX_RELAY_SWITCHES = 2;
   /** When the in-flight restart began. A restart can be orphaned (the other
    * side was offline when the offer went out), and restartInFlightRef must
    * not then block every later restart for the rest of the call. */
@@ -382,6 +384,11 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
   const [quality, setQuality] = useState<0 | 1 | 2 | 3 | null>(null);
   const qualitySamplesRef = useRef<number[]>([]);
   const lastLossCountersRef = useRef<{ lost: number; received: number } | null>(null);
+  // Relay switching (see the call-stats handler): consecutive bad samples
+  // on a relayed path, and how often this call has already moved.
+  const poorStreakRef = useRef(0);
+  const relaySwitchCountRef = useRef(0);
+  const lastRelaySwitchAtRef = useRef(0);
   /** Assigned every render below, once sendSignal/sendCommand exist. Returns
    * whether a restart (or a restart request) actually went out. */
   const restartIceRef = useRef<(reason: string, network: boolean) => boolean>(() => false);
@@ -503,6 +510,9 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
     setQuality(null);
     qualitySamplesRef.current = [];
     lastLossCountersRef.current = null;
+    poorStreakRef.current = 0;
+    relaySwitchCountRef.current = 0;
+    lastRelaySwitchAtRef.current = 0;
     // Drop the loudspeaker preference the moment a call ends, not on the 3s
     // auto-dismiss timer in reset().
     //
@@ -638,78 +648,37 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
   // simply a lost packet — and when the "hangup" broadcast never arrived,
   // this side's phase never moved to "ended": callActive stayed true forever,
   // WebRtcBridge never called releaseMedia, and the camera/mic stayed live
-  // until the app was killed by hand. Postgres changes on the row itself is
-  // the fallback: whichever side DID manage to write status="ended" (hangup
+  // until the app was killed by hand. The row's own status is the
+  // fallback: whichever side DID manage to write status="ended" (hangup
   // always writes this even when the broadcast to the peer is lost) now
   // reaches the other side through a completely different transport.
   useEffect(() => {
     const current = stateRef.current;
     if (current.phase === "idle" || current.phase === "ended" || !("call" in current)) return;
     const callId = current.call.id;
+    if (!userId) return;
 
-    let cancelled = false;
-    let activeChannel: ReturnType<typeof supabase.channel> | null = null;
-    let retryTimer: ReturnType<typeof setTimeout> | null = null;
-
-    const join = () => {
-      const channel = supabase
-        // private: true routes the join through Realtime Authorization, so
-        // the server checks the RLS policy on realtime.messages (see
-        // 039_private_call_channels.sql) instead of admitting anyone who
-        // knows the call id.
-        .channel(`call-status:${callId}`, { config: { private: true } })
-        .on(
-          "postgres_changes",
-          { event: "UPDATE", schema: "public", table: "calls", filter: `id=eq.${callId}` },
-          (payload) => {
-            const status = (payload.new as { status?: string } | null)?.status;
-            const latest = stateRef.current;
-            if (latest.phase === "idle" || latest.phase === "ended") return;
-            if (status === "ended" || status === "declined" || status === "missed") {
-              trace("call row watchdog", `status=${status} — signalling channel likely dropped the hangup`);
-              setState({
-                phase: "ended",
-                reason: status === "declined" ? "declined" : status === "missed" ? "missed" : "hangup",
-              });
-              cleanup();
-            }
-          }
-        )
-        .subscribe((status) => {
-          if (cancelled) return;
-          // Same cold-launch Realtime-auth race as joinSignalChannel: a
-          // private channel joined within milliseconds of process launch
-          // (the CallKit-answered path) can fail its first attempt before
-          // the restored session's JWT has reached the Realtime socket.
-          // This channel is a fallback safety net, not the primary
-          // signaling path, so a missed retry here is lower-stakes than on
-          // joinSignalChannel — but leaving it permanently unsubscribed
-          // after a transient error silently disables the hangup-recovery
-          // fallback for the rest of the call, which is exactly the kind of
-          // failure this channel exists to catch.
-          if (status !== "CHANNEL_ERROR" && status !== "TIMED_OUT") return;
-          retryTimer = setTimeout(() => {
-            if (cancelled) return;
-            if (stateRef.current.phase === "idle" || stateRef.current.phase === "ended") return;
-            void supabase.removeChannel(channel);
-            join();
-          }, 800);
+    // The call row's status arrives on the user's own channel
+    // (src/lib/userChannel.ts), which also reconnects on its own — a
+    // separate transport from the call's signalling channel, which is the
+    // point of this fallback.
+    return subscribeUserEvents(userId, (event) => {
+      if (event.type !== "call_update" || event.call.id !== callId) return;
+      const status = event.call.status;
+      const latest = stateRef.current;
+      if (latest.phase === "idle" || latest.phase === "ended") return;
+      if (status === "ended" || status === "declined" || status === "missed") {
+        trace("call row watchdog", `status=${status} — signalling channel likely dropped the hangup`);
+        setState({
+          phase: "ended",
+          reason: status === "declined" ? "declined" : status === "missed" ? "missed" : "hangup",
         });
-
-      activeChannel = channel;
-    };
-
-    join();
-
-    return () => {
-      cancelled = true;
-      if (retryTimer) clearTimeout(retryTimer);
-      if (activeChannel) void supabase.removeChannel(activeChannel);
-    };
+        cleanup();
+      }
+    });
     // Re-subscribes whenever a new call starts (state.phase transitions into
-    // a non-idle, non-ended value) — the filter is baked into the channel at
-    // subscribe time and can't be updated on an existing one.
-  }, [state.phase, cleanup, trace]);
+    // a non-idle, non-ended value), so callId is always the current call's.
+  }, [state.phase, userId, cleanup, trace]);
 
   // Wire format: encrypted straight to the peer's public key whenever it's
   // known, so SDP/ICE — which carry real IP addresses — aren't sent as plain
@@ -1673,6 +1642,12 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
   // instead of waiting for WebRTC to notice the old path went silent. The
   // native monitor reports the current path first — that's the baseline.
   const callLive = state.phase === "connecting" || state.phase === "active";
+
+  // Relay measurements (src/lib/iceServers.ts) run between calls only.
+  const callBusy = state.phase !== "idle" && state.phase !== "ended";
+  useEffect(() => {
+    setRelayProbingAllowed(!callBusy);
+  }, [callBusy]);
   useEffect(() => {
     if (!callLive) return;
     let last: NetworkPath | null = null;
@@ -1931,6 +1906,29 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
           const samples = [...qualitySamplesRef.current, score].slice(-3);
           qualitySamplesRef.current = samples;
           setQuality(Math.round(samples.reduce((a, b) => a + b, 0) / samples.length) as 0 | 1 | 2 | 3);
+
+          // Relayed and bad for three samples running (~15s): the relay may
+          // be the problem (congested, far away). Move to the next best one
+          // (src/lib/iceServers.ts) with an ICE restart instead of suffering
+          // it for the rest of the call. Bounded: two moves per call, 20s
+          // apart, and only when there is another relay to move to.
+          poorStreakRef.current = score <= 1 ? poorStreakRef.current + 1 : 0;
+          if (
+            poorStreakRef.current >= 3 &&
+            event.relayUrl &&
+            relaySwitchCountRef.current < MAX_RELAY_SWITCHES &&
+            Date.now() - lastRelaySwitchAtRef.current > 20_000
+          ) {
+            const next = penalizeRelayForUrl(event.relayUrl);
+            if (next) {
+              relaySwitchCountRef.current += 1;
+              lastRelaySwitchAtRef.current = Date.now();
+              poorStreakRef.current = 0;
+              trace("relay-switch", `${next.from} -> ${next.to}`);
+              sendCommand({ type: "set-ice-servers", iceServers: next.servers });
+              restartIceRef.current(`relay ${next.from} performing badly`, true);
+            }
+          }
         }
         trace(
           "call-stats",

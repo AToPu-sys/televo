@@ -12,6 +12,7 @@ Pod::Spec.new do |s|
   s.platforms      = { ios: '15.1' }
   s.source         = { git: 'https://github.com/AToPu-sys/televo-app.git' }
 
+  s.frameworks = 'VideoToolbox', 'AVKit'
   s.dependency 'ExpoModulesCore'
   # For RTCVideoRenderer/RTCVideoFrame/RTCMediaStream — this module reads
   # raw decoded video frames directly off the remote track react-native-webrtc

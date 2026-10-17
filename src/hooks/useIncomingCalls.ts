@@ -1,14 +1,15 @@
 import { useEffect, useRef } from "react";
 
-import { supabase } from "../lib/supabase";
+import { subscribeUserEvents } from "../lib/userChannel";
 import type { Database } from "../types/database";
 
 type CallRow = Database["public"]["Tables"]["calls"]["Row"];
 
 /**
- * Subscribes to every `calls` INSERT the user is allowed to see (RLS already
- * restricts this to conversations they participate in) so an incoming call
- * can ring from anywhere in the app, not just while a specific chat is open.
+ * Rings for a new call in any of the user's conversations, from anywhere in
+ * the app, not just while a specific chat is open. Calls arrive on the
+ * user's own channel (src/lib/userChannel.ts) — only their own, instead of
+ * every call inserted anywhere being checked against their RLS.
  */
 export function useIncomingCalls(
   userId: string | undefined,
@@ -32,23 +33,13 @@ export function useIncomingCalls(
   useEffect(() => {
     if (!userId) return;
 
-    const channel = supabase
-      .channel("incoming-calls")
-      .on(
-        "postgres_changes",
-        { event: "INSERT", schema: "public", table: "calls" },
-        (payload) => {
-          const call = payload.new as CallRow;
-          // Don't ring yourself when you're the one placing the call.
-          if (call.caller_id !== userId && call.status === "ringing") {
-            onIncomingRef.current(call);
-          }
-        }
-      )
-      .subscribe();
-
-    return () => {
-      void supabase.removeChannel(channel);
-    };
+    return subscribeUserEvents(userId, (event) => {
+      if (event.type !== "call_insert") return;
+      const call: CallRow = event.call;
+      // Don't ring yourself when you're the one placing the call.
+      if (call.caller_id !== userId && call.status === "ringing") {
+        onIncomingRef.current(call);
+      }
+    });
   }, [userId]);
 }

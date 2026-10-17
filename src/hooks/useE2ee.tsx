@@ -11,10 +11,10 @@ import {
 
 import {
   decapCallKemSecret,
-  decryptBytes,
+  decryptBytesAsync,
   decryptMessage,
   decryptSignal,
-  encryptBytes,
+  encryptBytesAsync,
   encryptMessage,
   encryptSignal,
   generateCallKemSecret,
@@ -29,6 +29,7 @@ import {
   type KeyPair,
   type SignalEnvelope,
 } from "../lib/e2e";
+import { readSharedSessionKey, shareSessionKeyWithNotifications } from "../lib/notificationKeys";
 import { supabase } from "../lib/supabase";
 
 /** Thrown by encryptForConversation when this device has no session key for
@@ -237,6 +238,13 @@ export function E2eeProvider({
         .maybeSingle();
 
       if (queryError) {
+        // Offline (or the server is unreachable): read this device's own
+        // copy of the key so cached Secret Chat history stays readable.
+        const local = await readSharedSessionKey(conversationId);
+        if (local) {
+          sessionKeys.current.set(conversationId, local);
+          return local;
+        }
         console.error("[useE2ee] loadSessionKey: query failed", queryError.message, { conversationId });
       }
       if (!data) {
@@ -263,7 +271,9 @@ export function E2eeProvider({
         data.sender_public_key,
         keyPair.secretKey,
         data.kem_ciphertext,
-        keyPair.kyberSecretKey
+        keyPair.kyberSecretKey,
+        keyPair.kyberSeed,
+        keyPair.kyberPublicKey
       );
       if (!unwrapped) {
         console.warn(
@@ -307,6 +317,7 @@ export function E2eeProvider({
       }
 
       sessionKeys.current.set(conversationId, unwrapped);
+      void shareSessionKeyWithNotifications(conversationId, unwrapped);
       return unwrapped;
     },
     [userId, keyPair]
@@ -510,6 +521,7 @@ export function E2eeProvider({
       }
 
       sessionKeys.current.set(conversationId, sessionKey);
+      void shareSessionKeyWithNotifications(conversationId, sessionKey);
     },
     [userId, keyPair, loadSessionKey]
   );
@@ -758,7 +770,7 @@ export function E2eeProvider({
   const receiveCallKem = useCallback(
     async (kemCiphertext: string): Promise<Uint8Array | null> => {
       if (!keyPair) return null;
-      return decapCallKemSecret(kemCiphertext, keyPair.kyberSecretKey);
+      return decapCallKemSecret(kemCiphertext, keyPair.kyberSecretKey, keyPair.kyberSeed, keyPair.kyberPublicKey);
     },
     [keyPair]
   );
@@ -767,7 +779,7 @@ export function E2eeProvider({
     async (conversationId: string, data: Uint8Array) => {
       const sessionKey = await loadSessionKey(conversationId);
       if (!sessionKey) return null;
-      return encryptBytes(data, sessionKey);
+      return encryptBytesAsync(data, sessionKey);
     },
     [loadSessionKey]
   );
@@ -776,7 +788,7 @@ export function E2eeProvider({
     async (conversationId: string, ciphertext: Uint8Array, nonce: string) => {
       const sessionKey = await loadSessionKey(conversationId);
       if (!sessionKey) return null;
-      return decryptBytes(ciphertext, nonce, sessionKey);
+      return decryptBytesAsync(ciphertext, nonce, sessionKey);
     },
     [loadSessionKey]
   );
