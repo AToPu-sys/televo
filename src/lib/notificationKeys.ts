@@ -24,6 +24,54 @@ const SHARED_KEYCHAIN_GROUP = "P37BNY7C4J.com.televo.app.shared";
 // appends ":no-auth" to keychainService for items without biometrics.
 const KEYCHAIN_SERVICE = "televo.nse";
 
+const SHARED = {
+  keychainService: KEYCHAIN_SERVICE,
+  accessGroup: SHARED_KEYCHAIN_GROUP,
+  keychainAccessible: SecureStore.AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY,
+};
+// The keychain can't be listed through SecureStore, so the conversations whose
+// keys were copied are kept in an index item next to them; signing out reads
+// it to delete every copy.
+const INDEX_KEY = "nse.index";
+let indexWrite: Promise<void> = Promise.resolve();
+
+async function readIndex(): Promise<string[]> {
+  try {
+    const raw = await SecureStore.getItemAsync(INDEX_KEY, SHARED);
+    const ids = raw ? JSON.parse(raw) : [];
+    return Array.isArray(ids) ? ids.filter((id) => typeof id === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+function rememberShared(conversationId: string): Promise<void> {
+  indexWrite = indexWrite.then(async () => {
+    const ids = await readIndex();
+    if (ids.includes(conversationId)) return;
+    await SecureStore.setItemAsync(INDEX_KEY, JSON.stringify([...ids, conversationId]), SHARED);
+  }).catch(() => {});
+  return indexWrite;
+}
+
+/**
+ * Deletes every Secret Chat session key this device copied for the
+ * notification extension. Called on sign-out (account deletion signs out
+ * too): otherwise the keys outlive the account in a keychain readable while
+ * the phone is locked, and could decrypt stored or intercepted envelopes.
+ */
+export async function wipeSharedSessionKeys(): Promise<void> {
+  if (Platform.OS !== "ios") return;
+  copied.clear();
+  indexWrite = indexWrite.then(async () => {
+    for (const id of await readIndex()) {
+      await SecureStore.deleteItemAsync(`nse.sk.${id}`, SHARED).catch(() => {});
+    }
+    await SecureStore.deleteItemAsync(INDEX_KEY, SHARED).catch(() => {});
+  }).catch(() => {});
+  return indexWrite;
+}
+
 // Last key copied per conversation in this app session, so reloading a chat
 // doesn't rewrite the keychain, but a rekeyed chat does.
 const copied = new Map<string, string>();
@@ -37,11 +85,8 @@ export async function shareSessionKeyWithNotifications(
   if (copied.get(conversationId) === encoded) return;
   copied.set(conversationId, encoded);
   try {
-    await SecureStore.setItemAsync(`nse.sk.${conversationId}`, encoded, {
-      keychainService: KEYCHAIN_SERVICE,
-      accessGroup: SHARED_KEYCHAIN_GROUP,
-      keychainAccessible: SecureStore.AFTER_FIRST_UNLOCK_THIS_DEVICE_ONLY,
-    });
+    await SecureStore.setItemAsync(`nse.sk.${conversationId}`, encoded, SHARED);
+    await rememberShared(conversationId);
   } catch (error) {
     // A binary without the keychain-sharing entitlement ends up here; its
     // Secret Chat pushes just keep the generic text. Not retried this
@@ -59,10 +104,7 @@ export async function shareSessionKeyWithNotifications(
 export async function readSharedSessionKey(conversationId: string): Promise<Uint8Array | null> {
   if (Platform.OS !== "ios") return null;
   try {
-    const encoded = await SecureStore.getItemAsync(`nse.sk.${conversationId}`, {
-      keychainService: KEYCHAIN_SERVICE,
-      accessGroup: SHARED_KEYCHAIN_GROUP,
-    });
+    const encoded = await SecureStore.getItemAsync(`nse.sk.${conversationId}`, SHARED);
     if (!encoded) return null;
     const key = naclUtil.decodeBase64(encoded);
     if (key.length !== 32) return null;

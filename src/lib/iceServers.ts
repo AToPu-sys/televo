@@ -78,22 +78,37 @@ function fresh() {
   return cached;
 }
 
+// Bumped on sign-out so a fetch that started for the previous account can't
+// repopulate the cache after it was cleared.
+let generation = 0;
+
+/** Forget credentials and measurements: the TURN username is bound to the
+ * signed-in user, so the next account must not reuse it. */
+export function resetIceServers(): void {
+  generation += 1;
+  cached = null;
+  inFlight = null;
+  measurement = null;
+  penalties.clear();
+}
+
 function fetchFromServer(): Promise<boolean> {
   if (inFlight) return inFlight;
+  const gen = generation;
   inFlight = (async () => {
     try {
       const { data, error } = await supabase.functions.invoke("turn-credentials", { method: "POST" });
       const body = data as { iceServers?: IceServer[]; relays?: Relay[]; expiresAt?: number } | null;
       if (error || !body?.expiresAt) return false;
       const relays = body.relays?.length ? body.relays : relaysFromFlatList(body.iceServers ?? []);
-      if (relays.length === 0) return false;
+      if (relays.length === 0 || gen !== generation) return false;
       cached = { relays, expiresAt: body.expiresAt };
       void probeRelays();
       return true;
     } catch {
       return false;
     } finally {
-      inFlight = null;
+      if (gen === generation) inFlight = null;
     }
   })();
   return inFlight;
@@ -169,6 +184,14 @@ export function warmIceServers(): void {
 /** "server": relays from the turn-credentials function. "fallback": the
  * list bundled in the app. */
 export type IceServerSet = { servers: IceServer[]; source: "server" | "fallback" };
+
+/** The fetched servers if they are fresh right now, without waiting;
+ * otherwise null (and a fetch is started so getIceServers finds it running). */
+export function peekIceServers(): IceServerSet | null {
+  if (fresh()) return { servers: buildServers(), source: "server" };
+  void fetchFromServer();
+  return null;
+}
 
 /** The servers to build this call's peer connection with. Never waits longer
  * than FETCH_TIMEOUT_MS; on a miss the call uses the bundled list. */

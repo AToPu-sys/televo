@@ -362,7 +362,12 @@ export function CallOverlay({
   // useful for a voice call as a video one. Reported bug: "swipe-to-
   // minimize only works for video calls". Separated so audio calls get the
   // swipe gesture without inheriting video's auto-hide behavior.
-  const minimizeEligible = state.phase === "active" && mediaConfirmed;
+  // 2026-10-20: from the moment the call is placed or picked up, not only
+  // once media is confirmed. Requiring mediaConfirmed meant no way to leave
+  // the call screen while it rang or connected — or at all on a call whose
+  // media check never fired — so "write to someone during a call" didn't
+  // work. The bar's status text already covers Calling…/Connecting….
+  const minimizeEligible = state.phase === "outgoing" || state.phase === "connecting" || state.phase === "active";
 
   useEffect(() => {
     if (!autoHideEligible) {

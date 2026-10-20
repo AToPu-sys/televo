@@ -104,8 +104,33 @@ function resync() {
   }
 }
 
+// removeChannel is async, and until the server acknowledges the leave,
+// supabase.channel() with the same topic hands back that LEAVING channel
+// instead of a new one: handlers got attached to it, subscribe() did nothing,
+// and it was then deleted — leaving the user with no live channel at all (no
+// messages, no incoming calls) after quickly leaving and re-entering a screen.
+// So every removal is remembered, and a new channel is built only after it.
+let removal: Promise<unknown> = Promise.resolve();
+let openSeq = 0;
+let pendingOpenFor: string | null = null;
+
+function drop(stale: RealtimeChannel) {
+  const done = supabase.removeChannel(stale).catch(() => undefined);
+  removal = Promise.all([removal, done]);
+}
+
 function open(userId: string) {
   channelUserId = userId;
+  pendingOpenFor = userId;
+  const seq = ++openSeq;
+  void removal.then(() => {
+    if (seq !== openSeq || channelUserId !== userId) return;
+    pendingOpenFor = null;
+    build(userId);
+  });
+}
+
+function build(userId: string) {
   // private: the join is checked against the realtime.messages policy, so
   // only this user can listen on this topic.
   let next = supabase.channel(`user:${userId}`, { config: { private: true } });
@@ -143,7 +168,7 @@ function scheduleReopen() {
     if (!channel || channelUserId !== userId) return;
     const stale = channel;
     channel = null;
-    void supabase.removeChannel(stale);
+    drop(stale);
     open(userId);
   }, retryMs);
 }
@@ -151,9 +176,11 @@ function scheduleReopen() {
 function close() {
   if (retryTimer) clearTimeout(retryTimer);
   retryTimer = null;
-  if (channel) void supabase.removeChannel(channel);
+  if (channel) drop(channel);
   channel = null;
   channelUserId = null;
+  pendingOpenFor = null;
+  openSeq += 1;
   joinedBefore = false;
   retryMs = 0;
 }
@@ -163,7 +190,7 @@ function ensure(userId: string) {
     clearTimeout(closeTimer);
     closeTimer = null;
   }
-  if (channelUserId === userId && channel) return;
+  if (channelUserId === userId && (channel || pendingOpenFor === userId)) return;
   close();
   open(userId);
 }

@@ -233,9 +233,13 @@ export async function flushOutbox(): Promise<void> {
     }
   } finally {
     flushing = false;
+    // A request that came in during this attempt runs now — unless the
+    // attempt just failed and a retry is scheduled: then the backoff timer
+    // owns the next attempt, or a burst of sends while offline turned the
+    // 1/2/4…30 s backoff into back-to-back requests.
     if (flushRequested) {
       flushRequested = false;
-      void flushOutbox();
+      if (!retryTimer) void flushOutbox();
     }
   }
 }

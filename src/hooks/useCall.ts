@@ -16,7 +16,7 @@ import {
 import { supabase } from "../lib/supabase";
 import { subscribeUserEvents } from "../lib/userChannel";
 import { USING_PUBLIC_TURN } from "../lib/webrtc";
-import { getIceServers, penalizeRelayForUrl, setRelayProbingAllowed, warmIceServers } from "../lib/iceServers";
+import { getIceServers, peekIceServers, penalizeRelayForUrl, setRelayProbingAllowed, warmIceServers } from "../lib/iceServers";
 import { addNetworkChangeListener, type NetworkPath } from "expo-televo-audio";
 import type { Database } from "../types/database";
 import { useE2ee } from "./useE2ee";
@@ -1084,12 +1084,13 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
       // its permission prompt while the phone is ringing instead of only
       // once the peer answers. create-offer below reuses the same stream, so
       // this costs nothing and makes the prompt appear when the user expects.
-      // Cloudflare TURN credentials (warm cache: instant; cold: ≤2.5s, then
-      // the bundled fallback) — see lib/iceServers.
-      const ice = await getIceServers();
-      iceSourceRef.current = ice.source;
-      trace("ice-servers", ice.source);
-      requestLocalMedia(kind === "video", ice.servers);
+      // TURN credentials: with a warm cache the bridge builds the connection
+      // and starts gathering ICE while the camera opens. With a cold one the
+      // camera and the signal channel start NOW and the credentials (≤2.5 s,
+      // then the bundled fallback — see lib/iceServers) are only awaited
+      // right before create-offer: nothing the user sees waits for them.
+      const warmIce = peekIceServers();
+      requestLocalMedia(kind === "video", warmIce?.servers);
 
       joinSignalChannel(call.id, async (signal) => {
         if (signal.type === "callee-ready") {
@@ -1149,6 +1150,11 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
         }
       });
 
+      const ice = warmIce ?? (await getIceServers());
+      iceSourceRef.current = ice.source;
+      trace("ice-servers", ice.source);
+      // Hung up (or the callee declined) while the credentials were coming.
+      if (stateRef.current.phase === "idle" || stateRef.current.phase === "ended") return;
       sendCommand({ type: "create-offer", iceServers: ice.servers, video: kind === "video" });
       // The bridge replies with a "offer" BridgeEvent once ready; see
       // handleBridgeEvent below, which forwards it as the signal.

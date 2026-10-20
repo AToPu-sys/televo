@@ -9,6 +9,7 @@ import { supabase } from "../lib/supabase";
 import { onUserChannelResync, subscribeUserEvents } from "../lib/userChannel";
 import type { Database } from "../types/database";
 import { useE2ee } from "./useE2ee";
+import { getCurrentConversationId } from "../lib/currentChat";
 
 type ConversationKind = Database["public"]["Enums"]["conversation_kind"];
 type MessageRow = Database["public"]["Tables"]["messages"]["Row"];
@@ -390,7 +391,11 @@ export function useChats(userId: string | undefined) {
                   // Same rule as chat_list_summary: others' messages after
                   // my last read. Opening the chat marks it read, which
                   // comes back below as my own participant_update.
-                  unreadCount: own ? item.unreadCount : item.unreadCount + 1,
+                  // Not for the chat on screen: it is being read as it
+                  // arrives, and counting it only to have markRead's echo
+                  // (or, with a phone clock behind the server, a full
+                  // reload) take it back cost three requests per message.
+                  unreadCount: own || getCurrentConversationId() === item.id ? item.unreadCount : item.unreadCount + 1,
                   lastMessageIsOwn: own,
                   lastMessageRead: item.kind === "direct" && own ? false : null,
                 }
@@ -406,7 +411,9 @@ export function useChats(userId: string | undefined) {
       if (readerId === userId) {
         // Read up to the newest message (here or on another device): the
         // badge is simply zero. A partial read needs the exact count.
-        if (readsLatest) {
+        // The chat on screen counts as read whatever the clocks say (a phone
+        // behind the server stamps last_read_at before the newest message).
+        if (readsLatest || getCurrentConversationId() === conversationId) {
           setChats((current) => current.map((item) => (item.id === conversationId ? { ...item, unreadCount: 0 } : item)));
         } else {
           scheduleReload();

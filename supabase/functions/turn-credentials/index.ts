@@ -174,6 +174,13 @@ Deno.serve(async (req) => {
   } = await admin.auth.getUser(authHeader.replace("Bearer ", ""));
   if (!user) return new Response("unauthorized", { status: 401 });
 
+  // 30 per user per hour (079): the app caches for 12 h, so only a script
+  // draining the providers' quotas gets here.
+  const { data: allowed, error: limitError } = await admin.rpc("claim_turn_credentials", { p_user_id: user.id });
+  if (!limitError && allowed === false) {
+    return Response.json({ error: "rate_limited" }, { status: 429, headers: { "Retry-After": "3600" } });
+  }
+
   // Own servers first: they're the ones meant to carry the traffic. The
   // order only matters to builds that don't rank (≤ 92).
   const groups = await Promise.all([ownRelays(user.id), staticRelays(), meteredRelays(), cloudflareRelays()]);
