@@ -1,0 +1,9 @@
+{
+  "name": "expo-televo-crypto",
+  "version": "1.0.0",
+  "description": "ML-KEM-768 (FIPS 203) from Apple CryptoKit for Televo's Secret Chats, iOS 26+.",
+  "main": "src/index.ts",
+  "author": "Televo",
+  "license": "MIT",
+  "homepage": ""
+}

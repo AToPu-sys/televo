@@ -24,7 +24,7 @@
           "remote-notification"
         ]
       },
-      "buildNumber": "89",
+      "buildNumber": "96",
       "associatedDomains": [
         "applinks:gettelevo.space"
       ]
@@ -55,6 +55,7 @@
     "plugins": [
       "./plugins/ios-scene-delegate/withIosSceneLifecycle.js",
       "./plugins/ios-pods-deployment-target/withPodsDeploymentTarget.js",
+      "./plugins/notification-service/withNotificationService.js",
       "expo-router",
       "expo-secure-store",
       [

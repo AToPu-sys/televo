@@ -1,7 +1,10 @@
 import { endCallPip, onCallPipFailedToStart, startCallPip } from "expo-call-pip";
+import { addAudioRouteListener, getAudioRoutes, setAudioRoute, type AudioRoute } from "expo-speaker-toggle";
+import { TelevoCallView, isNativeCallScreenAvailable, type CallScreenAction } from "expo-televo-audio";
 import { activateKeepAwakeAsync, deactivateKeepAwake } from "expo-keep-awake";
 import { useEffect, useRef, useState } from "react";
 import {
+  ActivityIndicator,
   Alert,
   Animated,
   Dimensions,
@@ -26,11 +29,17 @@ import { useRinger } from "../hooks/useRinger";
 import { useTheme } from "../hooks/useTheme";
 import { HAS_NO_TURN } from "../lib/webrtc";
 import { spacing } from "../theme";
+import { ActionSheet } from "./ActionSheet";
 import { Avatar } from "./Avatar";
 import { CallButton } from "./CallButton";
+import { CameraOffBackdrop, EncryptedPill, QualityBars, Scrim } from "./CallChrome";
 
 type CallOverlayProps = {
   state: CallState;
+  /** The call is recovering a dropped / changed network path (useCall). */
+  reconnecting?: boolean;
+  /** Signal quality 0 … 3 from useCall, null before the first sample. */
+  quality?: 0 | 1 | 2 | 3 | null;
   /** True once WebRtcBridge's getStats() poll has confirmed bytes are
    * actually arriving from the peer — see watchForInboundMedia. `state.phase
    * === "active"` alone only means SDP/ICE/DTLS finished, which a dead TURN
@@ -143,7 +152,76 @@ export function CallOverlay({
   getDiagnosticsReport,
   minimized,
   onMinimizedChange,
+  reconnecting = false,
+  quality = null,
 }: CallOverlayProps) {
+  // Where the sound goes: iPhone, speaker, or a connected headset/AirPods/car.
+  const [audioRoutes, setAudioRoutes] = useState(() => getAudioRoutes());
+  const [routeSheetOpen, setRouteSheetOpen] = useState(false);
+  const routeContext = useRef({ speakerOn, isVideo, onToggleSpeaker });
+  routeContext.current = { speakerOn, isVideo, onToggleSpeaker };
+
+  useEffect(() => {
+    setAudioRoutes(getAudioRoutes());
+    return addAudioRouteListener((change) => {
+      setAudioRoutes({ routes: change.routes, current: change.current });
+      const current = change.routes.find((route) => route.id === change.current);
+      if (!current) return;
+      const { speakerOn: onSpeaker, isVideo: video, onToggleSpeaker: toggle } = routeContext.current;
+      if (change.reason === "newDevice" && isExternalRoute(current) && onSpeaker) {
+        // iOS moved the call onto headphones that just connected; keep the
+        // speaker state in step instead of showing a stale "Speaker on".
+        toggle();
+      } else if (change.reason === "deviceRemoved" && current.kind === "receiver" && video) {
+        // AirPods taken out mid video call: iOS falls back to the earpiece,
+        // which nobody holding a video call can hear.
+        setAudioRoute("speaker");
+        if (!onSpeaker) toggle();
+      }
+    });
+  }, []);
+
+  const currentRoute = audioRoutes.routes.find((route) => route.id === audioRoutes.current);
+
+  const handleNativeAction = (action: CallScreenAction) => {
+    switch (action) {
+      case "mute":
+        onToggleMute();
+        break;
+      case "route":
+        if (audioRoutes.routes.some(isExternalRoute)) setRouteSheetOpen(true);
+        else onToggleSpeaker();
+        break;
+      case "hangup":
+        onHangup();
+        break;
+      case "decline":
+        onDecline();
+        break;
+      case "accept":
+        setAnswering(true);
+        onAccept();
+        break;
+      case "minimize":
+        onMinimizedChange(true);
+        Animated.timing(minimizeAnim, {
+          toValue: 1,
+          duration: 200,
+          useNativeDriver: false,
+          easing: Easing.out(Easing.cubic),
+        }).start();
+        break;
+    }
+  };
+  const hasExternalRoute = audioRoutes.routes.some(isExternalRoute);
+
+  const chooseRoute = (route: AudioRoute) => {
+    setRouteSheetOpen(false);
+    setAudioRoute(route.id);
+    // Keep useCall's speaker state (and the native speaker flag) in step.
+    if ((route.kind === "speaker") !== speakerOn) onToggleSpeaker();
+    setAudioRoutes(getAudioRoutes());
+  };
   const { theme } = useTheme();
 
   // Silence the ringtone the moment Accept is tapped, rather than waiting for
@@ -284,7 +362,12 @@ export function CallOverlay({
   // useful for a voice call as a video one. Reported bug: "swipe-to-
   // minimize only works for video calls". Separated so audio calls get the
   // swipe gesture without inheriting video's auto-hide behavior.
-  const minimizeEligible = state.phase === "active" && mediaConfirmed;
+  // 2026-10-20: from the moment the call is placed or picked up, not only
+  // once media is confirmed. Requiring mediaConfirmed meant no way to leave
+  // the call screen while it rang or connected — or at all on a call whose
+  // media check never fired — so "write to someone during a call" didn't
+  // work. The bar's status text already covers Calling…/Connecting….
+  const minimizeEligible = state.phase === "outgoing" || state.phase === "connecting" || state.phase === "active";
 
   useEffect(() => {
     if (!autoHideEligible) {
@@ -636,6 +719,13 @@ export function CallOverlay({
   if (state.phase === "idle") return null;
 
   const showVideo = isVideo && state.phase === "active";
+  const recovering = reconnecting && state.phase === "active" && mediaConfirmed;
+  const statusText = recovering ? "Reconnecting…" : statusLabel(state, elapsedSeconds, mediaConfirmed, connectingSeconds);
+  // Over video (or the full-screen self preview) the controls are frosted
+  // glass like the native voice screen; on the plain themed background they
+  // keep the theme's surfaces.
+  const glass = showVideo || (isVideo && (state.phase === "outgoing" || state.phase === "connecting"));
+  const labelColor = glass ? "rgba(255,255,255,0.9)" : theme.textSecondary;
   // Own camera preview runs from the moment a video call starts, not only
   // once it connects — you should see yourself while it rings, the way every
   // other video caller does. Before the peer's stream arrives the preview
@@ -800,6 +890,7 @@ export function CallOverlay({
               and moves in lockstep with the video underneath it. */}
           {minimized && showVideo && (swapped ? cameraOff : peerCameraOff) ? (
             <View style={[StyleSheet.absoluteFill, styles.cameraOffOverlay]} pointerEvents="none">
+              <CameraOffBackdrop />
               <Avatar
                 name={swapped ? myName : peerName}
                 uri={swapped ? myAvatarUrl : peerAvatarUrl}
@@ -932,6 +1023,7 @@ export function CallOverlay({
             exact audio-silence bug fixed on 2026-09-24. */}
         {showVideo && (swapped ? cameraOff : peerCameraOff) && !minimized ? (
           <View style={[StyleSheet.absoluteFill, styles.cameraOffOverlay]} pointerEvents="none">
+            <CameraOffBackdrop />
             <Avatar name={swapped ? myName : peerName} uri={swapped ? myAvatarUrl : peerAvatarUrl} size={120} />
             <Text style={styles.cameraOffName}>{swapped ? myName : peerName}</Text>
           </View>
@@ -942,6 +1034,7 @@ export function CallOverlay({
             swap, since there's no peer video yet to swap with. */}
         {showSelfPreview && cameraOff && !showVideo && !minimized ? (
           <View style={[StyleSheet.absoluteFill, styles.cameraOffOverlay]} pointerEvents="none">
+            <CameraOffBackdrop />
             <Avatar name={myName} uri={myAvatarUrl} size={120} />
             <Text style={styles.cameraOffName}>{myName}</Text>
           </View>
@@ -950,10 +1043,19 @@ export function CallOverlay({
         {minimized ? (
           <MinimizedCallWidget
             peerName={peerName}
-            statusText={statusLabel(state, elapsedSeconds, mediaConfirmed, connectingSeconds)}
+            statusText={statusText}
             onPress={restoreFromMinimized}
             theme={theme}
           />
+        ) : null}
+
+        {/* Legibility scrims over video: header on top, controls below. Fade
+            with the chrome so auto-hidden UI leaves clean full-bleed video. */}
+        {(showVideo || showSelfPreview) && !minimized ? (
+          <Animated.View pointerEvents="none" style={[StyleSheet.absoluteFill, { opacity: chromeFade }]}>
+            <Scrim position="top" height={230} />
+            <Scrim position="bottom" height={280} />
+          </Animated.View>
         ) : null}
 
         <SafeAreaView
@@ -992,10 +1094,19 @@ export function CallOverlay({
               accessibilityLabel="Show call diagnostics"
               hitSlop={12}
             >
-              <Text style={[styles.status, { color: showVideo ? "#FFFFFF" : theme.textSecondary }]}>
-                {statusLabel(state, elapsedSeconds, mediaConfirmed, connectingSeconds)}
-              </Text>
+              <View style={styles.statusRow}>
+                {recovering ? <ActivityIndicator size="small" color={showVideo ? "#FFFFFF" : theme.textSecondary} /> : null}
+                <Text style={[styles.status, { color: showVideo ? "#FFFFFF" : theme.textSecondary }]}>
+                  {statusText}
+                </Text>
+              </View>
             </Pressable>
+            {state.phase === "active" || state.phase === "connecting" ? (
+              <View style={styles.metaRow}>
+                <EncryptedPill onVideo={showVideo || showSelfPreview} />
+                {mediaConfirmed && quality !== null ? <QualityBars level={quality} onVideo={showVideo || showSelfPreview} /> : null}
+              </View>
+            ) : null}
           </Animated.View>
 
           <Animated.View
@@ -1019,49 +1130,136 @@ export function CallOverlay({
               <View style={styles.activeRow}>
                 <CallButton
                   icon={muted ? "mic-off" : "mic"}
-                  color={theme.surfaceElevated}
-                  iconColor={showVideo ? "#FFFFFF" : theme.text}
+                  color={glass ? (muted ? GLASS_ON : GLASS) : muted ? theme.text : theme.surfaceElevated}
+                  iconColor={glass ? (muted ? GLASS_ON_ICON : "#FFFFFF") : muted ? theme.background : theme.text}
                   onPress={onToggleMute}
                   label={muted ? "Unmute" : "Mute"}
                   small
+                  showLabel
+                  labelColor={labelColor}
                 />
                 {isVideo ? (
                   <CallButton
                     icon={cameraOff ? "videocam-off" : "videocam"}
-                    color={theme.surfaceElevated}
-                    iconColor={showVideo ? "#FFFFFF" : theme.text}
+                    color={glass ? (cameraOff ? GLASS_ON : GLASS) : theme.surfaceElevated}
+                    iconColor={glass ? (cameraOff ? GLASS_ON_ICON : "#FFFFFF") : theme.text}
                     onPress={onToggleCamera}
-                    label={cameraOff ? "Camera on" : "Camera off"}
+                    label={cameraOff ? "Camera on" : "Camera"}
                     small
+                    showLabel
+                    labelColor={labelColor}
                   />
                 ) : null}
                 {isVideo && !cameraOff ? (
                   <CallButton
                     icon="camera-reverse"
-                    color={theme.surfaceElevated}
-                    iconColor={showVideo ? "#FFFFFF" : theme.text}
+                    color={glass ? GLASS : theme.surfaceElevated}
+                    iconColor={glass ? "#FFFFFF" : theme.text}
                     onPress={onSwitchCamera}
                     label="Flip"
                     small
+                    showLabel
+                    labelColor={labelColor}
                   />
                 ) : null}
-                <CallButton
-                  icon={speakerOn ? "volume-high" : "volume-medium-outline"}
-                  color={speakerOn ? theme.accent : theme.surfaceElevated}
-                  iconColor={speakerOn ? "#FFFFFF" : showVideo ? "#FFFFFF" : theme.text}
-                  onPress={onToggleSpeaker}
-                  label={speakerOn ? "Speaker on" : "Speaker off"}
-                  small
-                />
-                <CallButton icon="call" color={theme.danger} onPress={onHangup} label="End" rotate />
+                {hasExternalRoute && currentRoute ? (
+                  // A headset or AirPods is connected: the button opens a
+                  // picker instead of toggling, and shows where sound is now.
+                  <CallButton
+                    icon={routeIcon(currentRoute)}
+                    color={glass ? (currentRoute.kind === "receiver" ? GLASS : GLASS_ON) : currentRoute.kind === "receiver" ? theme.surfaceElevated : theme.accent}
+                    iconColor={glass ? (currentRoute.kind === "receiver" ? "#FFFFFF" : GLASS_ON_ICON) : currentRoute.kind === "receiver" ? theme.text : "#FFFFFF"}
+                    onPress={() => setRouteSheetOpen(true)}
+                    label={routeLabel(currentRoute)}
+                    small
+                    showLabel
+                    labelColor={labelColor}
+                  />
+                ) : (
+                  <CallButton
+                    icon={speakerOn ? "volume-high" : "volume-medium-outline"}
+                    color={glass ? (speakerOn ? GLASS_ON : GLASS) : speakerOn ? theme.accent : theme.surfaceElevated}
+                    iconColor={glass ? (speakerOn ? GLASS_ON_ICON : "#FFFFFF") : speakerOn ? "#FFFFFF" : theme.text}
+                    onPress={onToggleSpeaker}
+                    label="Speaker"
+                    small
+                    showLabel
+                    labelColor={labelColor}
+                  />
+                )}
+                <CallButton icon="call" color={END_RED} onPress={onHangup} label="End" rotate small showLabel labelColor={labelColor} />
               </View>
             ) : null}
           </Animated.View>
         </SafeAreaView>
+
+        {/* iOS voice calls: the native SwiftUI screen, drawn over the React
+            Native one (which stays mounted underneath, WebRtcBridge
+            included). Video calls and Android keep the screen above. */}
+        {isNativeCallScreenAvailable && !isVideo && !minimized ? (
+          <TelevoCallView
+            style={StyleSheet.absoluteFill}
+            peerName={peerName}
+            avatarUrl={peerAvatarUrl ?? undefined}
+            statusText={statusText}
+            phase={state.phase}
+            connected={mediaConfirmed}
+            reconnecting={
+              recovering ||
+              ((state.phase === "connecting" || (state.phase === "active" && !mediaConfirmed)) &&
+                connectingSeconds >= SLOW_CONNECT_SECONDS)
+            }
+            quality={mediaConfirmed && quality !== null ? quality : -1}
+            muted={muted}
+            routeKind={hasExternalRoute && currentRoute ? currentRoute.kind : speakerOn ? "speaker" : "receiver"}
+            routeLabel={hasExternalRoute && currentRoute ? routeLabel(currentRoute) : "Speaker"}
+            routeIsPicker={hasExternalRoute}
+            canMinimize={minimizeEligible}
+            onAction={handleNativeAction}
+          />
+        ) : null}
       </View>
       </TouchPassthrough>
+      <ActionSheet
+        visible={routeSheetOpen}
+        onClose={() => setRouteSheetOpen(false)}
+        title="Audio output"
+        options={audioRoutes.routes.map((route) => ({
+          key: route.id,
+          label: route.id === audioRoutes.current ? `${routeLabel(route)}  ✓` : routeLabel(route),
+          icon: routeIcon(route),
+          onPress: () => chooseRoute(route),
+        }))}
+      />
     </Modal>
   );
+}
+
+// Frosted controls over video, matching TelevoCallScreen.swift's CallActionButton.
+const GLASS = "rgba(255,255,255,0.16)";
+const GLASS_ON = "rgba(255,255,255,0.95)";
+const GLASS_ON_ICON = "#111218";
+const END_RED = "#EB4D4B";
+
+function isExternalRoute(route: AudioRoute): boolean {
+  return route.kind !== "receiver" && route.kind !== "speaker";
+}
+
+function routeLabel(route: AudioRoute): string {
+  if (route.kind === "receiver") return "iPhone";
+  if (route.kind === "speaker") return "Speaker";
+  return route.name;
+}
+
+function routeIcon(route: AudioRoute): "phone-portrait-outline" | "volume-high" | "bluetooth" | "headset" | "car" | "tv-outline" {
+  switch (route.kind) {
+    case "receiver": return "phone-portrait-outline";
+    case "speaker": return "volume-high";
+    case "bluetooth": return "bluetooth";
+    case "car": return "car";
+    case "airplay": return "tv-outline";
+    default: return "headset";
+  }
 }
 
 /** The green status bar + tap-to-restore hint shown while a call is
@@ -1178,13 +1376,21 @@ const styles = StyleSheet.create({
   minimizedBarText: { flex: 1, color: "#FFFFFF", fontSize: 14, fontWeight: "600" },
   minimizedBarHint: { color: "#FFFFFF", fontSize: 12, opacity: 0.85 },
   header: { alignItems: "center", gap: spacing.sm, marginTop: spacing.xxl },
-  name: { fontSize: 24, fontWeight: "700" },
-  status: { fontSize: 15 },
+  name: {
+    fontSize: 26,
+    fontWeight: "600",
+    textShadowColor: "rgba(0,0,0,0.35)",
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 6,
+  },
+  status: { fontSize: 15, fontVariant: ["tabular-nums"] },
+  statusRow: { flexDirection: "row", alignItems: "center", gap: 8 },
+  metaRow: { flexDirection: "row", alignItems: "center", gap: 10, marginTop: 2 },
   controls: { paddingHorizontal: spacing.xl, paddingBottom: spacing.xl },
   incomingRow: { flexDirection: "row", justifyContent: "space-around" },
-  activeRow: { flexDirection: "row", justifyContent: "center", gap: spacing.xl },
+  activeRow: { flexDirection: "row", justifyContent: "center", gap: spacing.lg },
   cameraOffOverlay: {
-    backgroundColor: "#000000",
+    backgroundColor: "#0C0D16",
     alignItems: "center",
     justifyContent: "center",
     gap: spacing.md,

@@ -7,6 +7,7 @@ import type {
   RTCPeerConnection as RTCPeerConnectionType,
 } from "react-native-webrtc";
 
+import { tuneSdp } from "../lib/webrtc";
 import { getWebRtc } from "../lib/webrtcModule";
 
 export type BridgeEvent =
@@ -66,6 +67,18 @@ export type BridgeEvent =
       remoteAudioTrackMuted?: boolean | null;
       selectedCandidatePair: string | null;
       turnServer: string | null;
+      /** Round trip on the selected candidate pair, and what congestion
+       * control currently thinks it can send — the numbers the call screen's
+       * signal-quality bars are built from. */
+      rttMs?: number | null;
+      availableOutgoingKbps?: number | null;
+      /** Inbound packets received across all tracks, for a loss RATE (the
+       * lost counter alone only ever grows). */
+      packetsReceived?: number | null;
+      /** The TURN server URL (as configured) behind this device's relay
+       * candidate when the call is relayed through it — what useCall uses to
+       * pick a different relay when this one performs badly. */
+      relayUrl?: string | null;
       msToMedia: number | null;
       bytesReceived: number | null;
       packetsLost: number | null;
@@ -211,6 +224,9 @@ type Command =
   // this after a media-timeout; see useCall's handler for why one retry is
   // worth it before declaring the call failed.
   | { type: "restart-ice" }
+  // Swaps the relay list on the live connection (keeping every other
+  // setting it was created with). Takes effect at the next ICE restart.
+  | { type: "set-ice-servers"; iceServers: RTCIceServer[] }
   // The callee's half of an ICE restart: applies the caller's re-offer to
   // the peer connection that is ALREADY up and answers it. Distinct from
   // "create-answer", which builds a brand new connection and re-opens the
@@ -359,6 +375,10 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
   // that otherwise both just look like "no relay in the selected pair" in
   // call-stats after the fact, with no way to say WHICH one happened.
   const relayCandidateCountRef = useRef(0);
+  // The configuration the live connection was built with. setConfiguration
+  // replaces it wholesale, and changing bundle/rtcp-mux policy afterwards is
+  // refused, so swapping relays has to resend everything else unchanged.
+  const peerConfigRef = useRef<object | null>(null);
 
   // True until this effect has seen callActive go true at least once, i.e.
   // until a call has actually started in this mount. Without it, the effect's
@@ -809,6 +829,7 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
 
       let bytes = 0;
       let lost = 0;
+      let received = 0;
       let jitter: number | null = null;
       let audioBytes = 0;
       let audioPackets = 0;
@@ -818,6 +839,7 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
         if (stat.type === "inbound-rtp") {
           if (typeof stat.bytesReceived === "number") bytes += stat.bytesReceived;
           if (typeof stat.packetsLost === "number") lost += stat.packetsLost;
+          if (typeof stat.packetsReceived === "number") received += stat.packetsReceived;
           // Reported in seconds by the spec; stored as milliseconds.
           if (typeof stat.jitter === "number") jitter = stat.jitter * 1000;
           // Split out AUDIO specifically.
@@ -862,6 +884,7 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
       result.outboundAudioBytesSent = outboundAudioBytes;
       result.outboundAudioPacketsSent = outboundAudioPackets;
       result.packetsLost = lost;
+      result.packetsReceived = received;
       result.jitterMs = jitter;
 
       // Local track state — the most direct possible answer to "is the mic
@@ -955,6 +978,8 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
         const localType = typeof local?.candidateType === "string" ? local.candidateType : "?";
         const remoteType = typeof remote?.candidateType === "string" ? remote.candidateType : "?";
         result.selectedCandidatePair = `${localType}/${remoteType}`;
+        if (typeof pair.currentRoundTripTime === "number") result.rttMs = Math.round(pair.currentRoundTripTime * 1000);
+        if (typeof pair.availableOutgoingBitrate === "number") result.availableOutgoingKbps = Math.round(pair.availableOutgoingBitrate / 1000);
         // Only a relay candidate carries a meaningful server address.
         const relay = localType === "relay" ? local : remoteType === "relay" ? remote : undefined;
         if (relay) {
@@ -962,6 +987,7 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
           const port = relay.port ?? null;
           if (address) result.turnServer = port ? `${address}:${port}` : String(address);
         }
+        if (localType === "relay" && typeof local?.url === "string") result.relayUrl = local.url;
       }
     } catch {
       // Stats are diagnostics, never a reason to disturb a live call.
@@ -1169,15 +1195,22 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
             // 64kbit/s floor and its "high" priority below — on a congested
             // international relay the degradation preference (framerate-
             // first) absorbs the rest rather than the call breaking up.
-            encoding.maxBitrate = 900_000;
-            // Prefers dropping RESOLUTION over frame rate when the link
-            // tightens — was "maintain-resolution" (drop frame rate
-            // instead), which is backwards for a long/international relay
-            // path: a blurrier but smooth, unfrozen picture reads as "call
-            // is working" where a sharp-but-choppy one reads as "call is
-            // breaking up," and smoothness is also what keeps audio (bundled
-            // on the same transport) from getting starved by video retries.
-            encoding.degradationPreference = "maintain-resolution";
+            //
+            // 2026-10-17: raised to 2.5 Mbit/s with H.264 hardware encoding
+            // on iOS (lib/webrtc tuneVideoSdp) and a 1.2 Mbit/s start
+            // bitrate — 900k capped a 720p picture at visibly soft even on
+            // fast Wi-Fi. Congestion control still steps it down on a weak
+            // link; this is only the ceiling.
+            encoding.maxBitrate = 2_500_000;
+            encoding.maxFramerate = 30;
+            // "balanced", 2026-10-17. "maintain-framerate" (below, kept for
+            // the history) dropped RESOLUTION first under any pressure, which
+            // is the blurry picture people reported; balanced gives up a
+            // little of each, so faces stay readable and motion stays smooth.
+            // Was: prefers dropping resolution over frame rate when the link
+            // tightens — smoothness reads as "call is working" on a long
+            // relay path, and keeps audio from being starved by video retries.
+            encoding.degradationPreference = "balanced";
           }
         }
 
@@ -1220,7 +1253,7 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
     // mic, while candidates for the new one are applied to a connection
     // nobody reads.
     pcRef.current?.close();
-    const pc = new webrtc.RTCPeerConnection({
+    const config = {
       iceServers,
       // iceCandidatePoolSize (previously 4) REMOVED 2026-09-19: it was
       // added to gather candidates before the offer for a faster pickup,
@@ -1241,7 +1274,14 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
       //
       // Lets ICE re-pick a working route mid-call (e.g. Wi-Fi to cellular
       // handover) rather than dropping the call when the current path dies.
-      iceTransportPolicy: "all",
+      iceTransportPolicy: "all" as const,
+      // Android only (iOS's react-native-webrtc doesn't read this key): keep
+      // gathering candidates for the whole call, so a Wi-Fi <-> cellular
+      // switch surfaces a working new path on its own. iOS gets the same
+      // effect from the network monitor in useCall, which restarts ICE the
+      // moment the interface changes.
+      // (not in react-native-webrtc's TS types, hence the spread)
+      ...({ continualGatheringPolicy: "gather_continually" } as object),
       // Both added 2026-09-19 to cut the time spent in "Connecting…".
       //
       // Measured problem: with a relay now in play, ICE needs a few seconds
@@ -1259,9 +1299,11 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
       // checks. Both are universally supported by modern WebRTC stacks
       // (and by the identical react-native-webrtc build on both ends here),
       // so there is no fallback risk in requiring them.
-      bundlePolicy: "max-bundle",
-      rtcpMuxPolicy: "require",
-    });
+      bundlePolicy: "max-bundle" as const,
+      rtcpMuxPolicy: "require" as const,
+    };
+    peerConfigRef.current = config;
+    const pc = new webrtc.RTCPeerConnection(config);
 
     // react-native-webrtc types these callbacks as a bare Event<string>
     // without the payload fields, so the runtime shapes are annotated here.
@@ -1516,9 +1558,10 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
         const pc = pcRef.current ?? createPeer(command.iceServers);
         stream.getTracks().forEach((track) => pc.addTrack(track, stream));
 
-        const offer = await pc.createOffer({});
+        const created = await pc.createOffer({});
+        const offer = { type: created.type, sdp: tuneSdp(created.sdp ?? "", Platform.OS === "ios") };
         await pc.setLocalDescription(offer);
-        post({ type: "offer", sdp: offer.sdp ?? "" });
+        post({ type: "offer", sdp: offer.sdp });
         return;
       }
 
@@ -1586,9 +1629,10 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
         }
         stream.getTracks().forEach((track) => pc.addTrack(track, stream));
 
-        const answer = await pc.createAnswer();
+        const created = await pc.createAnswer();
+        const answer = { type: created.type, sdp: tuneSdp(created.sdp ?? "", Platform.OS === "ios") };
         await pc.setLocalDescription(answer);
-        post({ type: "answer", sdp: answer.sdp ?? "" });
+        post({ type: "answer", sdp: answer.sdp });
         return;
       }
 
@@ -1603,14 +1647,28 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
         await pc.setRemoteDescription(
           new webrtc.RTCSessionDescription({ type: "offer", sdp: command.sdp })
         );
-        const answer = await pc.createAnswer();
+        const created = await pc.createAnswer();
+        const answer = { type: created.type, sdp: tuneSdp(created.sdp ?? "", Platform.OS === "ios") };
         await pc.setLocalDescription(answer);
-        post({ type: "answer", sdp: answer.sdp ?? "" });
+        post({ type: "answer", sdp: answer.sdp });
         // Same reasoning as the caller's restart-ice branch: arm the
         // watchdog here so the callee also observes whether the restarted
         // connection actually carries media. Generation-guarded, so this
         // supersedes rather than races any loop already running.
         void watchForInboundMedia(pc);
+        return;
+      }
+
+      if (command.type === "set-ice-servers") {
+        const pc = pcRef.current;
+        if (!pc || !peerConfigRef.current) return;
+        const config = { ...peerConfigRef.current, iceServers: command.iceServers };
+        try {
+          pc.setConfiguration(config);
+          peerConfigRef.current = config;
+        } catch (error) {
+          post({ type: "log", message: `set-ice-servers failed: ${String(error)}` });
+        }
         return;
       }
 
@@ -1628,7 +1686,8 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
         // the media pipeline stays intact and only the network path is
         // renegotiated — which is the entire point, since the tracks were
         // never the problem, the dead relay was.
-        const offer = await pc.createOffer({ iceRestart: true });
+        const created = await pc.createOffer({ iceRestart: true });
+        const offer = { type: created.type, sdp: tuneSdp(created.sdp ?? "", Platform.OS === "ios") };
         await pc.setLocalDescription(offer);
         post({ type: "offer", sdp: offer.sdp ?? "" });
         // Re-arm the watchdog explicitly rather than relying on

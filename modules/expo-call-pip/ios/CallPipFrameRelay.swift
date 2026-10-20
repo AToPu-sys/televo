@@ -1,5 +1,6 @@
 import WebRTC
 import AVFoundation
+import VideoToolbox
 
 /// Bridges a live WebRTC remote video track's decoded frames into an
 /// `AVSampleBufferDisplayLayer` — the one surface type Apple's system
@@ -25,9 +26,22 @@ final class CallPipFrameRelay: NSObject, RTCVideoRenderer {
   /// with a separate `rotation` tag (RTCMTLVideoView applies it for the
   /// in-app view); AVSampleBufferDisplayLayer ignores it, so without this the
   /// PiP window showed every face lying on its side inside a landscape box.
+  ///
+  /// 2026-10-17: on iOS 16+ the rotation is now applied to the PIXELS
+  /// (VTPixelRotationSession, hardware) before the frame is enqueued, and the
+  /// callback reports 0 so the layer itself is never transformed. Turning
+  /// the layer with an affine transform was not honoured inside the system
+  /// PiP window on current iOS — both videos showed up lying on their side
+  /// even though the in-app view was upright. iOS 15 keeps the transform.
   var onGeometryChange: ((_ rotationDegrees: Int, _ uprightSize: CGSize) -> Void)?
   private var lastRotation = -1
   private var lastUprightSize = CGSize.zero
+  // VTPixelRotationSession (iOS 16+). Stored untyped because a stored
+  // property can't be @available-gated and the module targets iOS 15.1.
+  private var rotationSessionStorage: AnyObject?
+  private var rotationSessionDegrees = -1
+  private var rotatedPool: CVPixelBufferPool?
+  private var rotatedPoolKey = ""
 
   func setSize(_ size: CGSize) {
     // No-op: AVSampleBufferDisplayLayer sizes itself from each sample
@@ -47,22 +61,35 @@ final class CallPipFrameRelay: NSObject, RTCVideoRenderer {
     // a frame occasionally is fine, the in-app RTCView (Metal, handles I420
     // itself) remains the primary rendering path throughout.
     guard let pixelBufferFrame = frame.buffer as? RTCCVPixelBuffer else { return }
-    let pixelBuffer = pixelBufferFrame.pixelBuffer
+    let sourceBuffer = pixelBufferFrame.pixelBuffer
 
-    let width = Int32(CVPixelBufferGetWidth(pixelBuffer))
-    let height = Int32(CVPixelBufferGetHeight(pixelBuffer))
+    let sourceWidth = Int32(CVPixelBufferGetWidth(sourceBuffer))
+    let sourceHeight = Int32(CVPixelBufferGetHeight(sourceBuffer))
 
     let rotation = frame.rotation.rawValue
     let quarterTurn = rotation == 90 || rotation == 270
     let uprightSize = quarterTurn
-      ? CGSize(width: CGFloat(height), height: CGFloat(width))
-      : CGSize(width: CGFloat(width), height: CGFloat(height))
-    if rotation != lastRotation || uprightSize != lastUprightSize {
-      lastRotation = rotation
+      ? CGSize(width: CGFloat(sourceHeight), height: CGFloat(sourceWidth))
+      : CGSize(width: CGFloat(sourceWidth), height: CGFloat(sourceHeight))
+
+    // Upright pixels where the OS can do it; otherwise the original buffer
+    // plus a layer transform (the reported rotation) as before.
+    var pixelBuffer = sourceBuffer
+    var layerRotation = rotation
+    if rotation != 0, #available(iOS 16.0, *), let upright = rotateUpright(sourceBuffer, degrees: rotation, size: uprightSize) {
+      pixelBuffer = upright
+      layerRotation = 0
+    }
+
+    if layerRotation != lastRotation || uprightSize != lastUprightSize {
+      lastRotation = layerRotation
       lastUprightSize = uprightSize
       let callback = onGeometryChange
-      DispatchQueue.main.async { callback?(rotation, uprightSize) }
+      DispatchQueue.main.async { callback?(layerRotation, uprightSize) }
     }
+
+    let width = Int32(CVPixelBufferGetWidth(pixelBuffer))
+    let height = Int32(CVPixelBufferGetHeight(pixelBuffer))
     if formatDescription == nil || width != lastPixelBufferSize.width || height != lastPixelBufferSize.height {
       var newFormatDescription: CMFormatDescription?
       let status = CMVideoFormatDescriptionCreateForImageBuffer(
@@ -106,5 +133,57 @@ final class CallPipFrameRelay: NSObject, RTCVideoRenderer {
     if displayLayer.isReadyForMoreMediaData {
       displayLayer.enqueue(sampleBuffer)
     }
+  }
+
+  /// Rotates a camera/decoder buffer into an upright, IOSurface-backed copy
+  /// (what AVSampleBufferDisplayLayer wants) on VideoToolbox's hardware path.
+  /// nil on any failure — the caller then falls back to the layer transform.
+  @available(iOS 16.0, *)
+  private func rotateUpright(_ source: CVPixelBuffer, degrees: Int, size: CGSize) -> CVPixelBuffer? {
+    if rotationSessionStorage == nil || rotationSessionDegrees != degrees {
+      if let old = rotationSessionStorage { VTPixelRotationSessionInvalidate(old as! VTPixelRotationSession) }
+      rotationSessionStorage = nil
+      var session: VTPixelRotationSession?
+      guard VTPixelRotationSessionCreate(kCFAllocatorDefault, &session) == noErr,
+            let session else { return nil }
+      let angle: CFString
+      switch degrees {
+      case 90: angle = kVTRotation_CW90
+      case 180: angle = kVTRotation_180
+      case 270: angle = kVTRotation_CCW90
+      default: angle = kVTRotation_0
+      }
+      VTSessionSetProperty(session, key: kVTPixelRotationPropertyKey_Rotation, value: angle)
+      rotationSessionStorage = session
+      rotationSessionDegrees = degrees
+    }
+    guard let stored = rotationSessionStorage else { return nil }
+    let session = stored as! VTPixelRotationSession
+
+    let format = CVPixelBufferGetPixelFormatType(source)
+    let width = Int(size.width), height = Int(size.height)
+    let key = "\(format)-\(width)x\(height)"
+    if rotatedPool == nil || rotatedPoolKey != key {
+      let attributes: [String: Any] = [
+        kCVPixelBufferPixelFormatTypeKey as String: format,
+        kCVPixelBufferWidthKey as String: width,
+        kCVPixelBufferHeightKey as String: height,
+        kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any](),
+      ]
+      var pool: CVPixelBufferPool?
+      guard CVPixelBufferPoolCreate(kCFAllocatorDefault, nil, attributes as CFDictionary, &pool) == kCVReturnSuccess,
+            let pool else { return nil }
+      rotatedPool = pool
+      rotatedPoolKey = key
+    }
+    guard let pool = rotatedPool else { return nil }
+    var output: CVPixelBuffer?
+    guard CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &output) == kCVReturnSuccess, let output else {
+      return nil
+    }
+    guard VTPixelRotationSessionRotateImage(session, source, output) == noErr else {
+      return nil
+    }
+    return output
   }
 }

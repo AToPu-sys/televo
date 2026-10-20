@@ -1,0 +1,9 @@
+{
+  "name": "expo-televo-audio",
+  "version": "1.0.0",
+  "description": "Televo's call audio device for WebRTC: Apple voice processing plus rnnoise noise suppression, and Opus RED.",
+  "main": "src/index.ts",
+  "author": "Televo",
+  "license": "UNLICENSED",
+  "homepage": ""
+}

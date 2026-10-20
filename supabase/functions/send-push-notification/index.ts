@@ -4,12 +4,16 @@
 // Expo push tokens, and sends a push via the Expo push service. Encrypted
 // (Secret Chat) message bodies are never included in the notification text —
 // only a generic "sent a message" is shown, so a push notification can't
-// leak plaintext the server itself never had.
+// leak plaintext the server itself never had. On iOS the extension replaces
+// that text with the real one, decrypted on the device (see e2eEnvelope).
 import "@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
 
 const ASSISTANT_USER_ID = "00000000-0000-0000-0000-000000000001";
 const EXPO_PUSH_API = "https://exp.host/--/api/v2/push/send";
+// Leaves room under APNs' 4 KB limit for the title, the rest of the payload
+// and Expo's own keys — about 2 KB of plaintext after base64.
+const MAX_PUSH_ENVELOPE_CHARS = 3000;
 
 type WebhookPayload = {
   record: {
@@ -37,6 +41,17 @@ function previewFor(kind: string, body: string | null, isEncrypted: boolean): st
       return "🎤 Voice message";
     default:
       return body ?? "sent a message";
+  }
+}
+
+/** Only a real {ciphertext, nonce} envelope ever rides along in a push —
+ * never a plaintext body that somehow ended up in a Secret Chat. */
+function isE2eEnvelope(body: string): boolean {
+  try {
+    const parsed = JSON.parse(body);
+    return typeof parsed?.ciphertext === "string" && typeof parsed?.nonce === "string";
+  } catch {
+    return false;
   }
 }
 
@@ -146,12 +161,39 @@ Deno.serve(async (req) => {
       ? `${senderName}: ${previewFor(message.kind, decryptedBody, conversation.is_encrypted)}`
       : previewFor(message.kind, decryptedBody, conversation.is_encrypted);
 
+  // Secret Chat text: the push still says "sent a message", but also
+  // carries the E2E envelope exactly as stored (ciphertext the server can't
+  // open) with mutableContent set, so the iOS Notification Service Extension
+  // (plugins/notification-service) can decrypt it on the phone with the
+  // session key the app shared with it and show the real text. Skipped when
+  // the envelope wouldn't fit APNs' 4 KB payload — that push keeps the
+  // generic text, same as before.
+  const e2eEnvelope =
+    conversation.is_encrypted &&
+    message.kind === "text" &&
+    typeof decryptedBody === "string" &&
+    decryptedBody.length <= MAX_PUSH_ENVELOPE_CHARS &&
+    isE2eEnvelope(decryptedBody)
+      ? decryptedBody
+      : null;
+
   const notifications = tokens.map((token) => ({
     to: token,
     title,
     body,
     sound: "default",
-    data: { conversationId: message.conversation_id },
+    // Every push passes through the iOS Notification Service Extension: it
+    // files each chat's notifications into their own stack, and opens
+    // e2eEnvelope when there is one. Without the extension (older builds)
+    // iOS shows the push exactly as sent.
+    mutableContent: true,
+    data: e2eEnvelope
+      ? {
+          conversationId: message.conversation_id,
+          e2e: e2eEnvelope,
+          e2ePrefix: conversation.kind === "group" ? `${senderName}: ` : "",
+        }
+      : { conversationId: message.conversation_id },
   }));
 
   const response = await fetch(EXPO_PUSH_API, {

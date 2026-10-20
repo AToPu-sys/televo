@@ -1,0 +1,14 @@
+{
+  "platforms": [
+    "apple"
+  ],
+  "apple": {
+    "modules": [
+      "TelevoAudioModule",
+      "TelevoCallViewModule"
+    ],
+    "appDelegateSubscribers": [
+      "TelevoAudioAppDelegateSubscriber"
+    ]
+  }
+}

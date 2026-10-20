@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 
 import { supabase } from "../lib/supabase";
+import { onUserChannelResync, subscribeUserEvents } from "../lib/userChannel";
 import type { Database } from "../types/database";
 
 type CallRow = Database["public"]["Tables"]["calls"]["Row"];
@@ -115,15 +116,15 @@ export function useCallLog(userId: string | undefined) {
   useEffect(() => {
     if (!userId) return;
 
-    const channel = supabase
-      .channel("call-log")
-      .on("postgres_changes", { event: "*", schema: "public", table: "calls" }, () => {
-        void load();
-      })
-      .subscribe();
-
+    // Only this user's calls arrive on their channel (src/lib/userChannel.ts);
+    // after a reconnect, re-read in case one was missed.
+    const offEvents = subscribeUserEvents(userId, (event) => {
+      if (event.type === "call_insert" || event.type === "call_update") void load();
+    });
+    const offResync = onUserChannelResync(userId, () => void load());
     return () => {
-      void supabase.removeChannel(channel);
+      offEvents();
+      offResync();
     };
   }, [userId, load]);
 

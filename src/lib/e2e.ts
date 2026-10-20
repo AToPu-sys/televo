@@ -3,6 +3,7 @@ import "react-native-get-random-values";
 import { MlKem768 } from "crystals-kyber-js";
 import * as Crypto from "expo-crypto";
 import * as SecureStore from "expo-secure-store";
+import * as TelevoCrypto from "expo-televo-crypto";
 import nacl from "tweetnacl";
 import naclUtil from "tweetnacl-util";
 
@@ -35,6 +36,7 @@ const PRIVATE_KEY_STORE_KEY = "televo.e2e.private-key";
 const PUBLIC_KEY_STORE_KEY = "televo.e2e.public-key";
 const KYBER_PRIVATE_KEY_STORE_KEY = "televo.e2e.kyber-private-key";
 const KYBER_PUBLIC_KEY_STORE_KEY = "televo.e2e.kyber-public-key";
+const KYBER_SEED_STORE_KEY = "televo.e2e.kyber-seed";
 const TRUSTED_KEY_PREFIX = "televo.e2e.trusted-peer-key.";
 
 /**
@@ -82,7 +84,44 @@ export type KeyPair = {
    * topped up yet — getOrCreateDeviceKeyPair backfills it on next launch. */
   kyberPublicKey: string;
   kyberSecretKey: string;
+  /** The 64-byte FIPS 203 seed (d‖z) the ML-KEM key was derived from, base64.
+   * Only keys created from build 92 on have one; it is what lets CryptoKit
+   * decapsulate natively (kemDecap), since CryptoKit can't import the
+   * expanded secret key. Older keys stay on crystals-kyber-js. */
+  kyberSeed: string | null;
 };
+
+/** ML-KEM-768 encapsulation: CryptoKit on iOS 26+, crystals-kyber-js
+ * otherwise or if the native call fails. Returns [ciphertext, secret]. */
+async function kemEncap(recipientKyberPublicKeyB64: string): Promise<[Uint8Array, Uint8Array]> {
+  if (TelevoCrypto.isNativeMLKEMAvailable()) {
+    try {
+      const { ciphertext, sharedSecret } = TelevoCrypto.mlkem768Encapsulate(recipientKyberPublicKeyB64);
+      return [decodeBase64(ciphertext), decodeBase64(sharedSecret)];
+    } catch (error) {
+      console.warn("[e2e] native ML-KEM encapsulation failed, using JS", error);
+    }
+  }
+  return new MlKem768().encap(decodeBase64(recipientKyberPublicKeyB64));
+}
+
+/** ML-KEM-768 decapsulation with this device's key: CryptoKit when the key
+ * has a seed and iOS 26+, crystals-kyber-js with the expanded key otherwise. */
+async function kemDecap(
+  ciphertextB64: string,
+  kyberSecretKeyB64: string,
+  kyberSeedB64?: string | null,
+  kyberPublicKeyB64?: string | null
+): Promise<Uint8Array> {
+  if (kyberSeedB64 && TelevoCrypto.isNativeMLKEMAvailable()) {
+    try {
+      return decodeBase64(TelevoCrypto.mlkem768Decapsulate(kyberSeedB64, ciphertextB64, kyberPublicKeyB64));
+    } catch (error) {
+      console.warn("[e2e] native ML-KEM decapsulation failed, using JS", error);
+    }
+  }
+  return new MlKem768().decap(decodeBase64(ciphertextB64), decodeBase64(kyberSecretKeyB64));
+}
 
 /** Loads this device's keypair, generating and persisting one on first use.
  * Also backfills the ML-KEM-768 half onto a device that only has the
@@ -90,11 +129,12 @@ export type KeyPair = {
  * identity, the hybrid layer is simply added rather than the device treated
  * as new. */
 export async function getOrCreateDeviceKeyPair(): Promise<KeyPair> {
-  const [storedSecret, storedPublic, storedKyberSecret, storedKyberPublic] = await Promise.all([
+  const [storedSecret, storedPublic, storedKyberSecret, storedKyberPublic, storedKyberSeed] = await Promise.all([
     SecureStore.getItemAsync(PRIVATE_KEY_STORE_KEY),
     SecureStore.getItemAsync(PUBLIC_KEY_STORE_KEY),
     SecureStore.getItemAsync(KYBER_PRIVATE_KEY_STORE_KEY),
     SecureStore.getItemAsync(KYBER_PUBLIC_KEY_STORE_KEY),
+    SecureStore.getItemAsync(KYBER_SEED_STORE_KEY),
   ]);
 
   let publicKey = storedPublic;
@@ -131,21 +171,29 @@ export async function getOrCreateDeviceKeyPair(): Promise<KeyPair> {
 
   let kyberPublicKey = storedKyberPublic;
   let kyberSecretKey = storedKyberSecret;
+  let kyberSeed = storedKyberPublic && storedKyberSecret ? storedKyberSeed : null;
   if (!kyberPublicKey || !kyberSecretKey) {
-    const kem = new MlKem768();
-    const [pk, sk] = await kem.generateKeyPair();
+    // Derived from an explicit random seed rather than generateKeyPair(), so
+    // the seed can be kept for CryptoKit. Same distribution: FIPS 203
+    // KeyGen is exactly "draw 64 random bytes, derive from them".
+    const seed = nacl.randomBytes(64);
+    const [pk, sk] = await new MlKem768().deriveKeyPair(seed);
     kyberPublicKey = encodeBase64(pk);
     kyberSecretKey = encodeBase64(sk);
+    kyberSeed = encodeBase64(seed);
     await Promise.all([
       // Same reasoning as the X25519 secret above.
       SecureStore.setItemAsync(KYBER_PRIVATE_KEY_STORE_KEY, kyberSecretKey, {
+        keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
+      }),
+      SecureStore.setItemAsync(KYBER_SEED_STORE_KEY, kyberSeed, {
         keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
       }),
       SecureStore.setItemAsync(KYBER_PUBLIC_KEY_STORE_KEY, kyberPublicKey),
     ]);
   }
 
-  return { publicKey, secretKey, kyberPublicKey, kyberSecretKey };
+  return { publicKey, secretKey, kyberPublicKey, kyberSecretKey, kyberSeed };
 }
 
 /** Generates a fresh random 32-byte session key for one conversation. */
@@ -214,8 +262,7 @@ export async function wrapSessionKey(
     decodeBase64(senderSecretKeyB64)
   );
 
-  const kem = new MlKem768();
-  const [kemCiphertext, kemSecret] = await kem.encap(decodeBase64(recipientKyberPublicKeyB64));
+  const [kemCiphertext, kemSecret] = await kemEncap(recipientKyberPublicKeyB64);
 
   const wrappingKey = combineSharedSecrets(x25519Secret, kemSecret);
   const sealed = nacl.secretbox(sessionKey, nonce, wrappingKey);
@@ -235,7 +282,9 @@ export async function unwrapSessionKey(
   senderPublicKeyB64: string,
   recipientSecretKeyB64: string,
   kemCiphertextB64?: string | null,
-  recipientKyberSecretKeyB64?: string | null
+  recipientKyberSecretKeyB64?: string | null,
+  recipientKyberSeedB64?: string | null,
+  recipientKyberPublicKeyB64?: string | null
 ): Promise<Uint8Array | null> {
   if (!kemCiphertextB64 || !recipientKyberSecretKeyB64) {
     return nacl.box.open(
@@ -251,10 +300,11 @@ export async function unwrapSessionKey(
     decodeBase64(recipientSecretKeyB64)
   );
 
-  const kem = new MlKem768();
-  const kemSecret = await kem.decap(
-    decodeBase64(kemCiphertextB64),
-    decodeBase64(recipientKyberSecretKeyB64)
+  const kemSecret = await kemDecap(
+    kemCiphertextB64,
+    recipientKyberSecretKeyB64,
+    recipientKyberSeedB64,
+    recipientKyberPublicKeyB64
   );
 
   const wrappingKey = combineSharedSecrets(x25519Secret, kemSecret);
@@ -339,6 +389,41 @@ export function encryptBytes(
   return { ciphertext: nacl.secretbox(data, nonce, sessionKey), nonce: encodeBase64(nonce) };
 }
 
+/** encryptBytes for media, sealed natively in C off the JS thread when the
+ * build has it (expo-televo-crypto), with tweetnacl-js as the fallback. */
+export async function encryptBytesAsync(
+  data: Uint8Array,
+  sessionKey: Uint8Array
+): Promise<{ ciphertext: Uint8Array; nonce: string }> {
+  const nonce = nacl.randomBytes(nacl.secretbox.nonceLength);
+  if (TelevoCrypto.isNativeSecretBoxAvailable()) {
+    try {
+      return { ciphertext: await TelevoCrypto.secretboxSeal(data, nonce, sessionKey), nonce: encodeBase64(nonce) };
+    } catch (error) {
+      console.warn("[e2e] native secretbox seal failed, using JS", error);
+    }
+  }
+  return { ciphertext: nacl.secretbox(data, nonce, sessionKey), nonce: encodeBase64(nonce) };
+}
+
+/** decryptBytes for media, natively when available. A wrong key or tampered
+ * data is null either way; JS is only the fallback for a native error. */
+export async function decryptBytesAsync(
+  ciphertext: Uint8Array,
+  nonceB64: string,
+  sessionKey: Uint8Array
+): Promise<Uint8Array | null> {
+  const nonce = decodeBase64(nonceB64);
+  if (TelevoCrypto.isNativeSecretBoxAvailable()) {
+    try {
+      return await TelevoCrypto.secretboxOpen(ciphertext, nonce, sessionKey);
+    } catch (error) {
+      console.warn("[e2e] native secretbox open failed, using JS", error);
+    }
+  }
+  return nacl.secretbox.open(ciphertext, nonce, sessionKey);
+}
+
 /** Reverses encryptBytes. Returns null if the key is wrong or the data was
  * tampered with (secretbox is authenticated). */
 export function decryptBytes(
@@ -371,8 +456,7 @@ export type SignalEnvelope = {
 export async function generateCallKemSecret(
   peerKyberPublicKeyB64: string
 ): Promise<{ ciphertext: string; secret: Uint8Array }> {
-  const kem = new MlKem768();
-  const [ciphertext, secret] = await kem.encap(decodeBase64(peerKyberPublicKeyB64));
+  const [ciphertext, secret] = await kemEncap(peerKyberPublicKeyB64);
   return { ciphertext: encodeBase64(ciphertext), secret };
 }
 
@@ -380,10 +464,11 @@ export async function generateCallKemSecret(
  * from the ciphertext the caller attached to its first signal. */
 export async function decapCallKemSecret(
   ciphertextB64: string,
-  ownKyberSecretKeyB64: string
+  ownKyberSecretKeyB64: string,
+  ownKyberSeedB64?: string | null,
+  ownKyberPublicKeyB64?: string | null
 ): Promise<Uint8Array> {
-  const kem = new MlKem768();
-  return kem.decap(decodeBase64(ciphertextB64), decodeBase64(ownKyberSecretKeyB64));
+  return kemDecap(ciphertextB64, ownKyberSecretKeyB64, ownKyberSeedB64, ownKyberPublicKeyB64);
 }
 
 /**

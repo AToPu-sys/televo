@@ -34,6 +34,8 @@ type MessageBubbleProps = {
    * with no way back short of leaving and re-entering the chat, unlike a
    * failed photo/video, which already had tap-to-retry. */
   onRetryDecryption?: (messageId: string) => void;
+  /** Tap on a message that failed to send. */
+  onRetrySend?: (messageId: string) => void;
   /** Opens the full-screen photo/video viewer for this message. Absent
    * kind/media_url means the bubble has no media and never calls it. */
   onOpenMedia?: (messageId: string) => void;
@@ -50,6 +52,7 @@ function MessageBubbleComponent({
   forwardedFrom,
   peerLastReadAt,
   onRetryDecryption,
+  onRetrySend,
   onOpenMedia,
   senderName,
 }: MessageBubbleProps) {
@@ -73,10 +76,13 @@ function MessageBubbleComponent({
     // order bottom-up — rows must NOT be re-flipped here, or text mirrors.
     <View style={[styles.row, isOwn ? styles.alignEnd : styles.alignStart]}>
       <Pressable
+        onPress={message.failed && onRetrySend ? () => onRetrySend(message.id) : undefined}
         onLongPress={onLongPress ? () => onLongPress(message) : undefined}
         delayLongPress={350}
-        accessibilityRole={onLongPress ? "button" : undefined}
-        accessibilityLabel={onLongPress ? "Message options" : undefined}
+        accessibilityRole={onLongPress || message.failed ? "button" : undefined}
+        accessibilityLabel={
+          message.failed && onRetrySend ? "Not sent. Tap to send again" : onLongPress ? "Message options" : undefined
+        }
         style={[
           styles.bubble,
           { backgroundColor },
@@ -184,6 +190,9 @@ function MessageBubbleComponent({
           </Text>
           {isOwn ? <DeliveryState message={message} peerLastReadAt={peerLastReadAt} /> : null}
         </View>
+        {isOwn && message.failed && onRetrySend ? (
+          <Text style={[styles.retryLabel, { color: theme.danger }]}>Not sent. Tap to retry.</Text>
+        ) : null}
       </Pressable>
     </View>
   );
@@ -202,7 +211,7 @@ function MessageBubbleComponent({
  * reason: useMessages replaces the array on every realtime event, and an
  * unchanged message frequently arrives as a new object. */
 export const MessageBubble = memo(MessageBubbleComponent, (prev, next) => {
-  // onOpenMedia/onRetryDecryption/onLongPress intentionally excluded from
+  // onOpenMedia/onRetryDecryption/onRetrySend/onLongPress intentionally excluded from
   // this comparison, matching the existing fields below — the parent passes
   // a stable identity-per-message closure for each.
   const a = prev.message;
@@ -656,4 +665,5 @@ const styles = StyleSheet.create({
   meta: { flexDirection: "row", alignItems: "center", gap: 4, alignSelf: "flex-end" },
   editedLabel: { fontSize: 11, fontStyle: "italic" },
   time: { fontSize: 11 },
+  retryLabel: { fontSize: 11, fontWeight: "500", marginTop: 2, alignSelf: "flex-end" },
 });

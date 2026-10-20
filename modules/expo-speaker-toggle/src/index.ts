@@ -11,7 +11,15 @@ type SpeakerToggleModuleType = {
   isWebRtcAudioEnabled: () => boolean;
   audioRouteSnapshot: () => Record<string, unknown>;
   forceRepairAudioRoute: (wantSpeaker: boolean) => boolean;
+  getAudioRoutes: () => AudioRoutes;
+  setAudioRoute: (id: string) => boolean;
+  addListener?: (event: string, listener: (payload: AudioRouteChange) => void) => { remove: () => void };
 };
+
+export type AudioRouteKind = "receiver" | "speaker" | "bluetooth" | "headphones" | "car" | "usb" | "airplay";
+export type AudioRoute = { id: string; name: string; kind: AudioRouteKind };
+export type AudioRoutes = { routes: AudioRoute[]; current: string };
+export type AudioRouteChange = AudioRoutes & { reason: "newDevice" | "deviceRemoved" | "override" | "category" | "other" };
 
 // requireNativeModule THROWS at import time if the native binary hasn't been
 // rebuilt yet (a fresh JS install always runs before the matching Xcode
@@ -170,4 +178,38 @@ export function forceRepairAudioRoute(wantSpeaker: boolean): boolean {
   } catch {
     return false;
   }
+}
+
+/** Where the call's sound can go right now (iPhone, speaker, AirPods…) and
+ * which one is active. Off iOS: just the two built-in routes. */
+export function getAudioRoutes(): AudioRoutes {
+  const fallback: AudioRoutes = {
+    routes: [
+      { id: "receiver", name: "iPhone", kind: "receiver" },
+      { id: "speaker", name: "Speaker", kind: "speaker" },
+    ],
+    current: "receiver",
+  };
+  try {
+    return nativeModule?.getAudioRoutes?.() ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+/** Sends the call's sound to `id` from getAudioRoutes(). Returns false when
+ * the device is gone or the native module predates this feature. */
+export function setAudioRoute(id: string): boolean {
+  try {
+    return nativeModule?.setAudioRoute?.(id) ?? false;
+  } catch {
+    return false;
+  }
+}
+
+/** Called whenever the route changes — including iOS moving the call to
+ * AirPods on its own when they connect, or off them when they're removed. */
+export function addAudioRouteListener(listener: (change: AudioRouteChange) => void): () => void {
+  const subscription = nativeModule?.addListener?.("onAudioRouteChange", listener);
+  return () => subscription?.remove();
 }

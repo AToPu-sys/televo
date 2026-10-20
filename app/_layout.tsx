@@ -403,6 +403,8 @@ function GlobalCallOverlay() {
   const {
     state,
     mediaConfirmed,
+    reconnecting,
+    quality,
     peer,
     muted,
     cameraOff,
@@ -473,6 +475,8 @@ function GlobalCallOverlay() {
     <CallOverlay
       state={state}
       mediaConfirmed={mediaConfirmed}
+      reconnecting={reconnecting}
+      quality={quality}
       peerName={peer?.name ?? ""}
       peerAvatarUrl={peer?.avatarUrl ?? null}
       myName={myProfile?.name ?? ""}

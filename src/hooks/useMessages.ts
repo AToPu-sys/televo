@@ -11,7 +11,19 @@ import {
   upsertLocalMessages,
 } from "../lib/localMessages";
 import { primeMediaCache } from "../lib/mediaCache";
+import {
+  cancelOutboxEntry,
+  enqueueOutbox,
+  flushOutbox,
+  isInOutbox,
+  outboxEntriesFor,
+  restoreOutbox,
+  retryOutboxEntry,
+  subscribeOutbox,
+  type OutboxEntry,
+} from "../lib/outbox";
 import { supabase } from "../lib/supabase";
+import { onUserChannelResync, subscribeUserEvents } from "../lib/userChannel";
 import type { Database } from "../types/database";
 import { randomUUID } from "../lib/uuid";
 import { playMessageSentSound } from "./useMessageNotifications";
@@ -29,6 +41,36 @@ export type ChatMessage = MessageRow & {
 };
 
 const PAGE_SIZE = 50;
+
+/** A queued text message (src/lib/outbox.ts) as a bubble. `body` is what
+ * will be stored — for a Secret Chat the envelope, which
+ * decorateWithDecryption opens like any other row. expires_at stays unset
+ * until the server row arrives, so a self-destruct timer can't make a
+ * message vanish from the screen while it's still waiting to be sent. */
+function messageFromOutbox(entry: OutboxEntry, failed: boolean): ChatMessage {
+  return {
+    id: entry.id,
+    conversation_id: entry.conversationId,
+    sender_id: entry.senderId,
+    kind: "text",
+    body: entry.body,
+    media_url: null,
+    shared_activity_id: null,
+    shared_profile_id: null,
+    reply_to_id: entry.replyToId,
+    edited_at: null,
+    forwarded_from_message_id: null,
+    forwarded_from_sender_id: null,
+    expires_at: null,
+    document_name: null,
+    document_size_bytes: null,
+    media_duration_ms: null,
+    waveform: null,
+    created_at: entry.createdAt,
+    pending: !failed,
+    failed,
+  };
+}
 
 /** True only for a body that actually looks like our ciphertext envelope
  * ({"ciphertext":...,"nonce":...}), so plaintext history in a chat that was
@@ -74,18 +116,19 @@ export function useMessages(
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  // Tracks optimistic ids so the realtime INSERT can replace them instead of
-  // appending a duplicate when our own message echoes back.
-  const optimisticIds = useRef(new Set<string>());
+  // Latest messages for callbacks handed to memoized bubbles, which keep
+  // whichever callback they rendered with.
+  const messagesRef = useRef<ChatMessage[]>([]);
+  messagesRef.current = messages;
+  // Ids delivered live on the user channel, so a load() racing them can't
+  // drop them (see withUnsent).
+  const liveIdsRef = useRef(new Set<string>());
   const [hasMore, setHasMore] = useState(false);
   // The other participant's last_read_at, so a sent message can show whether
   // it was actually read. Previously every sent message showed a double
   // checkmark unconditionally, which simply lied to the user.
   const [peerLastReadAt, setPeerLastReadAt] = useState<string | null>(null);
   const loadingOlderRef = useRef(false);
-  // False until the channel's first SUBSCRIBED; distinguishes the initial
-  // join (no refetch needed) from a reconnect (refetch required).
-  const hasSubscribedRef = useRef(false);
   // Incremented at the start of every load() call; each call captures its
   // own id and checks it's still current before writing state. `load`'s
   // identity changes whenever `isEncrypted` does (via decorateWithDecryption
@@ -141,13 +184,20 @@ export function useMessages(
     // with no connection). Best-effort: any cache failure just falls through
     // to the server fetch below, exactly as before the cache existed.
     let paintedFromCache = false;
+    let unsent: ChatMessage[] = [];
     try {
-      if (userId) await bindLocalMessagesToUser(userId);
+      if (userId) {
+        await bindLocalMessagesToUser(userId);
+        await restoreOutbox(userId);
+      }
+      unsent = await decorateWithDecryption(
+        outboxEntriesFor(conversationId).map(({ entry, failed }) => messageFromOutbox(entry, failed))
+      );
       const local = await readLocalMessages(conversationId, PAGE_SIZE);
       if (local.length > 0 && runId === loadRunIdRef.current) {
         const decoratedLocal = await decorateWithDecryption(local);
         if (runId === loadRunIdRef.current) {
-          setMessages(decoratedLocal);
+          setMessages((current) => withUnsent(decoratedLocal, current, unsent));
           setHasMore(local.length === PAGE_SIZE);
           setLoading(false);
           paintedFromCache = true;
@@ -186,12 +236,41 @@ export function useMessages(
       ).catch(() => {});
       const decorated = await decorateWithDecryption(rows);
       if (runId === loadRunIdRef.current) {
-        setMessages(decorated);
+        setMessages((current) => withUnsent(decorated, current, unsent));
         setHasMore(rows.length === PAGE_SIZE);
       }
     }
     if (runId === loadRunIdRef.current) setLoading(false);
   }, [conversationId, userId, decorateWithDecryption]);
+
+  /** A (re)load only knows server rows; this keeps what exists only on this
+   * device so far — queued or failed text, uploads in flight — on screen,
+   * newest first above them. A reconnect refetch used to wipe queued
+   * messages off the screen until they landed. */
+  function withUnsent(serverRows: ChatMessage[], current: ChatMessage[], queued: ChatMessage[]): ChatMessage[] {
+    const onServer = new Set(serverRows.map((message) => message.id));
+    const newestOnServer = serverRows[0]?.created_at;
+    const extra = new Map<string, ChatMessage>();
+    for (const message of current) {
+      if (message.conversation_id !== conversationId || onServer.has(message.id)) continue;
+      if (
+        message.pending ||
+        isInOutbox(message.id) ||
+        (message.failed && message.kind === "text") ||
+        // Arrived live while this fetch was in flight.
+        (liveIdsRef.current.has(message.id) && (!newestOnServer || message.created_at > newestOnServer))
+      ) {
+        extra.set(message.id, message);
+      }
+    }
+    for (const message of queued) {
+      if (!onServer.has(message.id) && !extra.has(message.id) && isInOutbox(message.id)) {
+        extra.set(message.id, message);
+      }
+    }
+    const unsentFirst = [...extra.values()].sort((a, b) => b.created_at.localeCompare(a.created_at));
+    return [...unsentFirst, ...serverRows];
+  }
 
   /** Loads the next page of older messages. Without this, anything past the
    * first 50 was permanently unreachable — scrolling up just hit a wall, and
@@ -242,138 +321,117 @@ export function useMessages(
     void load();
   }, [load, isEncryptedInput]);
 
+  // Live changes to this chat arrive on the user's channel
+  // (src/lib/userChannel.ts) as complete rows — no per-message refetch.
+  const loadRef = useRef(load);
+  loadRef.current = load;
   useEffect(() => {
-    if (!conversationId) return;
+    if (!conversationId || !userId) return;
 
-    const channel = supabase
-      .channel(`messages:${conversationId}`)
-      .on(
-        "postgres_changes",
-        {
-          event: "INSERT",
-          schema: "public",
-          table: "messages",
-          filter: `conversation_id=eq.${conversationId}`,
-        },
-        (payload) => {
-          // payload.new carries the RAW table row — since
-          // 076_at_rest_message_encryption.sql, that's the DB-level
-          // ciphertext, not real content. postgres_changes streams straight
-          // off the table/WAL and has no way to run the decrypt function, so
-          // this is now a signal ("a row with this id was inserted"), not
-          // the content itself: re-fetch the one row through
-          // messages_decrypted, which does. One extra round trip per
-          // message, not per keystroke.
-          const incomingRaw = payload.new as MessageRow;
-          void (async () => {
-            const { data: incoming } = await supabase
-              .from("messages_decrypted")
-              .select("*")
-              .eq("id", incomingRaw.id)
-              .maybeSingle();
-            if (!incoming) return;
-            void upsertLocalMessages([incoming as MessageRow]).catch(() => {});
-            const [decorated] = await decorateWithDecryption([incoming as MessageRow]);
+    const onInsert = async (incoming: MessageRow) => {
+      liveIdsRef.current.add(incoming.id);
+      void upsertLocalMessages([incoming]).catch(() => {});
+      const [decorated] = await decorateWithDecryption([incoming]);
 
-            setMessages((current) => {
-              // Our own optimistic copy is already on screen — swap it for the
-              // server row rather than showing the message twice. Compare by
-              // the ciphertext body when encrypted (plaintext bodies differ
-              // by nonce each time, so they'd never match).
-              const withoutOptimistic = current.filter((message) => {
-                if (!message.pending) return true;
-                const isOurEcho =
-                  message.sender_id === incoming.sender_id &&
-                  (isEncrypted || message.body === incoming.body);
-                if (isOurEcho) {
-                  optimisticIds.current.delete(message.id);
-                  return false;
-                }
-                return true;
-              });
-
-              if (withoutOptimistic.some((message) => message.id === decorated.id)) {
-                return withoutOptimistic;
-              }
-              return [decorated, ...withoutOptimistic];
-            });
-          })();
+      setMessages((current) => {
+        // Our own text message, sent under an id chosen on this device
+        // (src/lib/outbox.ts): replace exactly that bubble. Matching by
+        // sender alone used to drop EVERY pending message of ours in a
+        // Secret Chat on the first echo, so a burst of messages blinked
+        // out and back in.
+        if (current.some((message) => message.id === decorated.id)) {
+          return current.map((message) => (message.id === decorated.id ? decorated : message));
         }
-      )
-      .on(
-        "postgres_changes",
-        {
-          event: "UPDATE",
-          schema: "public",
-          table: "messages",
-          filter: `conversation_id=eq.${conversationId}`,
-        },
-        (payload) => {
-          // See the INSERT handler's comment: payload.new is ciphertext,
-          // re-fetch the decrypted row by id instead of trusting it.
-          const updatedRaw = payload.new as MessageRow;
-          void (async () => {
-            const { data: updated } = await supabase
-              .from("messages_decrypted")
-              .select("*")
-              .eq("id", updatedRaw.id)
-              .maybeSingle();
-            if (!updated) return;
-            void upsertLocalMessages([updated as MessageRow]).catch(() => {});
-            const [decorated] = await decorateWithDecryption([updated as MessageRow]);
-            setMessages((current) =>
-              current.map((message) => (message.id === decorated.id ? decorated : message))
-            );
-          })();
-        }
-      )
-      .on(
-        "postgres_changes",
-        {
-          event: "DELETE",
-          schema: "public",
-          table: "messages",
-          filter: `conversation_id=eq.${conversationId}`,
-        },
-        (payload) => {
-          const removed = payload.old as Partial<MessageRow>;
-          if (removed.id) void deleteLocalMessages([removed.id]).catch(() => {});
-          setMessages((current) => current.filter((message) => message.id !== removed.id));
-        }
-      )
-      .subscribe((status) => {
-        // Realtime is a WebSocket: a Wi-Fi→cellular handover, a tunnel or a
-        // spell in the background drops it, and supabase-js silently
-        // re-joins. Broadcast and postgres_changes have NO replay, so every
-        // INSERT during that gap is lost forever — messages simply never
-        // appeared until the chat was closed and reopened. Refetching on each
-        // (re)subscribe closes that hole; the first SUBSCRIBED is skipped
-        // because load() has just run.
-        if (status === "SUBSCRIBED") {
-          if (hasSubscribedRef.current) void load();
-          hasSubscribedRef.current = true;
-        }
+        // Media still goes up under a temporary "optimistic-" id — swap
+        // that copy for the server row rather than showing it twice.
+        // Compare by the ciphertext body when encrypted (plaintext bodies
+        // differ by nonce each time, so they'd never match).
+        const withoutOptimistic = current.filter((message) => {
+          if (!message.pending || !message.id.startsWith("optimistic-")) return true;
+          const isOurEcho =
+            message.sender_id === incoming.sender_id &&
+            message.kind === incoming.kind &&
+            (isEncrypted || message.body === incoming.body);
+          return !isOurEcho;
+        });
+        return [decorated, ...withoutOptimistic];
       });
+    };
+
+    const onUpdate = async (updated: MessageRow) => {
+      void upsertLocalMessages([updated]).catch(() => {});
+      const [decorated] = await decorateWithDecryption([updated]);
+      setMessages((current) =>
+        current.map((message) => (message.id === decorated.id ? decorated : message))
+      );
+    };
+
+    const offEvents = subscribeUserEvents(userId, (event) => {
+      switch (event.type) {
+        case "message_insert":
+          if (event.message.conversation_id === conversationId) void onInsert(event.message);
+          return;
+        case "message_update":
+          if (event.message.conversation_id === conversationId) void onUpdate(event.message);
+          return;
+        case "message_delete":
+          if (event.conversation_id !== conversationId) return;
+          void deleteLocalMessages([event.id]).catch(() => {});
+          setMessages((current) => current.filter((message) => message.id !== event.id));
+          return;
+        case "participant_update":
+          // Read receipts: the newest read position among the others.
+          if (event.conversation_id !== conversationId || event.user_id === userId || !event.last_read_at) return;
+          setPeerLastReadAt((current) =>
+            !current || event.last_read_at! > current ? event.last_read_at : current
+          );
+          return;
+      }
+    });
+
+    // Realtime has no replay: after a drop (handover, tunnel, background)
+    // refetch, and send whatever was queued meanwhile.
+    const offResync = onUserChannelResync(userId, () => {
+      void loadRef.current();
+      void flushOutbox();
+    });
 
     return () => {
-      void supabase.removeChannel(channel);
+      offEvents();
+      offResync();
     };
-  }, [conversationId, isEncrypted, decorateWithDecryption]);
+  }, [conversationId, userId, isEncrypted, decorateWithDecryption]);
+
+  // Bubbles follow the send queue: clock while queued or sending, red when
+  // the server rejected it, plain once it landed.
+  useEffect(() => {
+    if (!conversationId) return;
+    return subscribeOutbox((entry, status) => {
+      if (entry.conversationId !== conversationId) return;
+      if (status === "sent") playMessageSentSound();
+      setMessages((current) =>
+        current.map((message) => {
+          if (message.id !== entry.id) return message;
+          if (status === "sent") return { ...message, pending: false, failed: false };
+          if (status === "failed") return { ...message, pending: false, failed: true };
+          return { ...message, pending: true, failed: false };
+        })
+      );
+    });
+  }, [conversationId]);
 
   const sendMessage = useCallback(
     async (body: string, replyToId?: string | null) => {
       const trimmed = body.trim();
       if (!trimmed || !conversationId || !userId) return;
 
-      const optimisticId = `optimistic-${randomUUID()}`;
-      optimisticIds.current.add(optimisticId);
-
-      const expiresAt = selfDestructSeconds
-        ? new Date(Date.now() + selfDestructSeconds * 1000).toISOString()
-        : null;
+      // The message's real id, chosen here so a retry can never post it
+      // twice (see src/lib/outbox.ts).
+      const messageId = randomUUID();
+      const createdAt = new Date().toISOString();
 
       const optimistic: ChatMessage = {
-        id: optimisticId,
+        id: messageId,
         conversation_id: conversationId,
         sender_id: userId,
         kind: "text",
@@ -386,53 +444,65 @@ export function useMessages(
         edited_at: null,
         forwarded_from_message_id: null,
         forwarded_from_sender_id: null,
-        expires_at: expiresAt,
+        // Set by the server row; see messageFromOutbox.
+        expires_at: null,
         document_name: null,
         document_size_bytes: null,
         media_duration_ms: null,
         waveform: null,
-        created_at: new Date().toISOString(),
+        created_at: createdAt,
         pending: true,
       };
       setMessages((current) => [optimistic, ...current]);
 
+      // Encrypted now, once: the queue (and its copy on disk) only ever
+      // holds the envelope.
+      let storedBody: string;
       try {
-        const storedBody = isEncrypted
-          ? await encryptForConversation(conversationId, trimmed)
-          : trimmed;
-
-        const { error: insertError } = await supabase.from("messages").insert({
-          conversation_id: conversationId,
-          sender_id: userId,
-          kind: "text",
-          body: storedBody,
-          reply_to_id: replyToId ?? null,
-          expires_at: expiresAt,
-        });
-        if (insertError) throw insertError;
-        playMessageSentSound();
+        storedBody = isEncrypted ? await encryptForConversation(conversationId, trimmed) : trimmed;
       } catch (error) {
-        // Every send failure used to look identical — a red bubble with no
-        // trace of WHY (network error, RLS rejection, missing encryption
-        // key). That made it impossible to tell a real bug from a network
-        // blip from a race condition without adding logging after the fact.
         // eslint-disable-next-line no-console
         console.error(
           "[sendMessage] failed:",
           error instanceof Error ? error.message : error,
           { conversationId, isEncrypted }
         );
-        // Leave the bubble in place but mark it failed, so the text isn't lost.
+        // Leave the bubble in place but mark it failed, so the text isn't
+        // lost; a tap retries (retrySend).
         setMessages((current) =>
           current.map((message) =>
-            message.id === optimisticId ? { ...message, pending: false, failed: true } : message
+            message.id === messageId ? { ...message, pending: false, failed: true } : message
           )
         );
-        optimisticIds.current.delete(optimisticId);
         throw error;
       }
+
+      enqueueOutbox({
+        id: messageId,
+        conversationId,
+        senderId: userId,
+        body: storedBody,
+        replyToId: replyToId ?? null,
+        selfDestructSeconds,
+        createdAt,
+      });
     },
     [conversationId, userId, isEncrypted, encryptForConversation, selfDestructSeconds]
+  );
+
+  /** Tap on a red bubble: back into the queue, or — when it never got that
+   * far (encryption failed) — sent again from its text. */
+  const retrySend = useCallback(
+    async (messageId: string) => {
+      if (retryOutboxEntry(messageId)) return;
+      const target = messagesRef.current.find((message) => message.id === messageId);
+      if (!target?.failed || target.kind !== "text") return;
+      const text = target.decryptedBody ?? target.body;
+      if (!text) return;
+      setMessages((current) => current.filter((message) => message.id !== messageId));
+      await sendMessage(text, target.reply_to_id);
+    },
+    [sendMessage]
   );
 
   const editMessage = useCallback(
@@ -530,6 +600,9 @@ export function useMessages(
           localUri,
           isEncrypted ? (data) => encryptBytesForConversation(conversationId, data) : undefined
         );
+        // The sender already has the file — keep it as the cached copy so
+        // their own photo or video is there offline and never downloads back.
+        primeMediaCache(path, localUri);
         const { error: insertError } = await supabase.from("messages").insert({
           conversation_id: conversationId,
           sender_id: userId,
@@ -598,6 +671,7 @@ export function useMessages(
           name,
           isEncrypted ? (data) => encryptBytesForConversation(conversationId, data) : undefined
         );
+        primeMediaCache(path, localUri);
         const { error: insertError } = await supabase.from("messages").insert({
           conversation_id: conversationId,
           sender_id: userId,
@@ -699,6 +773,8 @@ export function useMessages(
       // self-destructed image left its ciphertext in the bucket permanently:
       // a cost that only grows, and for account deletion a failure to
       // actually delete the user's data.
+      // Not sent yet: just stop it from going out.
+      cancelOutboxEntry(messageId);
       const target = messages.find((message) => message.id === messageId);
       if (target?.media_url) {
         const { path } = parseMediaRef(target.media_url);
@@ -786,22 +862,12 @@ export function useMessages(
 
     void readPeerState();
 
-    const channel = supabase
-      .channel(`read-state:${conversationId}`)
-      .on(
-        "postgres_changes",
-        {
-          event: "UPDATE",
-          schema: "public",
-          table: "conversation_participants",
-          filter: `conversation_id=eq.${conversationId}`,
-        },
-        () => void readPeerState()
-      )
-      .subscribe();
+    // Live updates come through the user channel (see the effect above);
+    // this re-reads after a reconnect, when some may have been missed.
+    const offResync = onUserChannelResync(userId, () => void readPeerState());
 
     return () => {
-      void supabase.removeChannel(channel);
+      offResync();
     };
   }, [conversationId, userId]);
 
@@ -849,5 +915,6 @@ export function useMessages(
     markRead,
     refresh: load,
     retryDecryption,
+    retrySend,
   };
 }

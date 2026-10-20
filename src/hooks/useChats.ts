@@ -3,11 +3,16 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ASSISTANT_USER_ID } from "../lib/assistant";
 import { parseEnvelope } from "../lib/e2e";
 import { describeGroupEvent } from "../lib/groupEvents";
+import { readChatListCache, writeChatListCache } from "../lib/localMessages";
+import { restoreOutbox } from "../lib/outbox";
 import { supabase } from "../lib/supabase";
+import { onUserChannelResync, subscribeUserEvents } from "../lib/userChannel";
 import type { Database } from "../types/database";
 import { useE2ee } from "./useE2ee";
+import { getCurrentConversationId } from "../lib/currentChat";
 
 type ConversationKind = Database["public"]["Enums"]["conversation_kind"];
+type MessageRow = Database["public"]["Tables"]["messages"]["Row"];
 
 export type ChatSummary = {
   id: string;
@@ -41,15 +46,19 @@ export type ChatSummary = {
  */
 export function useChats(userId: string | undefined) {
   const [chats, setChats] = useState<ChatSummary[]>([]);
+  // Latest list for callbacks (cache paint, live updates) without making
+  // them depend on it.
+  const chatsRef = useRef(chats);
+  chatsRef.current = chats;
   const [loading, setLoading] = useState(true);
-  // useChats is mounted by BOTH the chats tab and the forward-message modal.
-  // A fixed channel name meant the modal's cleanup tore down the topic the
-  // chats screen was still using, silently killing its live updates.
-  const channelIdRef = useRef(Math.random().toString(36).slice(2));
-  // Distinguishes the first join from a reconnect — see the subscribe handler.
-  const hasSubscribedRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
   const { decryptForConversation, ready: e2eeReady, repairAllSessionKeys } = useE2ee();
+
+  // Messages still queued when the app was last closed go out from launch,
+  // not only once their chat is opened again (src/lib/outbox.ts).
+  useEffect(() => {
+    if (userId) void restoreOutbox(userId);
+  }, [userId]);
 
   // Top up any peer who is missing their wrapped copy of a session key, in
   // every encrypted chat this device holds a key for.
@@ -83,6 +92,23 @@ export function useChats(userId: string | undefined) {
 
     setError(null);
 
+    // First load: paint the list as it was last time, straight from disk —
+    // instant on launch, and the only list there is with no connection.
+    if (chatsRef.current.length === 0) {
+      try {
+        const cachedList = await readChatListCache(userId);
+        if (cachedList && chatsRef.current.length === 0) {
+          const parsed = JSON.parse(cachedList) as ChatSummary[];
+          if (parsed.length > 0) {
+            setChats(parsed);
+            setLoading(false);
+          }
+        }
+      } catch {
+        // no cache yet — the server load below fills it
+      }
+    }
+
     // Conversations the user participates in. Note: conversation_participants
     // .user_id references auth.users, not public.profiles, so PostgREST can't
     // embed profiles here — they're fetched separately below.
@@ -107,14 +133,15 @@ export function useChats(userId: string | undefined) {
       // participant row only — the other participant's row, and every
       // message, is untouched. Excluding it here is the entire client-side
       // effect of that delete: the chat simply stops appearing in this
-      // list. A NEW message arriving un-hides it again (see the realtime
-      // handler below, which clears deleted_at on receipt), so this filter
-      // alone would otherwise permanently hide a chat someone messages you
-      // in again after you'd deleted it.
+      // list. A NEW message arriving un-hides it again — the database
+      // clears deleted_at as the message is stored
+      // (077_realtime_user_channels.sql) — so a chat someone messages you
+      // in again after you'd deleted it comes back.
       .is("deleted_at", null);
 
     if (queryError) {
-      setError(queryError.message);
+      // Offline with the cached list on screen: keep it, no error.
+      if (chatsRef.current.length === 0) setError(queryError.message);
       setLoading(false);
       return;
     }
@@ -181,7 +208,7 @@ export function useChats(userId: string | undefined) {
       // a permanently spinning chat list with no way back. Previews and unread
       // badges simply stay empty for this pass; the next refresh recovers.
       if (summaryError) {
-        setError(summaryError.message);
+        if (chatsRef.current.length === 0) setError(summaryError.message);
         setLoading(false);
         return;
       }
@@ -288,14 +315,15 @@ export function useChats(userId: string | undefined) {
       };
     });
 
-    summaries.sort((a, b) => {
-      const aTime = a.lastMessageAt ? new Date(a.lastMessageAt).getTime() : 0;
-      const bTime = b.lastMessageAt ? new Date(b.lastMessageAt).getTime() : 0;
-      return bTime - aTime;
-    });
-
-    setChats(summaries);
+    const sorted = sortByLatest(summaries);
+    setChats(sorted);
     setLoading(false);
+    // Secret Chat previews are decrypted text: only a placeholder goes to
+    // disk, the same rule as the message cache (src/lib/localMessages.ts).
+    const forDisk = sorted.map((chat) =>
+      chat.isEncrypted && chat.lastMessage ? { ...chat, lastMessage: "🔒 Message" } : chat
+    );
+    void writeChatListCache(userId, JSON.stringify(forDisk)).catch(() => {});
   }, [userId, decryptForConversation, e2eeReady]);
 
   // Collapses a burst of realtime events into a single reload. Ten messages
@@ -326,74 +354,112 @@ export function useChats(userId: string | undefined) {
     void load();
   }, [load]);
 
-  // Any new message anywhere can change ordering, previews, or unread counts,
-  // so refresh the summary list when one lands. Also listen for
-  // conversation_participants updates: that's how last_read_at changes, which
-  // is what lets a chat marked read on one device clear its badge live on
-  // another device signed into the same account.
+  // Live updates on the user's channel (src/lib/userChannel.ts). A new
+  // message updates its own row in place — preview, time, unread badge,
+  // order — instead of reloading the whole list (three queries plus
+  // decrypting every Secret Chat preview) for each message, which in a busy
+  // group was a continuous refetch loop. Rarer changes still reload.
+  const loadRef = useRef(load);
+  loadRef.current = load;
+
   useEffect(() => {
     if (!userId) return;
 
-    const channel = supabase
-      .channel(`chats-list:${channelIdRef.current}`)
-      .on(
-        "postgres_changes",
-        { event: "INSERT", schema: "public", table: "messages" },
-        (payload) => {
-          // RLS already limits which rows reach this socket, but EVERY one of
-          // them used to trigger a full reload — several round trips plus
-          // per-chat decryption. In a busy group that is a continuous refetch
-          // loop. Coalesce instead: collapse a burst into one reload.
-          const conversationId = (payload.new as { conversation_id?: string } | null)
-            ?.conversation_id;
-          if (!conversationId) return;
-          // A new message in a chat this device had "deleted for me" (048_
-          // delete_chat.sql) un-hides it, same as Telegram/WhatsApp — a
-          // deleted chat isn't a standing preference to never see this
-          // person again, it's "I'm done with the history up to now."
-          // Best-effort: RLS already scopes this to rows this user can
-          // update, and a failure here just leaves the chat hidden (the
-          // same state it was already correctly in) rather than breaking
-          // anything, so no error handling beyond letting it fail silently.
-          void supabase
-            .from("conversation_participants")
-            .update({ deleted_at: null })
-            .eq("conversation_id", conversationId)
-            .eq("user_id", userId)
-            .not("deleted_at", "is", null);
+    const applyNewMessage = async (message: MessageRow) => {
+      const chat = chatsRef.current.find((item) => item.id === message.conversation_id);
+      // A chat not in the list (brand new, or one this user had deleted —
+      // the server un-hides it on a new message): reload to pick it up.
+      if (!chat) {
+        scheduleReload();
+        return;
+      }
+      let preview = previewFor(message.body, message.kind);
+      if (chat.isEncrypted && message.kind === "text" && message.body && parseEnvelope(message.body)) {
+        const decrypted = await decryptForConversation(message.conversation_id, message.body);
+        preview = decrypted ?? (e2eeReady ? "🔒 Unable to decrypt" : "🔒 Message");
+      }
+      const own = message.sender_id === userId;
+      setChats((current) =>
+        sortByLatest(
+          current.map((item) =>
+            item.id !== message.conversation_id || (item.lastMessageAt && item.lastMessageAt > message.created_at)
+              ? item
+              : {
+                  ...item,
+                  lastMessage: preview,
+                  lastMessageAt: message.created_at,
+                  // Same rule as chat_list_summary: others' messages after
+                  // my last read. Opening the chat marks it read, which
+                  // comes back below as my own participant_update.
+                  // Not for the chat on screen: it is being read as it
+                  // arrives, and counting it only to have markRead's echo
+                  // (or, with a phone clock behind the server, a full
+                  // reload) take it back cost three requests per message.
+                  unreadCount: own || getCurrentConversationId() === item.id ? item.unreadCount : item.unreadCount + 1,
+                  lastMessageIsOwn: own,
+                  lastMessageRead: item.kind === "direct" && own ? false : null,
+                }
+          )
+        )
+      );
+    };
+
+    const applyReadPosition = (conversationId: string, readerId: string, lastReadAt: string | null) => {
+      const chat = chatsRef.current.find((item) => item.id === conversationId);
+      if (!chat || !lastReadAt) return;
+      const readsLatest = !chat.lastMessageAt || lastReadAt >= chat.lastMessageAt;
+      if (readerId === userId) {
+        // Read up to the newest message (here or on another device): the
+        // badge is simply zero. A partial read needs the exact count.
+        // The chat on screen counts as read whatever the clocks say (a phone
+        // behind the server stamps last_read_at before the newest message).
+        if (readsLatest || getCurrentConversationId() === conversationId) {
+          setChats((current) => current.map((item) => (item.id === conversationId ? { ...item, unreadCount: 0 } : item)));
+        } else {
           scheduleReload();
         }
-      )
-      .on(
-        "postgres_changes",
-        {
-          event: "UPDATE",
-          schema: "public",
-          table: "conversation_participants",
-          filter: `user_id=eq.${userId}`,
-        },
-        () => {
+        return;
+      }
+      if (chat.kind === "direct" && chat.lastMessageIsOwn) {
+        setChats((current) =>
+          current.map((item) => (item.id === conversationId ? { ...item, lastMessageRead: readsLatest } : item))
+        );
+      }
+    };
+
+    const offEvents = subscribeUserEvents(userId, (event) => {
+      switch (event.type) {
+        case "message_insert":
+          void applyNewMessage(event.message);
+          return;
+        case "message_update":
+        case "message_delete":
+        case "membership":
           scheduleReload();
-        }
-      )
-      .subscribe((status) => {
-        // Refetch on every re-SUBSCRIBE. Realtime has no replay, so any
-        // message that landed while the socket was down (handover, tunnel,
-        // backgrounding) would otherwise never reach this list: the chat
-        // would sit with a stale preview and a stale unread badge until the
-        // user pulled to refresh.
-        if (status === "SUBSCRIBED") {
-          if (hasSubscribedRef.current) void load();
-          hasSubscribedRef.current = true;
-        }
-      });
+          return;
+        case "participant_update":
+          applyReadPosition(event.conversation_id, event.user_id, event.last_read_at);
+          return;
+      }
+    });
+    // Realtime has no replay: after a drop, refetch the whole list.
+    const offResync = onUserChannelResync(userId, () => void loadRef.current());
 
     return () => {
-      void supabase.removeChannel(channel);
+      offEvents();
+      offResync();
     };
-  }, [userId, load, scheduleReload]);
+  }, [userId, scheduleReload, decryptForConversation, e2eeReady]);
 
   return { chats, loading, error, refresh: load };
+}
+
+function sortByLatest(chats: ChatSummary[]): ChatSummary[] {
+  return [...chats].sort((a, b) => {
+    const aTime = a.lastMessageAt ? new Date(a.lastMessageAt).getTime() : 0;
+    const bTime = b.lastMessageAt ? new Date(b.lastMessageAt).getTime() : 0;
+    return bTime - aTime;
+  });
 }
 
 function previewFor(
