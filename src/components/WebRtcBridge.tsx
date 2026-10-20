@@ -7,6 +7,7 @@ import type {
   RTCPeerConnection as RTCPeerConnectionType,
 } from "react-native-webrtc";
 
+import { addNetworkChangeListener, currentNetwork, type NetworkPath } from "expo-televo-audio";
 import { tuneSdp } from "../lib/webrtc";
 import { getWebRtc } from "../lib/webrtcModule";
 
@@ -383,6 +384,18 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
   // replaces it wholesale, and changing bundle/rtcp-mux policy afterwards is
   // refused, so swapping relays has to resend everything else unchanged.
   const peerConfigRef = useRef<object | null>(null);
+
+  // Wi-Fi <-> cellular (or Low Data Mode toggled) mid-call: re-apply the
+  // video ceiling to the live connection.
+  useEffect(() => {
+    const sub = addNetworkChangeListener((path) => {
+      if (path.status !== "satisfied" || !pcRef.current) return;
+      void applyVideoCeiling(pcRef.current, path);
+    });
+    return () => sub.remove();
+    // applyVideoCeiling only reads refs; subscribe once per mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // True until this effect has seen callActive go true at least once, i.e.
   // until a call has actually started in this mount. Without it, the effect's
@@ -1145,6 +1158,35 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
    * Best-effort throughout: setParameters and the encoding fields it takes
    * are optional in react-native-webrtc, and an older build simply keeps
    * the defaults rather than failing the call. */
+  // Video ceiling by network, so a call doesn't eat a mobile data plan:
+  // Wi-Fi/wired 2.5 Mbit/s (720p, sharp through motion), cellular 1 Mbit/s
+  // (≈450 MB/h instead of ≈1.1 GB/h, still 720p for a steady picture and
+  // scaled down by congestion control on motion), Low Data Mode 350 kbit/s at
+  // 20 fps. Re-applied on every path change mid-call (see the listener in
+  // the call effect), since Wi-Fi -> cellular keeps the same connection.
+  function videoCeiling(path: NetworkPath | null): { maxBitrate: number; maxFramerate: number } {
+    if (path?.constrained) return { maxBitrate: 350_000, maxFramerate: 20 };
+    if (path?.interface === "cellular" || path?.expensive) return { maxBitrate: 1_000_000, maxFramerate: 30 };
+    return { maxBitrate: 2_500_000, maxFramerate: 30 };
+  }
+
+  async function applyVideoCeiling(pc: RTCPeerConnectionType, path: NetworkPath | null) {
+    const senders = (pc as unknown as { getSenders?: () => { track?: { kind?: string } | null; getParameters?: () => { encodings?: Record<string, unknown>[] }; setParameters?: (p: unknown) => Promise<void> }[] }).getSenders?.();
+    const ceiling = videoCeiling(path);
+    for (const sender of senders ?? []) {
+      if (sender.track?.kind !== "video" || !sender.getParameters || !sender.setParameters) continue;
+      const params = sender.getParameters();
+      if (!params.encodings?.length) continue;
+      for (const encoding of params.encodings) Object.assign(encoding, ceiling);
+      try {
+        await sender.setParameters(params);
+        post({ type: "log", message: `video ceiling ${ceiling.maxBitrate / 1000}k/${ceiling.maxFramerate}fps (${path?.interface ?? "unknown"}${path?.constrained ? ", low data" : ""})` });
+      } catch (error) {
+        post({ type: "log", message: `video ceiling failed: ${String(error)}` });
+      }
+    }
+  }
+
   async function tuneForMobileNetwork(pc: RTCPeerConnectionType) {
     try {
       const senders = (
@@ -1205,8 +1247,7 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
             // bitrate — 900k capped a 720p picture at visibly soft even on
             // fast Wi-Fi. Congestion control still steps it down on a weak
             // link; this is only the ceiling.
-            encoding.maxBitrate = 2_500_000;
-            encoding.maxFramerate = 30;
+            Object.assign(encoding, videoCeiling(currentNetwork()));
             // "balanced", 2026-10-17. "maintain-framerate" (below, kept for
             // the history) dropped RESOLUTION first under any pressure, which
             // is the blurry picture people reported; balanced gives up a

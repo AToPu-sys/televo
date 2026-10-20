@@ -288,6 +288,15 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
   // three near-simultaneous "offer received" events, the third one's
   // renegotiate-answer throwing and ending the call outright.
   const lastRenegotiatedSdpRef = useRef<string | null>(null);
+  // ICE ufrag of the offer this side last answered (first answer or a
+  // renegotiation). The caller re-sends its ORIGINAL offer every time it
+  // hears callee-ready, and the callee sends callee-ready twice (on joining
+  // and again on Accept) — so a second copy of the already-answered offer
+  // arrives on a live call. It used to be taken for an ICE restart and
+  // renegotiated over the in-flight answer ("cannot create an answer in
+  // state …"), leaving the call stuck on Connecting until people hung up
+  // (call_diagnostics, 2026-10-20). A real restart always has a new ufrag.
+  const answeredUfragRef = useRef<string | null>(null);
   // True once this call ever reached phase "active", on EITHER side —
   // answeredCallIdRef above only ever gets set on the callee. Used by
   // flushCallDiagnostics to decide whether a call that ended with no
@@ -529,6 +538,7 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
     pendingOfferRef.current = null;
     activeCallRowRef.current = null;
     answeredCallIdRef.current = null;
+    answeredUfragRef.current = null;
     answerAppliedForCallIdRef.current = null;
     lastRenegotiatedSdpRef.current = null;
     wasActiveRef.current = false;
@@ -1188,6 +1198,7 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
         return;
       }
       answeredCallIdRef.current = call.id;
+      answeredUfragRef.current = iceUfrag(offerSdp);
       trace("answerCall", `kind=${kind}`);
       setState({ phase: "connecting", call });
       roleRef.current = "callee";
@@ -1281,6 +1292,12 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
               trace("offer received", "duplicate ICE restart — ignored");
               return;
             }
+            const ufrag = iceUfrag(signal.sdp);
+            if (ufrag && ufrag === answeredUfragRef.current) {
+              trace("offer received", "same offer re-sent (no new ICE ufrag) — ignored");
+              return;
+            }
+            answeredUfragRef.current = ufrag;
             lastRenegotiatedSdpRef.current = signal.sdp;
             trace("offer received", "ICE restart from caller — renegotiating");
             sendCommand({ type: "renegotiate-answer", sdp: signal.sdp });
@@ -2180,4 +2197,9 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
     reconnecting,
     quality,
   };
+}
+
+/** The session's ICE username fragment; changes only on an ICE restart. */
+function iceUfrag(sdp: string | undefined | null): string | null {
+  return sdp?.match(/^a=ice-ufrag:(\S+)/m)?.[1] ?? null;
 }
