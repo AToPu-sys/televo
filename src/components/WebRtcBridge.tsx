@@ -227,6 +227,10 @@ type Command =
   // Swaps the relay list on the live connection (keeping every other
   // setting it was created with). Takes effect at the next ICE restart.
   | { type: "set-ice-servers"; iceServers: RTCIceServer[] }
+  // Caller with a cold credential cache: start-local went without servers;
+  // build the connection (and start gathering) as soon as they arrive, while
+  // the camera may still be opening. create-offer then reuses it.
+  | { type: "prepare-peer"; iceServers: RTCIceServer[] }
   // The callee's half of an ICE restart: applies the caller's re-offer to
   // the peer connection that is ALREADY up and answers it. Distinct from
   // "create-answer", which builds a brand new connection and re-opens the
@@ -1656,6 +1660,14 @@ export const WebRtcBridge = forwardRef<WebRtcBridgeHandle, WebRtcBridgeProps>(fu
         // connection actually carries media. Generation-guarded, so this
         // supersedes rather than races any loop already running.
         void watchForInboundMedia(pc);
+        return;
+      }
+
+      if (command.type === "prepare-peer") {
+        if (!pcRef.current) {
+          isCallerRef.current = true;
+          createPeer(command.iceServers);
+        }
         return;
       }
 

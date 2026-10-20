@@ -1153,8 +1153,10 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
       const ice = warmIce ?? (await getIceServers());
       iceSourceRef.current = ice.source;
       trace("ice-servers", ice.source);
-      // Hung up (or the callee declined) while the credentials were coming.
-      if (stateRef.current.phase === "idle" || stateRef.current.phase === "ended") return;
+      // Hung up, declined, or already on ANOTHER call by the time the
+      // credentials came: this call's offer must not reach that one.
+      if (activeCallRowRef.current?.id !== call.id || stateRef.current.phase === "idle" || stateRef.current.phase === "ended") return;
+      if (!warmIce) sendCommand({ type: "prepare-peer", iceServers: ice.servers });
       sendCommand({ type: "create-offer", iceServers: ice.servers, video: kind === "video" });
       // The bridge replies with a "offer" BridgeEvent once ready; see
       // handleBridgeEvent below, which forwards it as the signal.
@@ -1189,10 +1191,21 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
       trace("answerCall", `kind=${kind}`);
       setState({ phase: "connecting", call });
       roleRef.current = "callee";
-      // Normally already warm (listenForOffer starts the fetch while it rings).
-      const ice = await getIceServers();
+      // Normally already warm (listenForOffer starts the fetch while it
+      // rings). Cold: wait at most 800 ms, not 2.5 s — the user has already
+      // answered and is looking at "Connecting…"; the ranked servers that
+      // come later are handed over for any ICE restart.
+      const warm = peekIceServers();
+      const ice = warm ?? (await getIceServers(800));
       iceSourceRef.current = ice.source;
       trace("ice-servers", ice.source);
+      if (ice.source === "fallback") {
+        void getIceServers().then((late) => {
+          if (late.source === "server" && answeredCallIdRef.current === call.id) {
+            sendCommand({ type: "set-ice-servers", iceServers: late.servers });
+          }
+        });
+      }
       sendCommand({
         type: "create-answer",
         iceServers: ice.servers,

@@ -441,6 +441,14 @@ export function CallOverlay({
     });
     return () => minimizeAnim.removeListener(id);
   }, [minimizeAnim]);
+  // minimized is also cleared from outside (useCallManager on ended/idle) —
+  // e.g. a call minimized while ringing and then declined. This component
+  // stays mounted between calls, so without this the shrunken scale carried
+  // over: the "Declined" screen and the NEXT call drew tiny in a corner under
+  // an opaque Modal.
+  useEffect(() => {
+    if (!minimized && (state.phase === "ended" || state.phase === "idle")) minimizeAnim.setValue(0);
+  }, [minimized, state.phase, minimizeAnim]);
   const DRAG_TO_MINIMIZE_DISTANCE = 220;
   const minimizePanResponder = useRef(
     PanResponder.create({

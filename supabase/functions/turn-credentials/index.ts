@@ -176,7 +176,10 @@ Deno.serve(async (req) => {
 
   // 30 per user per hour (079): the app caches for 12 h, so only a script
   // draining the providers' quotas gets here.
+  // On an RPC error the request still goes through (calls matter more than
+  // the limit), but loudly, so a missing migration doesn't hide.
   const { data: allowed, error: limitError } = await admin.rpc("claim_turn_credentials", { p_user_id: user.id });
+  if (limitError) console.error(`turn rate limit unavailable: ${limitError.message}`);
   if (!limitError && allowed === false) {
     return Response.json({ error: "rate_limited" }, { status: 429, headers: { "Retry-After": "3600" } });
   }
@@ -186,6 +189,8 @@ Deno.serve(async (req) => {
   const groups = await Promise.all([ownRelays(user.id), staticRelays(), meteredRelays(), cloudflareRelays()]);
   const relays = groups.flat();
   if (relays.length === 0) {
+    // Nothing was handed out: give the slot back (080).
+    if (!limitError) await admin.rpc("refund_turn_credentials", { p_user_id: user.id });
     return Response.json({ error: "turn_not_configured" }, { status: 503 });
   }
 

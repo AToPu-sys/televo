@@ -88,6 +88,7 @@ export function resetIceServers(): void {
   generation += 1;
   cached = null;
   inFlight = null;
+  probing = null;
   measurement = null;
   penalties.clear();
 }
@@ -147,13 +148,16 @@ export function probeRelays(force = false): Promise<void> {
     return Promise.resolve();
   }
   if (probing) return probing;
-  probing = (async () => {
+  const gen = generation;
+  const mine = (async () => {
     const results = await Promise.all(relays.map(async (relay) => [relay.id, await probeRelay(relay.server)] as const));
-    measurement = { network, at: Date.now(), ms: new Map(results) };
+    // Signed out meanwhile: these were the previous account's relays.
+    if (gen === generation) measurement = { network, at: Date.now(), ms: new Map(results) };
   })().finally(() => {
-    probing = null;
+    if (probing === mine) probing = null;
   });
-  return probing;
+  probing = mine;
+  return mine;
 }
 
 function listenForNetworkChanges() {
@@ -195,11 +199,11 @@ export function peekIceServers(): IceServerSet | null {
 
 /** The servers to build this call's peer connection with. Never waits longer
  * than FETCH_TIMEOUT_MS; on a miss the call uses the bundled list. */
-export async function getIceServers(): Promise<IceServerSet> {
+export async function getIceServers(timeoutMs = FETCH_TIMEOUT_MS): Promise<IceServerSet> {
   if (fresh()) return { servers: buildServers(), source: "server" };
   const ok = await Promise.race([
     fetchFromServer(),
-    new Promise<boolean>((resolve) => setTimeout(() => resolve(false), FETCH_TIMEOUT_MS)),
+    new Promise<boolean>((resolve) => setTimeout(() => resolve(false), timeoutMs)),
   ]);
   return ok && cached ? { servers: buildServers(), source: "server" } : { servers: FALLBACK_ICE_SERVERS, source: "fallback" };
 }
