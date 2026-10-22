@@ -36,6 +36,7 @@ type config struct {
 	metrics      string
 	allowPeers   string
 	maxConns     int
+	maxBitrate   int64
 }
 
 func env(name, def string) string {
@@ -63,6 +64,7 @@ func parseConfig() config {
 	flag.StringVar(&c.metrics, "metrics", env("TURN_METRICS", "127.0.0.1:9478"), "address for /metrics and /healthz")
 	flag.StringVar(&c.allowPeers, "allow-peer", env("TURN_ALLOW_PEERS", ""), "comma-separated peer CIDRs allowed despite the deny list (tests only)")
 	flag.IntVar(&c.maxConns, "max-tcp-connections", 20000, "simultaneous TCP/TLS connections")
+	flag.Int64Var(&c.maxBitrate, "max-bitrate", 20_000_000, "bits per second one allocation may relay each way (0 = unlimited)")
 	flag.Parse()
 	return c
 }
@@ -118,12 +120,16 @@ func main() {
 	auth := newRESTAuth(secret, cfg.userQuota, cfg.refreshGrace, metrics)
 
 	relayGen := func() turn.RelayAddressGenerator {
-		return &turn.RelayAddressGeneratorPortRange{
-			RelayAddress: publicIP,
-			Address:      cfg.relayBind,
-			MinPort:      uint16(cfg.minPort),
-			MaxPort:      uint16(cfg.maxPort),
-			MaxRetries:   64,
+		return &meteredRelay{
+			RelayAddressGeneratorPortRange: &turn.RelayAddressGeneratorPortRange{
+				RelayAddress: publicIP,
+				Address:      cfg.relayBind,
+				MinPort:      uint16(cfg.minPort),
+				MaxPort:      uint16(cfg.maxPort),
+				MaxRetries:   64,
+			},
+			bitsPerSecond: cfg.maxBitrate,
+			metrics:       metrics,
 		}
 	}
 	permit := func(client net.Addr, peer net.IP) bool {

@@ -19,6 +19,8 @@ type metrics struct {
 	allocationsCreated, allocationsDeleted atomic.Int64
 	authFailures, quotaRejections          atomic.Int64
 	deniedPeers                            atomic.Int64
+	bytesToPeer, bytesToClient             atomic.Int64
+	droppedPackets                         atomic.Int64
 }
 
 // health sends a STUN Binding to our own UDP listener; the server counts as
@@ -97,19 +99,24 @@ func serveMetrics(addr string, m *metrics, h *health, s *turn.Server, l *connLim
 	})
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
 		var b strings.Builder
-		gauge := func(name string, v int64) { fmt.Fprintf(&b, "%s %d\n", name, v) }
-		gauge("turn_allocations", int64(s.AllocationCount()))
-		gauge("turn_allocations_created_total", m.allocationsCreated.Load())
-		gauge("turn_allocations_deleted_total", m.allocationsDeleted.Load())
-		gauge("turn_auth_failures_total", m.authFailures.Load())
-		gauge("turn_quota_rejections_total", m.quotaRejections.Load())
-		gauge("turn_denied_peers_total", m.deniedPeers.Load())
-		gauge("turn_stream_connections", l.current.Load())
+		metric := func(name, kind, help string, v int64) {
+			fmt.Fprintf(&b, "# HELP %s %s\n# TYPE %s %s\n%s %d\n", name, help, name, kind, name, v)
+		}
 		healthy := int64(0)
 		if h.healthy() {
 			healthy = 1
 		}
-		gauge("turn_healthy", healthy)
+		metric("turn_allocations", "gauge", "Live allocations.", int64(s.AllocationCount()))
+		metric("turn_allocations_created_total", "counter", "Allocations created.", m.allocationsCreated.Load())
+		metric("turn_allocations_deleted_total", "counter", "Allocations deleted.", m.allocationsDeleted.Load())
+		metric("turn_auth_failures_total", "counter", "Rejected credentials.", m.authFailures.Load())
+		metric("turn_quota_rejections_total", "counter", "Allocations refused by the per-user quota.", m.quotaRejections.Load())
+		metric("turn_denied_peers_total", "counter", "Permissions refused for internal peer addresses.", m.deniedPeers.Load())
+		metric("turn_bytes_to_peer_total", "counter", "Payload bytes relayed client to peer.", m.bytesToPeer.Load())
+		metric("turn_bytes_to_client_total", "counter", "Payload bytes relayed peer to client.", m.bytesToClient.Load())
+		metric("turn_dropped_packets_total", "counter", "Packets dropped by the bitrate cap.", m.droppedPackets.Load())
+		metric("turn_stream_connections", "gauge", "Open TCP/TLS connections.", l.current.Load())
+		metric("turn_healthy", "gauge", "1 while the STUN self-check passes.", healthy)
 		_, _ = w.Write([]byte(b.String()))
 	})
 	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}

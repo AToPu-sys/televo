@@ -76,13 +76,63 @@ impl AllocState {
     }
 }
 
+/// Caps one allocation's relayed bitrate; over the cap packets are dropped,
+/// as a congested link would.
+pub struct TokenBucket {
+    rate: f64,
+    burst: f64,
+    state: Mutex<(f64, Instant)>,
+}
+
+impl TokenBucket {
+    pub fn new(bits_per_second: u64) -> Option<Self> {
+        (bits_per_second > 0).then(|| {
+            let rate = bits_per_second as f64 / 8.0;
+            TokenBucket { rate, burst: rate / 2.0, state: Mutex::new((rate / 2.0, Instant::now())) }
+        })
+    }
+
+    pub fn allow(&self, n: usize) -> bool {
+        let mut st = self.state.lock().unwrap();
+        let now = Instant::now();
+        let tokens = (st.0 + now.duration_since(st.1).as_secs_f64() * self.rate).min(self.burst);
+        *st = (tokens, now);
+        if tokens < n as f64 {
+            return false;
+        }
+        st.0 -= n as f64;
+        true
+    }
+}
+
+fn within(bucket: &Option<TokenBucket>, n: usize) -> bool {
+    bucket.as_ref().is_none_or(|b| b.allow(n))
+}
+
 pub struct Allocation {
+    to_peer: Option<TokenBucket>,
+    to_client: Option<TokenBucket>,
     username: String,
     user_id: String,
     relay: Arc<UdpSocket>,
     sink: ClientSink,
     state: Mutex<AllocState>,
     cancel: CancellationToken,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TokenBucket;
+
+    #[test]
+    fn token_bucket_caps_and_refills() {
+        let b = TokenBucket::new(8_000).unwrap(); // 1000 bytes/s, burst 500
+        assert!(b.allow(400));
+        assert!(!b.allow(400));
+        std::thread::sleep(std::time::Duration::from_millis(450));
+        assert!(b.allow(400));
+        assert!(TokenBucket::new(0).is_none());
+    }
 }
 
 #[derive(Default)]
@@ -398,6 +448,8 @@ impl Server {
                 .u32(attr::LIFETIME, lifetime as u32);
         });
         let alloc = Arc::new(Allocation {
+            to_peer: TokenBucket::new(self.cfg.max_bitrate),
+            to_client: TokenBucket::new(self.cfg.max_bitrate),
             username: creds.username,
             user_id: creds.user_id,
             relay,
@@ -555,6 +607,10 @@ impl Server {
     }
 
     fn to_peer(&self, alloc: &Allocation, data: &[u8], peer: SocketAddr) {
+        if !within(&alloc.to_peer, data.len()) {
+            inc(&self.metrics.dropped_packets, 1);
+            return;
+        }
         match alloc.relay.try_send_to(data, peer) {
             Ok(n) => inc(&self.metrics.bytes_to_peer, n as u64),
             Err(_) => inc(&self.metrics.dropped_packets, 1),
@@ -578,6 +634,10 @@ async fn relay_loop(alloc: Arc<Allocation>, metrics: Arc<Metrics>) {
             },
         };
         let peer = canonical(from);
+        if !within(&alloc.to_client, n) {
+            inc(&metrics.dropped_packets, 1);
+            continue;
+        }
         let now = Instant::now();
         let channel = {
             let st = alloc.state.lock().unwrap();

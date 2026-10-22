@@ -49,6 +49,9 @@ pub struct Config {
     pub allow_peers: Vec<String>,
     #[arg(long, env = "TURN_MAX_TCP_CONNECTIONS", default_value_t = 20000)]
     pub max_tcp_connections: usize,
+    /// Bits per second one allocation may relay each way (0 = unlimited).
+    #[arg(long, env = "TURN_MAX_BITRATE", default_value_t = 20_000_000)]
+    pub max_bitrate: u64,
 }
 
 pub fn load_secret(cfg: &Config) -> Result<Vec<u8>, String> {

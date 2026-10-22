@@ -93,21 +93,22 @@ async fn serve_metrics(addr: SocketAddr, server: Arc<Server>, last_ok: Arc<Atomi
             } else if line.starts_with("GET /metrics") {
                 let m = &server.metrics;
                 let mut b = String::new();
-                let mut g = |name: &str, v: u64| {
-                    let _ = writeln!(b, "{name} {v}");
+                let mut g = |name: &str, kind: &str, help: &str, v: u64| {
+                    let _ = writeln!(b, "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {v}");
                 };
-                g("turn_allocations", server.allocation_count() as u64);
-                g("turn_allocations_created_total", m.allocations_created.load(Ordering::Relaxed));
-                g("turn_allocations_deleted_total", m.allocations_deleted.load(Ordering::Relaxed));
-                g("turn_auth_failures_total", m.auth_failures.load(Ordering::Relaxed));
-                g("turn_quota_rejections_total", m.quota_rejections.load(Ordering::Relaxed));
-                g("turn_denied_peers_total", m.denied_peers.load(Ordering::Relaxed));
-                g("turn_bytes_to_peer_total", m.bytes_to_peer.load(Ordering::Relaxed));
-                g("turn_bytes_to_client_total", m.bytes_to_client.load(Ordering::Relaxed));
-                g("turn_dropped_packets_total", m.dropped_packets.load(Ordering::Relaxed));
-                g("turn_malformed_total", m.malformed.load(Ordering::Relaxed));
-                g("turn_stream_connections", m.stream_connections.load(Ordering::Relaxed) as u64);
-                g("turn_healthy", healthy as u64);
+                let load = |c: &AtomicU64| c.load(Ordering::Relaxed);
+                g("turn_allocations", "gauge", "Live allocations.", server.allocation_count() as u64);
+                g("turn_allocations_created_total", "counter", "Allocations created.", load(&m.allocations_created));
+                g("turn_allocations_deleted_total", "counter", "Allocations deleted.", load(&m.allocations_deleted));
+                g("turn_auth_failures_total", "counter", "Rejected credentials.", load(&m.auth_failures));
+                g("turn_quota_rejections_total", "counter", "Allocations refused by a quota.", load(&m.quota_rejections));
+                g("turn_denied_peers_total", "counter", "Permissions refused for internal peer addresses.", load(&m.denied_peers));
+                g("turn_bytes_to_peer_total", "counter", "Payload bytes relayed client to peer.", load(&m.bytes_to_peer));
+                g("turn_bytes_to_client_total", "counter", "Payload bytes relayed peer to client.", load(&m.bytes_to_client));
+                g("turn_dropped_packets_total", "counter", "Packets dropped (bitrate cap, no permission, full buffers).", load(&m.dropped_packets));
+                g("turn_malformed_total", "counter", "Unparseable STUN messages.", load(&m.malformed));
+                g("turn_stream_connections", "gauge", "Open TCP/TLS connections.", m.stream_connections.load(Ordering::Relaxed) as u64);
+                g("turn_healthy", "gauge", "1 while the STUN self-check passes.", healthy as u64);
                 ("200 OK", b)
             } else {
                 ("404 Not Found", "not found\n".to_string())

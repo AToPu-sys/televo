@@ -22,7 +22,9 @@ Behaviour both share:
   keep refreshing for 24 h past expiry, so long calls aren't cut.
 - No relaying to private, loopback, link-local (cloud metadata), CGNAT,
   multicast or reserved addresses.
-- 100 simultaneous allocations per user.
+- 100 simultaneous allocations per user, 20 Mbit/s per allocation each way
+  (`--max-bitrate`; a video call needs about 2.5): one client can't eat the
+  server's bandwidth or traffic budget.
 - Certificates are reloaded from disk on renewal: no restart, no dropped calls.
 - `/healthz` is backed by a STUN round trip to the server's own UDP port,
   and only that pets the systemd watchdog — a stuck relay is restarted.
@@ -31,8 +33,13 @@ Behaviour both share:
 
 ```sh
 cd e2e && go test ./...      # builds and starts both relays locally
-cd rust && cargo test        # codec (incl. RFC 5769 vectors), auth, policy
+cd rust && cargo test        # codec (incl. RFC 5769 vectors), auth, policy, rate cap
+cd go && go test ./...       # auth window, quota, policy, rate cap
+cd e2e && go test -run '^$' -bench .   # Go vs Rust relay round trip
 ```
+
+`/metrics` is Prometheus text (allocations, relayed bytes each way, drops,
+auth failures, quota and policy rejections, health).
 
 The e2e suite drives both relays with pion's TURN client over UDP, TCP and
 TLS (echo, relay-to-relay, bad and expired credentials, denied peers, quota)
