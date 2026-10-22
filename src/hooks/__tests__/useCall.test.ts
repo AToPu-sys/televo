@@ -54,7 +54,7 @@ let mockCallsTable: ReturnType<typeof createFakeCallsTable>;
 jest.mock("../../lib/supabase", () => ({
   supabase: {
     channel: (..._args: unknown[]) => mockChannel,
-    removeChannel: jest.fn(),
+    removeChannel: jest.fn(async () => "ok"),
     from: (table: string) => {
       if (table === "calls") return mockCallsTable;
       throw new Error(`unexpected table in test: ${table}`);

@@ -9,7 +9,7 @@ import { createClient } from "jsr:@supabase/supabase-js@2";
  *
  * Sources, all optional, all from this function's secrets:
  *
- *  - Televo's own coturn servers (COTURN_HOSTS, comma-separated host names,
+ *  - Televo's own relays (COTURN_HOSTS, comma-separated host or host:port:tlsPort,
  *    and COTURN_SECRET). Credentials are coturn's "TURN REST" kind: the
  *    username carries an expiry, the password is an HMAC of it under the
  *    shared secret, so nothing long-lived ever reaches a phone.
@@ -109,15 +109,20 @@ async function ownRelays(userId: string): Promise<Relay[]> {
   );
   const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(username));
   const credential = btoa(String.fromCharCode(...new Uint8Array(signature)));
-  return hosts.map((host) => ({
-    id: `televo:${host}`,
-    provider: "televo",
-    server: {
-      urls: [`turn:${host}:3478`, `turn:${host}:3478?transport=tcp`, `turns:${host}:443?transport=tcp`],
-      username,
-      credential,
-    },
-  }));
+  // "host" uses 3478 and 443; "host:port:tlsPort" a relay on other ports
+  // (the Rust relay runs beside the Go one on 3479/5349).
+  return hosts.map((entry) => {
+    const [host, port = "3478", tlsPort = "443"] = entry.split(":");
+    return {
+      id: `televo:${entry}`,
+      provider: "televo",
+      server: {
+        urls: [`turn:${host}:${port}`, `turn:${host}:${port}?transport=tcp`, `turns:${host}:${tlsPort}?transport=tcp`],
+        username,
+        credential,
+      },
+    };
+  });
 }
 
 function staticRelays(): Relay[] {

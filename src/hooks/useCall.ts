@@ -1071,6 +1071,7 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
       // ref-based path that treats this as "the call in progress" — hangup,
       // declineFromCallKit — was simply dead on an outgoing call.
       activeCallRowRef.current = call;
+      const renderedBeforeStart = stateRef.current;
       setState({ phase: "outgoing", call });
 
       // This call is about to be reported to CallKit too (see
@@ -1163,9 +1164,16 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
       const ice = warmIce ?? (await getIceServers());
       iceSourceRef.current = ice.source;
       trace("ice-servers", ice.source);
-      // Hung up, declined, or already on ANOTHER call by the time the
-      // credentials came: this call's offer must not reach that one.
-      if (activeCallRowRef.current?.id !== call.id || stateRef.current.phase === "idle" || stateRef.current.phase === "ended") return;
+      // Hung up or replaced meanwhile; stateRef lags setState until a render, so its "ended" counts only once it has moved.
+      const rendered = stateRef.current;
+      if (
+        activeCallRowRef.current?.id !== call.id ||
+        roleRef.current !== "caller" ||
+        (rendered !== renderedBeforeStart && rendered.phase === "ended")
+      ) {
+        trace("create-offer SKIPPED", "call ended or replaced before the credentials came");
+        return;
+      }
       if (!warmIce) sendCommand({ type: "prepare-peer", iceServers: ice.servers });
       sendCommand({ type: "create-offer", iceServers: ice.servers, video: kind === "video" });
       // The bridge replies with a "offer" BridgeEvent once ready; see

@@ -63,3 +63,7 @@ CLAUDE.md
 AGENTS.md
 .claude/
 *.bak
+
+# TURN relay build output
+server/turn/rust/target/
+__pycache__/
