@@ -32,13 +32,23 @@ jest.mock("../useE2ee", () => ({
 
 let mockChannel: ReturnType<typeof createFakeChannel>;
 let mockCallsTable: ReturnType<typeof createFakeCallsTable>;
+const mockDiagnosticsRows: { outcome?: string }[] = [];
+const mockDiagnostics = {
+  insert: async (row: { outcome?: string }) => {
+    mockDiagnosticsRows.push(row);
+    return { error: null };
+  },
+};
 
 jest.mock("../../lib/supabase", () => ({
   supabase: {
-    channel: (..._args: unknown[]) => mockChannel,
+    // The user channel gets its own fake, so it can't take over the call channel's handler.
+    channel: (topic: string) =>
+      topic.startsWith("call:") ? mockChannel : jest.requireActual("../__mocks__/callTestUtils").createFakeChannel(),
     removeChannel: jest.fn(async () => "ok"),
     from: (table: string) => {
       if (table === "calls") return mockCallsTable;
+      if (table === "call_diagnostics") return mockDiagnostics;
       throw new Error(`unexpected table in test: ${table}`);
     },
   },
@@ -148,5 +158,47 @@ describe("useCall — caller offer", () => {
     });
 
     expect(commands.some((c) => c.type === "create-offer")).toBe(false);
+    expect(mockDiagnosticsRows.map((r) => r.outcome)).toContain("offer_skipped");
+  });
+
+  it("answers a burst of callee-ready frames with one offer re-send", async () => {
+    mockWarmIce = mockServerIce;
+    const { result } = renderHook(() => useCall("user-caller", "peer-public-key"));
+    attachBridge(result);
+    await act(async () => {
+      await result.current.startCall("conv-1", "video");
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    act(() => {
+      result.current.handleBridgeEvent({ type: "offer", sdp: "v=0\r\na=ice-ufrag:abcd\r\n" } as never);
+    });
+    const offersSent = () => mockChannel.__sent.filter((p) => (p as { plain?: { type?: string } }).plain?.type === "offer").length;
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    const before = offersSent();
+
+    await act(async () => {
+      for (let i = 0; i < 3; i++) mockChannel.__simulateIncoming({ plain: { type: "callee-ready" } });
+      await new Promise((r) => setTimeout(r, 0));
+    });
+
+    expect(offersSent() - before).toBe(1);
+  });
+
+  it("sends one callee-ready when ringing and a CallKit answer both queue one", async () => {
+    const { result } = renderHook(() => useCall("user-callee", "peer-public-key"));
+    attachBridge(result);
+    act(() => {
+      result.current.listenForOffer(makeCallRow({ caller_id: "user-remote", kind: "audio" }));
+      result.current.acceptFromCallKit("audio");
+    });
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    const ready = mockChannel.__sent.filter((p) => (p as { plain?: { type?: string } }).plain?.type === "callee-ready");
+    expect(ready).toHaveLength(1);
   });
 });
+

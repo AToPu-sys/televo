@@ -4,6 +4,7 @@ import {
   reportMuteState,
 } from "expo-callkit";
 import { isBackgroundCameraSupported } from "expo-call-pip";
+import Constants from "expo-constants";
 import { resetAudioRoute, setSpeakerphoneOn } from "expo-speaker-toggle";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AppState, Platform } from "react-native";
@@ -24,6 +25,8 @@ import type { SignalEnvelope } from "../lib/e2e";
 
 type CallKind = Database["public"]["Enums"]["call_kind"];
 type CallRow = Database["public"]["Tables"]["calls"]["Row"];
+
+const APP_BUILD = Constants.expoConfig?.ios?.buildNumber ?? "?";
 
 export type CallState =
   | { phase: "idle" }
@@ -297,6 +300,11 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
   // state …"), leaving the call stuck on Connecting until people hung up
   // (call_diagnostics, 2026-10-20). A real restart always has a new ufrag.
   const answeredUfragRef = useRef<string | null>(null);
+  // One offer re-send answers a burst of callee-ready frames (listenForOffer, Accept and CallKit each send one).
+  const lastOfferResendAtRef = useRef(0);
+  // Why an unanswered call still deserves a call_diagnostics row; unanswered calls are skipped otherwise.
+  const unansweredReasonRef = useRef<string | null>(null);
+  const callStartedAtRef = useRef(0);
   // True once this call ever reached phase "active", on EITHER side —
   // answeredCallIdRef above only ever gets set on the callee. Used by
   // flushCallDiagnostics to decide whether a call that ended with no
@@ -539,6 +547,7 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
     activeCallRowRef.current = null;
     answeredCallIdRef.current = null;
     answeredUfragRef.current = null;
+    lastOfferResendAtRef.current = 0;
     answerAppliedForCallIdRef.current = null;
     lastRenegotiatedSdpRef.current = null;
     wasActiveRef.current = false;
@@ -615,15 +624,26 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
     // cannot write the same call twice.
     callStatsRef.current = null;
     callOutcomeRef.current = null;
-    // Nothing worth recording for a call that never got past dialing/ringing
-    // — no call row, or never answered. A call that WAS answered is recorded
+    let unanswered = unansweredReasonRef.current;
+    unansweredReasonRef.current = null;
+    if (
+      !wasAnswered &&
+      !unanswered &&
+      roleRef.current === "caller" &&
+      !pendingOfferRef.current?.sdp &&
+      Date.now() - callStartedAtRef.current > 3000
+    ) {
+      unanswered = "no_offer_created";
+    }
+    // Nothing worth recording for a call that never got past dialing/ringing,
+    // unless something went wrong on the way. A call that WAS answered is recorded
     // even with no explicit outcome and no stats: a user hanging up manually
     // before either media-flowing or media-timeout fired (e.g. right after
     // the 10-second mark this exact symptom produces) used to leave nothing
     // behind at all, which is precisely the case this table exists to catch
     // — "the call was answered, then ended, and nobody knows why" must
     // itself be a recorded outcome, not silence.
-    if (!call || !userId || !wasAnswered) return;
+    if (!call || !userId || (!wasAnswered && !unanswered)) return;
 
     const report = getDiagnosticsReport();
     void supabase
@@ -632,7 +652,8 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
         call_id: call.id,
         user_id: userId,
         outcome:
-          outcome ?? (stats?.msToMedia != null ? "connected" : "ended_no_media_event"),
+          outcome ??
+          (wasAnswered ? (stats?.msToMedia != null ? "connected" : "ended_no_media_event") : (unanswered ?? "unanswered")),
         selected_candidate_pair: stats?.selectedCandidatePair ?? null,
         turn_server: stats?.turnServer ?? null,
         using_public_turn: iceSourceRef.current === "fallback" && USING_PUBLIC_TURN,
@@ -859,6 +880,9 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
         // is precisely "CallKit says connected, the app shows Ringing and
         // never connects." Answering in-app never hit this because
         // listenForOffer always runs first there.
+        if (signal.type === "callee-ready" && pendingSignalsRef.current.some((queued) => queued.type === "callee-ready")) {
+          return;
+        }
         pendingSignalsRef.current.push(signal);
         return;
       }
@@ -1033,7 +1057,8 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
   const startCall = useCallback(
     async (conversationId: string, kind: CallKind) => {
       diagnosticsRef.current = [];
-      trace("startCall", `kind=${kind} peerKey=${peerPublicKeyRef.current ? "present" : "MISSING"}`);
+      callStartedAtRef.current = Date.now();
+      trace("startCall", `kind=${kind} peerKey=${peerPublicKeyRef.current ? "present" : "MISSING"} build=${APP_BUILD}`);
       if (!userId) {
         trace("startCall", "ABORTED — no userId");
         return;
@@ -1105,6 +1130,12 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
 
       joinSignalChannel(call.id, async (signal) => {
         if (signal.type === "callee-ready") {
+          const now = Date.now();
+          if (now - lastOfferResendAtRef.current < 1000) {
+            trace("callee-ready", "duplicate within 1s — offer already re-sent");
+            return;
+          }
+          lastOfferResendAtRef.current = now;
           // The callee joined after our offer already went out (broadcast has
           // no replay), so re-send it now that someone is listening. If the
           // offer isn't generated yet, remember the callee is waiting so the
@@ -1172,6 +1203,7 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
         (rendered !== renderedBeforeStart && rendered.phase === "ended")
       ) {
         trace("create-offer SKIPPED", "call ended or replaced before the credentials came");
+        unansweredReasonRef.current = "offer_skipped";
         return;
       }
       if (!warmIce) sendCommand({ type: "prepare-peer", iceServers: ice.servers });
@@ -1266,7 +1298,8 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
   const listenForOffer = useCallback(
     (call: CallRow) => {
       diagnosticsRef.current = [];
-      trace("listenForOffer", `peerKey=${peerPublicKeyRef.current ? "present" : "MISSING"}`);
+      callStartedAtRef.current = Date.now();
+      trace("listenForOffer", `peerKey=${peerPublicKeyRef.current ? "present" : "MISSING"} build=${APP_BUILD}`);
       warmIceServers();
       // Claim the callee role HERE, not in answerCall. The first outgoing
       // signal ("callee-ready", sent at the end of this function) is encoded
@@ -1381,6 +1414,7 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
     if (!pendingOfferRef.current?.sdp) {
       trace("no offer yet", "waiting — will answer automatically once it arrives");
       acceptRequestedRef.current = true;
+      unansweredReasonRef.current ??= "accepted_no_offer";
       sendSignal({ type: "callee-ready" });
       return;
     }
@@ -1428,6 +1462,7 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
 
       trace("accept from CallKit", "arming deferred answer");
       acceptRequestedRef.current = true;
+      unansweredReasonRef.current ??= "callkit_accepted_no_offer";
       // Tells the caller we're here, so it re-sends the offer if its first
       // broadcast landed before this device joined the channel.
       sendSignal({ type: "callee-ready" });
@@ -1930,7 +1965,8 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
         // Held, not written yet: the outcome this belongs to isn't known
         // until the call ends. A later snapshot (e.g. after an ICE restart)
         // legitimately replaces an earlier one.
-        callStatsRef.current = event;
+        // Only the media-flowing snapshot carries msToMedia; later ones must not erase it.
+        callStatsRef.current = { ...event, msToMedia: event.msToMedia ?? callStatsRef.current?.msToMedia ?? null };
         // Signal bars: loss RATE over the last sample interval (the counters
         // are cumulative) and the current round trip, averaged over three
         // samples (~6s) so the bars don't flicker on a single bad second.
@@ -2103,6 +2139,7 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
           return;
         }
         trace("BRIDGE ERROR", event.message);
+        unansweredReasonRef.current ??= "bridge_error";
         // eslint-disable-next-line no-console
         console.warn("[call engine]", event.message);
         // A media failure is fatal to the call: without a microphone there is

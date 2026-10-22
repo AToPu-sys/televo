@@ -50,6 +50,13 @@ jest.mock("../useE2ee", () => ({
 
 let mockChannel: ReturnType<typeof createFakeChannel>;
 let mockCallsTable: ReturnType<typeof createFakeCallsTable>;
+const mockDiagnosticsRows: { outcome?: string }[] = [];
+const mockDiagnostics = {
+  insert: async (row: { outcome?: string }) => {
+    mockDiagnosticsRows.push(row);
+    return { error: null };
+  },
+};
 
 jest.mock("../../lib/supabase", () => ({
   supabase: {
@@ -57,6 +64,7 @@ jest.mock("../../lib/supabase", () => ({
     removeChannel: jest.fn(async () => "ok"),
     from: (table: string) => {
       if (table === "calls") return mockCallsTable;
+      if (table === "call_diagnostics") return mockDiagnostics;
       throw new Error(`unexpected table in test: ${table}`);
     },
   },
