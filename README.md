@@ -1,4 +1,4 @@
-# Televo —  Messenger
+# Televo Messenger
 
 A messenger built with React Native and a Supabase backend, targeting
 rough feature parity with Telegram circa 2016: real accounts, real chats
