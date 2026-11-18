@@ -19,15 +19,7 @@ import { createClient } from "jsr:@supabase/supabase-js@2";
 
 type Payload = { request_id: string };
 
-// Disabled: the waiting device receives the session over a public broadcast
-// channel whose topic anyone can learn, so the tokens could be intercepted.
-// Re-enable only once they are encrypted to a key held by that device.
-const QR_LOGIN_ENABLED = false;
-
 Deno.serve(async (req) => {
-  if (!QR_LOGIN_ENABLED) {
-    return new Response("qr_login_disabled", { status: 503 });
-  }
   const authHeader = req.headers.get("Authorization");
   if (!authHeader) {
     return new Response("unauthorized", { status: 401 });
