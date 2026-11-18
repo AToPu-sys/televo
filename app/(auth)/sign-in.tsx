@@ -253,6 +253,7 @@ export default function SignInScreen() {
               onChangeText={setEmail}
               autoCapitalize="none"
               autoComplete="email"
+              textContentType="username"
               keyboardType="email-address"
               placeholder="you@example.com"
             />
@@ -264,6 +265,7 @@ export default function SignInScreen() {
                 secureTextEntry
                 autoCapitalize="none"
                 autoComplete={isSignUp ? "new-password" : "current-password"}
+                textContentType={isSignUp ? "newPassword" : "password"}
                 placeholder="••••••••"
               />
             ) : (

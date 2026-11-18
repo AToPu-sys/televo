@@ -24,9 +24,10 @@
           "remote-notification"
         ]
       },
-      "buildNumber": "101",
+      "buildNumber": "102",
       "associatedDomains": [
-        "applinks:gettelevo.space"
+        "applinks:gettelevo.space",
+        "webcredentials:gettelevo.space"
       ]
     },
     "android": {
