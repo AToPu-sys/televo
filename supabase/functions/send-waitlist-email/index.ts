@@ -65,7 +65,7 @@ Deno.serve(async (req) => {
           {
             icon: "🔒",
             title: "Secret Chats only you can read",
-            body: "Keys are generated on your phone and never touch our servers — not even we can read them.",
+            body: "Secret Chat keys are made on your phone and never leave it, so not even we can read them. Regular chats sync everywhere and are stored encrypted on our servers.",
           },
           {
             icon: "📞",
