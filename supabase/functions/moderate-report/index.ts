@@ -25,7 +25,7 @@ type ReportRecord = {
   reporter_id: string;
   reported_user_id: string;
   reason: string;
-  reported_content: string | null;
+  message_id: string | null;
 };
 
 /** True for text that is still a ciphertext envelope rather than readable
@@ -178,13 +178,12 @@ Deno.serve(async (req) => {
     Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
   );
 
-  const content = record.reported_content ?? "";
-
-  // Nothing readable to judge: leave it pending for a human rather than
-  // guessing. Silently dismissing these would let real abuse through
-  // whenever the reporter's device hadn't decrypted the message yet.
-  if (!content.trim() || isCiphertext(content)) {
-    return new Response("left for human review: no readable content", { status: 200 });
+  // Judge the stored message, never text supplied by the reporter: a report's
+  // own copy can say anything. Secret Chats are unreadable here by design and
+  // go to a human, as does anything that isn't plain text.
+  const content = await storedMessageText(admin, record);
+  if (!content || !content.trim() || isCiphertext(content)) {
+    return new Response("left for human review: no readable stored message", { status: 200 });
   }
 
   let verdict: { severity: Severity; rationale: string };
@@ -222,3 +221,24 @@ Deno.serve(async (req) => {
     headers: { "content-type": "application/json" },
   });
 });
+
+async function storedMessageText(
+  admin: ReturnType<typeof createClient>,
+  record: ReportRecord
+): Promise<string | null> {
+  if (!record.message_id) return null;
+  const { data: message } = await admin
+    .from("messages")
+    .select("body, kind, sender_id, conversation_id")
+    .eq("id", record.message_id)
+    .maybeSingle();
+  if (!message || message.kind !== "text" || !message.body || message.sender_id !== record.reported_user_id) return null;
+  const { data: conversation } = await admin
+    .from("conversations")
+    .select("is_encrypted")
+    .eq("id", message.conversation_id)
+    .maybeSingle();
+  if (!conversation || conversation.is_encrypted) return null;
+  const { data: text } = await admin.rpc("decrypt_message_body", { p_ciphertext: message.body });
+  return typeof text === "string" ? text : null;
+}
