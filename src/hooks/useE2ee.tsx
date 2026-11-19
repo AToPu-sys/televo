@@ -259,7 +259,8 @@ export function E2eeProvider({
       // trust-on-first-use, same as every other app doing this without an
       // out-of-band verification step at signup.
       const trusted = await getTrustedPeerKey(conversationId);
-      if (trusted && trusted !== data.sender_public_key) {
+      const foreign = await isForeignWrapKey(conversationId, userId, keyPair.publicKey, data.sender_public_key);
+      if (foreign || (trusted && trusted !== data.sender_public_key)) {
         setPeerKeyChanged((current) => new Set(current).add(conversationId));
       } else if (!trusted) {
         await setTrustedPeerKey(conversationId, data.sender_public_key);
@@ -882,4 +883,30 @@ export function useE2ee() {
     throw new Error("useE2ee must be used within an E2eeProvider");
   }
   return context;
+}
+
+/**
+ * In a direct chat the session key can only have been wrapped by this device
+ * or by the peer, so a wrap from any other key is someone in the middle, even
+ * on first contact, before trust-on-first-use has anything to compare with.
+ * Unknown (offline, group chat, peer without a key yet) is not foreign.
+ */
+async function isForeignWrapKey(
+  conversationId: string,
+  userId: string,
+  ownPublicKey: string,
+  wrapKey: string
+): Promise<boolean> {
+  if (wrapKey === ownPublicKey) return false;
+  const { data: conversation } = await supabase.from("conversations").select("kind").eq("id", conversationId).maybeSingle();
+  if (conversation?.kind !== "direct") return false;
+  const { data: other } = await supabase
+    .from("conversation_participants")
+    .select("user_id")
+    .eq("conversation_id", conversationId)
+    .neq("user_id", userId)
+    .maybeSingle();
+  if (!other) return false;
+  const { data: profile } = await supabase.from("profiles").select("e2e_public_key").eq("id", other.user_id).maybeSingle();
+  return !!profile?.e2e_public_key && profile.e2e_public_key !== wrapKey;
 }

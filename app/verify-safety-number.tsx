@@ -1,7 +1,7 @@
 import { Ionicons } from "@expo/vector-icons";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { useEffect, useState } from "react";
-import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { ActivityIndicator, Alert, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
 import { Button } from "../src/components/Button";
@@ -65,7 +65,32 @@ export default function VerifySafetyNumberScreen() {
   }, [publicKey, peerId]);
 
   async function handleConfirmMatch() {
-    if (!conversationId || !peerPublicKey) return;
+    if (!conversationId || !peerPublicKey || !user) return;
+    // The safety number covers profile keys, but the chat is encrypted with
+    // whatever key wrapped this device's session key. Trust only if that is
+    // this device's own key or the peer key just compared, and the peer
+    // really is in this chat (the screen's params can come from a link).
+    const [{ data: member }, { data: wrap }] = await Promise.all([
+      supabase
+        .from("conversation_participants")
+        .select("user_id")
+        .eq("conversation_id", conversationId)
+        .eq("user_id", peerId)
+        .maybeSingle(),
+      supabase
+        .from("encrypted_session_keys")
+        .select("sender_public_key")
+        .eq("conversation_id", conversationId)
+        .eq("recipient_id", user.id)
+        .maybeSingle(),
+    ]);
+    if (!member || (wrap && wrap.sender_public_key !== publicKey && wrap.sender_public_key !== peerPublicKey)) {
+      Alert.alert(
+        "The keys don't match",
+        `This chat is encrypted with a key that is neither yours nor ${peerName ?? "this person"}'s. Someone may be intercepting it. Don't share anything sensitive here and check with them another way.`
+      );
+      return;
+    }
     await setPeerKeyVerified(conversationId, peerPublicKey);
     // This is the ONE place a changed key may be re-trusted — the user just
     // compared the safety number out of band and confirmed it matches, the
