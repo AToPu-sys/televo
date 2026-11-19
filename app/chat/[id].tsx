@@ -205,12 +205,16 @@ export default function ConversationScreen() {
     }
   }
 
+  // finishVoice is memoised above the key-change state; it reads the current check through this.
+  const confirmSendRef = useRef<() => Promise<boolean>>(() => Promise.resolve(true));
   const finishVoice = useCallback(async () => {
     if (voiceSending) return;
     setVoiceSending(true);
     try {
       const recording = await voice.finish();
-      if (recording) await sendVoice(recording.uri, recording.durationMs, recording.waveform);
+      if (recording && (await confirmSendRef.current())) {
+        await sendVoice(recording.uri, recording.durationMs, recording.waveform);
+      }
     } catch {
       showToast({ kind: "error", message: "Voice message couldn't be sent. Tap it to see details." });
     } finally {
@@ -236,6 +240,43 @@ export default function ConversationScreen() {
     ready: e2eeReady,
   } = useE2ee();
   const keyChanged = isEncrypted && peerKeyChanged.has(id);
+
+  // A changed key in a Secret Chat can be a reinstall or someone in the middle;
+  // nothing leaves until the user verifies or knowingly sends anyway.
+  function confirmSendDespiteKeyChange(): Promise<boolean> {
+    if (!keyChanged) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      Alert.alert(
+        `${title}'s encryption key changed`,
+        "Compare safety numbers before sending. Send anyway only if you know why it changed, for example they reinstalled Televo.",
+        [
+          { text: "Cancel", style: "cancel", onPress: () => resolve(false) },
+          {
+            text: "Verify",
+            onPress: () => {
+              resolve(false);
+              if (conversation?.otherUserId) {
+                router.push({
+                  pathname: "/verify-safety-number" as never,
+                  params: { peerId: conversation.otherUserId, peerName: title, conversationId: id },
+                });
+              }
+            },
+          },
+          {
+            text: "Send anyway",
+            style: "destructive",
+            onPress: () => {
+              acknowledgeKeyChange(id);
+              resolve(true);
+            },
+          },
+        ],
+        { cancelable: true, onDismiss: () => resolve(false) }
+      );
+    });
+  }
+  confirmSendRef.current = confirmSendDespiteKeyChange;
   // Two encryption tiers, deliberately not both shown the same way: every
   // chat is end-to-end encrypted the moment it can be (see the auto-encrypt
   // effect below) with no icon at all, because it's the invisible baseline
@@ -640,6 +681,7 @@ export default function ConversationScreen() {
   async function handleSend() {
     const body = draft.trim();
     if (!body || sending) return;
+    if (!editTarget && !(await confirmSendDespiteKeyChange())) return;
     setDraft("");
     setSending(true);
     try {
@@ -681,6 +723,7 @@ export default function ConversationScreen() {
   }
 
   async function handleAttachImage() {
+    if (!(await confirmSendDespiteKeyChange())) return;
     // pickerBusyRef, not `attaching`: `attaching` is only set once the
     // picker RESOLVES, so a second tap in the meantime slipped through and
     // launched a second picker ("Different document picking in progress").
@@ -734,6 +777,7 @@ export default function ConversationScreen() {
   }
 
   async function handleAttachDocument() {
+    if (!(await confirmSendDespiteKeyChange())) return;
     if (pickerBusyRef.current) return;
     pickerBusyRef.current = true;
     try {
