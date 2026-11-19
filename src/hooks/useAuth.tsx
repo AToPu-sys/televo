@@ -16,6 +16,7 @@ import { clearOutbox } from "../lib/outbox";
 import { resetIceServers } from "../lib/iceServers";
 import { wipeSharedSessionKeys } from "../lib/notificationKeys";
 import { supabase } from "../lib/supabase";
+import { expectAuthLink } from "../lib/authLinkGuard";
 
 /** Verifies a password against the CURRENT account without disturbing the
  * live session — unlike verifyPasswordOnly (below), which signs out
@@ -215,6 +216,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       password: string,
       profile: { username: string; displayName: string; phone?: string }
     ) => {
+      await expectAuthLink();
       const { data, error } = await supabase.auth.signUp({
         email: email.trim(),
         password,
@@ -294,6 +296,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const sendPasswordReset = useCallback(async (email: string) => {
+    await expectAuthLink();
     const { error } = await supabase.auth.resetPasswordForEmail(email.trim(), {
       // A Universal Link (Apple's App Site Association at
       // gettelevo.space/.well-known/apple-app-site-association, paths
@@ -315,6 +318,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const resendConfirmation = useCallback(async (email: string) => {
+    await expectAuthLink();
     const { error } = await supabase.auth.resend({
       type: "signup",
       email: email.trim(),
@@ -343,6 +347,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
    * handles. Nothing else to do here — there's no separate "confirm change"
    * step in this app beyond opening that link. */
   const changeEmail = useCallback(async (newEmail: string) => {
+    await expectAuthLink();
     const { error } = await supabase.auth.updateUser(
       { email: newEmail.trim() },
       // See sendPasswordReset's comment on the Universal Link switch.

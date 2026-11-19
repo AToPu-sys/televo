@@ -40,6 +40,7 @@ import { useBanStatus } from "../src/hooks/useBanStatus";
 import { CallManagerProvider, useCallManager } from "../src/hooks/useCallManager";
 import { E2eeProvider } from "../src/hooks/useE2ee";
 import { supabase } from "../src/lib/supabase";
+import { mayApplyAuthLink } from "../src/lib/authLinkGuard";
 import { usePresenceHeartbeat } from "../src/hooks/usePresence";
 import { MessageNotificationsProvider } from "../src/hooks/useMessageNotifications";
 import { usePushNotifications } from "../src/hooks/usePushNotifications";
@@ -160,6 +161,17 @@ function useAuthDeepLinks() {
       const accessToken = params.get("access_token");
       const refreshToken = params.get("refresh_token");
       if (accessToken && refreshToken) {
+        const { data: current } = await supabase.auth.getSession();
+        if (!(await mayApplyAuthLink(accessToken, current.session?.user.id ?? null))) {
+          show({
+            kind: "error",
+            message: "This link can't be used here",
+            detail: current.session
+              ? "It belongs to a different account."
+              : "Open the link on the device where you asked for it, or enter the 6-digit code.",
+          });
+          return;
+        }
         const { error } = await supabase.auth.setSession({
           access_token: accessToken,
           refresh_token: refreshToken,
