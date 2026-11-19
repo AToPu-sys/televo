@@ -16,6 +16,10 @@
 // user_id).
 import "@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
+import nacl from "npm:tweetnacl@1.0.3";
+
+const b64 = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes));
+const unb64 = (text: string) => Uint8Array.from(atob(text), (c) => c.charCodeAt(0));
 
 type Payload = { request_id: string };
 
@@ -58,7 +62,7 @@ Deno.serve(async (req) => {
   // client-side call sequence was somehow skipped or reordered.
   const { data: request, error: fetchError } = await admin
     .from("qr_login_requests")
-    .select("status, scanned_by_user_id, expires_at")
+    .select("status, scanned_by_user_id, expires_at, device_public_key")
     .eq("id", payload.request_id)
     .single();
 
@@ -121,12 +125,22 @@ Deno.serve(async (req) => {
   await channel.send({
     type: "broadcast",
     event: "session",
-    payload: {
+    payload: sealForDevice(request.device_public_key, {
       access_token: sessionData.session.access_token,
       refresh_token: sessionData.session.refresh_token,
-    },
+    }),
   });
   await admin.removeChannel(channel);
 
   return new Response("ok", { status: 200 });
 });
+
+// Seals the session to the waiting device's one-time key; requests from builds
+// without a key still get it in the clear (their ids are no longer listable).
+function sealForDevice(devicePublicKey: string | null, tokens: Record<string, string>): Record<string, string> {
+  if (!devicePublicKey) return tokens;
+  const ephemeral = nacl.box.keyPair();
+  const nonce = nacl.randomBytes(nacl.box.nonceLength);
+  const sealed = nacl.box(new TextEncoder().encode(JSON.stringify(tokens)), nonce, unb64(devicePublicKey), ephemeral.secretKey);
+  return { sealed: b64(sealed), nonce: b64(nonce), server_public_key: b64(ephemeral.publicKey) };
+}

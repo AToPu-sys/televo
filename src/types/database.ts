@@ -1357,7 +1357,7 @@ export type Database = {
         Args: { topic: string }
         Returns: string
       }
-      create_qr_login_request: { Args: never; Returns: string }
+      create_qr_login_request: { Args: { p_device_public_key?: string }; Returns: string }
       delete_expired_messages: { Args: never; Returns: number }
       delete_own_account: { Args: never; Returns: undefined }
       deny_qr_login: { Args: { p_request_id: string }; Returns: undefined }

@@ -3,11 +3,31 @@ import { useRouter } from "expo-router";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ActivityIndicator, Pressable, StyleSheet, Text, View } from "react-native";
 import QRCode from "react-native-qrcode-svg";
+import nacl from "tweetnacl";
+import naclUtil from "tweetnacl-util";
 import { SafeAreaView } from "react-native-safe-area-context";
 
 import { useTheme } from "../../src/hooks/useTheme";
 import { supabase } from "../../src/lib/supabase";
 import { spacing } from "../../src/theme";
+
+const { decodeBase64, encodeBase64, encodeUTF8 } = naclUtil;
+
+type SealedSession = { sealed?: string; nonce?: string; server_public_key?: string };
+
+/** Opens the session qr-login-exchange sealed to this screen's one-time key. */
+function openSession(payload: SealedSession, keyPair: nacl.BoxKeyPair | null) {
+  if (!keyPair || !payload.sealed || !payload.nonce || !payload.server_public_key) return null;
+  const opened = nacl.box.open(
+    decodeBase64(payload.sealed),
+    decodeBase64(payload.nonce),
+    decodeBase64(payload.server_public_key),
+    keyPair.secretKey
+  );
+  if (!opened) return null;
+  const tokens = JSON.parse(encodeUTF8(opened)) as { access_token?: string; refresh_token?: string };
+  return tokens.access_token && tokens.refresh_token ? tokens : null;
+}
 
 type Phase = "loading" | "waiting" | "scanned" | "signing-in" | "denied" | "expired" | "error";
 
@@ -37,10 +57,17 @@ export default function QrSignInScreen() {
   const [phase, setPhase] = useState<Phase>("loading");
   const [requestId, setRequestId] = useState<string | null>(null);
   const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
+  // One-time key for this QR code: the session is sealed to it, so only this
+  // screen can read what arrives on the broadcast topic.
+  const keyPairRef = useRef<nacl.BoxKeyPair | null>(null);
 
   const start = useCallback(async () => {
     setPhase("loading");
-    const { data, error } = await supabase.rpc("create_qr_login_request");
+    const keyPair = nacl.box.keyPair();
+    keyPairRef.current = keyPair;
+    const { data, error } = await supabase.rpc("create_qr_login_request", {
+      p_device_public_key: encodeBase64(keyPair.publicKey),
+    });
     if (error || !data) {
       setPhase("error");
       return;
@@ -68,10 +95,15 @@ export default function QrSignInScreen() {
         }
       )
       .on("broadcast", { event: "session" }, async ({ payload }) => {
+        const tokens = openSession(payload as SealedSession, keyPairRef.current);
+        if (!tokens) {
+          setPhase("error");
+          return;
+        }
         setPhase("signing-in");
         const { error } = await supabase.auth.setSession({
-          access_token: payload.access_token,
-          refresh_token: payload.refresh_token,
+          access_token: tokens.access_token!,
+          refresh_token: tokens.refresh_token!,
         });
         if (error) {
           setPhase("error");
