@@ -46,4 +46,41 @@ final class TelevoCallNativeView: ExpoView {
     addSubview(controller.view)
     host = controller
   }
+
+  // The hosting controller must be a real child of the view controller that
+  // shows this view. Its view used to be added on its own, outside the view
+  // controller hierarchy; when the call's Modal was dismissed, UIKit met that
+  // orphaned controller's view in the middle of the dismissal transition and
+  // aborted with an assertion in UIViewControllerBuiltinTransitionViewAnimator
+  // ("the app crashes after every call", build 90 onward).
+  override func didMoveToWindow() {
+    super.didMoveToWindow()
+    guard let host = host else { return }
+    if window != nil {
+      if host.parent == nil, let parent = owningViewController() {
+        parent.addChild(host)
+        host.didMove(toParent: parent)
+      }
+    } else if host.parent != nil {
+      host.willMove(toParent: nil)
+      host.removeFromParent()
+    }
+  }
+
+  override func removeFromSuperview() {
+    if let host = host, host.parent != nil {
+      host.willMove(toParent: nil)
+      host.removeFromParent()
+    }
+    super.removeFromSuperview()
+  }
+
+  private func owningViewController() -> UIViewController? {
+    var responder: UIResponder? = self.next
+    while let current = responder {
+      if let controller = current as? UIViewController, controller !== host { return controller }
+      responder = current.next
+    }
+    return nil
+  }
 }

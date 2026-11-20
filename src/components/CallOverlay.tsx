@@ -1204,7 +1204,11 @@ export function CallOverlay({
         {/* iOS voice calls: the native SwiftUI screen, drawn over the React
             Native one (which stays mounted underneath, WebRtcBridge
             included). Video calls and Android keep the screen above. */}
-        {isNativeCallScreenAvailable && !isVideo && !minimized ? (
+        {/* Not during "ended": the native screen is taken down while the
+            Modal is still up, so it never tears down in the same transition
+            as the Modal itself (see TelevoCallViewModule.swift). The React
+            Native screen underneath shows "Call ended" meanwhile. */}
+        {isNativeCallScreenAvailable && !isVideo && !minimized && state.phase !== "ended" ? (
           <TelevoCallView
             style={StyleSheet.absoluteFill}
             peerName={peerName}

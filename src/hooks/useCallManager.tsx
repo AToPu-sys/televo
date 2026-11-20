@@ -374,6 +374,10 @@ export function CallManagerProvider({ children }: { children: ReactNode }) {
 
   const placeCall = useCallback(
     async (conversationId: string, kind: CallKind) => {
+      // Same as an incoming call: a keyboard left up in the chat would be
+      // restored by UIKit while the call's Modal is dismissed, inside the
+      // same transition.
+      Keyboard.dismiss();
       // Calls need the native WebRTC module, which Expo Go does not ship.
       // Saying so is better than starting a call that can never open the
       // microphone and appears to hang.
