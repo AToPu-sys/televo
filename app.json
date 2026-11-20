@@ -24,7 +24,7 @@
           "remote-notification"
         ]
       },
-      "buildNumber": "104",
+      "buildNumber": "105",
       "associatedDomains": [
         "applinks:gettelevo.space",
         "webcredentials:gettelevo.space"
@@ -65,7 +65,7 @@
         "monochromeImage": "./assets/android-icon-monochrome.png"
       },
       "predictiveBackGestureEnabled": false,
-      "versionCode": 105,
+      "versionCode": 106,
       "blockedPermissions": [
         "android.permission.SYSTEM_ALERT_WINDOW",
         "android.permission.WRITE_CONTACTS",
