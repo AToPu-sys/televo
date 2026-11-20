@@ -463,6 +463,39 @@ export type Database = {
         }
         Relationships: []
       }
+      ban_appeals: {
+        Row: {
+          id: string
+          user_id: string
+          message: string
+          status: string
+          notice_message_ids: string[]
+          created_at: string
+          decided_at: string | null
+          decided_by: string | null
+        }
+        Insert: {
+          id?: string
+          user_id: string
+          message: string
+          status?: string
+          notice_message_ids?: string[]
+          created_at?: string
+          decided_at?: string | null
+          decided_by?: string | null
+        }
+        Update: {
+          id?: string
+          user_id?: string
+          message?: string
+          status?: string
+          notice_message_ids?: string[]
+          created_at?: string
+          decided_at?: string | null
+          decided_by?: string | null
+        }
+        Relationships: []
+      }
       content_reports: {
         Row: {
           conversation_id: string | null
@@ -1357,6 +1390,7 @@ export type Database = {
         Args: { topic: string }
         Returns: string
       }
+      submit_ban_appeal: { Args: { p_message: string }; Returns: string }
       create_qr_login_request: { Args: { p_device_public_key?: string }; Returns: string }
       delete_expired_messages: { Args: never; Returns: number }
       delete_own_account: { Args: never; Returns: undefined }

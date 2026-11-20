@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { AppState } from "react-native";
 
 import { supabase } from "../lib/supabase";
 
@@ -8,12 +9,14 @@ export type BanStatus = {
   bannedReason: string | null;
 };
 
-/** Polled rather than realtime-subscribed: a ban is rare and not
- * time-sensitive the way a message is — the user finds out the moment they
- * next try to act (send a message, place a call) and enforce_ban_on_message/
- * enforce_ban_on_call already reject that server-side regardless of whether
- * this hook has caught up yet. This exists to explain WHY, not to enforce
- * anything itself. */
+/** Enforcement is server-side (enforce_ban_on_message / enforce_ban_on_call);
+ * this only explains WHY sending fails and gets out of the way once a ban
+ * ends. It used to load once, so a suspension lifted by a moderator (or one
+ * that simply ran out) kept the app behind the ban screen until a restart.
+ * Now it re-checks every 30 s while suspended, and whenever the app comes
+ * back to the foreground. */
+const BANNED_POLL_MS = 30_000;
+
 export function useBanStatus(userId: string | undefined) {
   const [status, setStatus] = useState<BanStatus | null>(null);
 
@@ -23,6 +26,7 @@ export function useBanStatus(userId: string | undefined) {
       return;
     }
     let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
     const id = userId;
 
     async function load() {
@@ -33,15 +37,20 @@ export function useBanStatus(userId: string | undefined) {
         .maybeSingle();
       if (cancelled) return;
       const until = data?.banned_until ?? null;
-      setStatus({
-        bannedUntil: until && new Date(until).getTime() > Date.now() ? until : null,
-        bannedReason: data?.banned_reason ?? null,
-      });
+      const active = !!until && new Date(until).getTime() > Date.now();
+      setStatus({ bannedUntil: active ? until : null, bannedReason: data?.banned_reason ?? null });
+      if (timer) clearTimeout(timer);
+      timer = active ? setTimeout(() => void load(), BANNED_POLL_MS) : null;
     }
 
     void load();
+    const sub = AppState.addEventListener("change", (state) => {
+      if (state === "active") void load();
+    });
     return () => {
       cancelled = true;
+      if (timer) clearTimeout(timer);
+      sub.remove();
     };
   }, [userId]);
 
