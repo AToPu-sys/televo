@@ -32,6 +32,7 @@
     },
     "android": {
       "package": "com.televo.app",
+      "allowBackup": false,
       "googleServicesFile": "./google-services.json",
       "permissions": [
         "android.permission.POST_NOTIFICATIONS",
@@ -47,7 +48,7 @@
         "monochromeImage": "./assets/android-icon-monochrome.png"
       },
       "predictiveBackGestureEnabled": false,
-      "versionCode": 87
+      "versionCode": 103
     },
     "web": {
       "favicon": "./assets/favicon.png",
