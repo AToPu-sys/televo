@@ -135,6 +135,13 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
   // it from the caller's first signal, then reused for every later signal in
   // this call. Reset in cleanup() so a new call doesn't inherit a stale one.
   const callKemSecretRef = useRef<Uint8Array | null>(null);
+  // Televo Web holds no profile keypair, so it can neither open signals
+  // sealed to the profile key nor seal its own. It marks every signal
+  // plaintextOnly; seeing that, this side stops encrypting for the rest of
+  // the call (the media is still DTLS-SRTP end to end).
+  const peerPlaintextOnlyRef = useRef(false);
+  // sendSignal is defined after decodeFromWire; reached through this ref.
+  const sendSignalRef = useRef<((signal: Signal) => void) | null>(null);
   // The ciphertext this device generated (if it's the caller) still needs
   // attaching to exactly one outgoing signal — the first one actually sent,
   // whichever type that turns out to be (normally the offer, but callee-ready
@@ -598,6 +605,7 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
     // ciphertext that was never sent for THIS call.
     callKemSecretRef.current = null;
     pendingKemCiphertextRef.current = null;
+    peerPlaintextOnlyRef.current = false;
     // Or the next call would await a resolved promise from the previous one
     // and skip minting its own secret entirely.
     kemMintRef.current = null;
@@ -718,7 +726,15 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
   // the app that publishes one) rather than dropping the call outright; the
   // media itself is still protected either way by WebRTC's own DTLS-SRTP.
   const encodeForWire = useCallback(
-    async (signal: Signal): Promise<{ encrypted: SignalEnvelope } | { plain: Signal }> => {
+    async (signal: Signal): Promise<{ encrypted: SignalEnvelope } | { plain: Signal; plaintextOnly?: boolean }> => {
+      if (Platform.OS === "web") {
+        trace(`send:${signal.type}`, "plaintext (web has no profile key)");
+        return { plain: signal, plaintextOnly: true };
+      }
+      if (peerPlaintextOnlyRef.current) {
+        trace(`send:${signal.type}`, "plaintext (peer is on the web)");
+        return { plain: signal };
+      }
       const peerKey = peerPublicKeyRef.current;
       if (peerKey) {
         // ONLY the caller mints the call's hybrid secret. An ML-KEM
@@ -795,7 +811,7 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
   );
 
   const decodeFromWire = useCallback(
-    async (payload: { encrypted: SignalEnvelope } | { plain: Signal }): Promise<Signal | null> => {
+    async (payload: { encrypted: SignalEnvelope } | { plain: Signal; plaintextOnly?: boolean }): Promise<Signal | null> => {
       // Accept plaintext unconditionally: the peer either has no key for us
       // or hasn't finished loading its own. Deliberately does NOT flip this
       // side to plaintext — inferring the mode from whichever message
@@ -804,6 +820,17 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
       // already been dropped by then. Each side simply encrypts whenever it
       // can and reads whatever it is sent.
       if ("plain" in payload) {
+        if (payload.plaintextOnly && !peerPlaintextOnlyRef.current) {
+          // The peer is Televo Web: everything this side sent encrypted so
+          // far was unreadable to it. Switch to plaintext and, as the callee
+          // still waiting for an offer, ask for it again — the caller's
+          // callee-ready handler re-sends the offer.
+          peerPlaintextOnlyRef.current = true;
+          trace("peer is on the web", "switching signals to plaintext");
+          if (roleRef.current === "callee" && payload.plain.type !== "offer" && stateRef.current.phase !== "active") {
+            sendSignalRef.current?.({ type: "callee-ready" } as Signal);
+          }
+        }
         trace(`recv:${payload.plain.type}`, "plaintext");
         return payload.plain;
       }
@@ -911,6 +938,7 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
     },
     [encodeForWire, trace]
   );
+  sendSignalRef.current = sendSignal;
 
   /** Like sendSignal, but resolves once the broadcast has actually been
    * handed off — used before cleanup() tears the channel down. */
@@ -974,7 +1002,7 @@ export function useCall(userId: string | undefined, peerPublicKey?: string | nul
         .on(
           "broadcast",
           { event: "signal" },
-          ({ payload }: { payload: { encrypted: SignalEnvelope } | { plain: Signal } }) => {
+          ({ payload }: { payload: { encrypted: SignalEnvelope } | { plain: Signal; plaintextOnly?: boolean } }) => {
             // A signal that fails to decrypt (wrong/stale peer key) is
             // dropped rather than crashing the call state machine on it —
             // the existing signal-loss recovery paths (callee-ready
