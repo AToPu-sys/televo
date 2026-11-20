@@ -1,7 +1,7 @@
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { ActivityIndicator, Alert, FlatList, Pressable, StyleSheet, Text, View } from "react-native";
+import { ActivityIndicator, Alert, FlatList, Platform, Pressable, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
 import { useAuth } from "../src/hooks/useAuth";
@@ -114,6 +114,9 @@ export default function DevicesScreen() {
         <View style={styles.headerSpacer} />
       </View>
 
+      {/* A browser can't scan (the camera is off for Televo Web): new devices
+          are connected from the phone. */}
+      {Platform.OS !== "web" ? (
       <Pressable
         onPress={() => router.push("/scan-qr-login")}
         accessibilityRole="button"
@@ -123,6 +126,7 @@ export default function DevicesScreen() {
         <Ionicons name="qr-code-outline" size={20} color="#FFFFFF" />
         <Text style={styles.connectButtonText}>Connect Device</Text>
       </Pressable>
+      ) : null}
 
       <Text style={[styles.hint, { color: theme.textSecondary }]}>
         Every device signed in on this account. Ending a session signs that device out

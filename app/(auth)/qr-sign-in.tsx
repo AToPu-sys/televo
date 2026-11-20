@@ -1,7 +1,7 @@
 import { Ionicons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ActivityIndicator, Pressable, StyleSheet, Text, View } from "react-native";
+import { ActivityIndicator, Platform, Pressable, StyleSheet, Text, View } from "react-native";
 import QRCode from "react-native-qrcode-svg";
 import nacl from "tweetnacl";
 import naclUtil from "tweetnacl-util";
@@ -149,8 +149,9 @@ export default function QrSignInScreen() {
               <QRCode value={`televo://qr-login/${requestId}`} size={220} />
             </View>
             <Text style={[styles.instructions, { color: theme.text }]}>
-              Open Televo on your other phone, go to Settings → Devices → Connect Device, and scan
-              this code.
+              {Platform.OS === "web"
+                ? "Open Televo on your phone, go to Settings → Devices → Connect Device, and point the camera at this code."
+                : "Open Televo on your other phone, go to Settings → Devices → Connect Device, and scan this code."}
             </Text>
           </>
         ) : phase === "scanned" ? (

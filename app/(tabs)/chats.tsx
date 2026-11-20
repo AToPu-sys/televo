@@ -18,8 +18,28 @@ import { useAuth } from "../../src/hooks/useAuth";
 import { useChats, type ChatSummary } from "../../src/hooks/useChats";
 import { useTheme } from "../../src/hooks/useTheme";
 import { radius, spacing } from "../../src/theme";
+import { useWideWeb } from "../../src/hooks/useWideWeb";
 
-export default function ChatsScreen() {
+/** The Chats tab. On a wide browser window the list already sits in the
+ * left sidebar (app/_layout.tsx), so the tab itself shows a prompt instead. */
+export default function ChatsRoute() {
+  const wide = useWideWeb();
+  if (wide) return <SelectChatPlaceholder />;
+  return <ChatsList />;
+}
+
+function SelectChatPlaceholder() {
+  const { theme } = useTheme();
+  return (
+    <View style={{ flex: 1, alignItems: "center", justifyContent: "center", backgroundColor: theme.background, gap: 10 }}>
+      <Ionicons name="chatbubbles-outline" size={48} color={theme.textSecondary} />
+      <Text style={{ color: theme.text, fontSize: 18, fontWeight: "600" }}>Select a chat</Text>
+      <Text style={{ color: theme.textSecondary, fontSize: 14 }}>Pick a conversation on the left to start messaging.</Text>
+    </View>
+  );
+}
+
+export function ChatsList() {
   const { theme } = useTheme();
   const { user } = useAuth();
   const router = useRouter();

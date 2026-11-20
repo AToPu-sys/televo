@@ -52,6 +52,8 @@ import {
   setCrashContextScreen,
   uploadPendingCrashReports,
 } from "../src/lib/crashReporter";
+import { ChatsList } from "./(tabs)/chats";
+import { useWideWeb } from "../src/hooks/useWideWeb";
 
 // Before anything else can throw.
 installCrashReporter();
@@ -200,6 +202,8 @@ function RootNavigator() {
   const router = useRouter();
   const { minimized } = useCallManager();
   const banStatus = useBanStatus(user?.id);
+  const wideWeb = useWideWeb();
+  const showSidebar = wideWeb && !!session && segments[0] !== "(auth)" && !needsMfaChallenge && !recoveringPassword;
   useAuthDeepLinks();
 
   // Which screen a crash happened on, attached to every crash report.
@@ -296,7 +300,19 @@ function RootNavigator() {
           its height. This is the same idea done manually: push the WHOLE
           navigator down by the bar's height so nothing underneath is ever
           covered, exactly like a real call-in-progress status bar. */}
-      <View style={{ flex: 1, paddingTop: minimized ? MINIMIZED_BAR_BOTTOM : 0 }}>
+      <View
+        style={[
+          { flex: 1, paddingTop: minimized ? MINIMIZED_BAR_BOTTOM : 0 },
+          showSidebar ? { flexDirection: "row" } : null,
+        ]}
+      >
+        {/* Televo Web on a wide window: the chat list stays on the left. */}
+        {showSidebar ? (
+          <View style={{ width: 360, borderRightWidth: 1, borderRightColor: theme.border }}>
+            <ChatsList />
+          </View>
+        ) : null}
+        <View style={{ flex: 1 }}>
         <Stack screenOptions={{ headerShown: false }}>
           <Stack.Screen name="(auth)" />
           <Stack.Screen name="auth/confirm" />
@@ -318,6 +334,7 @@ function RootNavigator() {
           <Stack.Screen name="user-profile" options={{ presentation: "modal" }} />
           <Stack.Screen name="group-info" options={{ presentation: "modal" }} />
         </Stack>
+        </View>
       </View>
       {session ? <GlobalCallOverlay /> : null}
       {/* Above the call overlay so a failure during a call is still visible,
