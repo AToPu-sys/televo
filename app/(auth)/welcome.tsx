@@ -22,7 +22,7 @@ export default function WelcomeScreen() {
           Fast · Secure · Simple
         </Text>
         <Text style={[styles.subtitle, { color: theme.textSecondary }]}>
-          End-to-end encrypted messages and calls.
+          Private messages and calls. Secret Chats only the two of you can read.
         </Text>
       </View>
 
