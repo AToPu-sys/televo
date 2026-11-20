@@ -33,6 +33,23 @@
     "android": {
       "package": "com.televo.app",
       "allowBackup": false,
+      "intentFilters": [
+        {
+          "action": "VIEW",
+          "autoVerify": true,
+          "data": [
+            {
+              "scheme": "https",
+              "host": "gettelevo.space",
+              "pathPrefix": "/auth/"
+            }
+          ],
+          "category": [
+            "BROWSABLE",
+            "DEFAULT"
+          ]
+        }
+      ],
       "googleServicesFile": "./google-services.json",
       "permissions": [
         "android.permission.POST_NOTIFICATIONS",
@@ -48,7 +65,12 @@
         "monochromeImage": "./assets/android-icon-monochrome.png"
       },
       "predictiveBackGestureEnabled": false,
-      "versionCode": 103
+      "versionCode": 103,
+      "blockedPermissions": [
+        "android.permission.SYSTEM_ALERT_WINDOW",
+        "android.permission.WRITE_CONTACTS",
+        "android.permission.WRITE_EXTERNAL_STORAGE"
+      ]
     },
     "web": {
       "favicon": "./assets/favicon.png",
@@ -77,7 +99,9 @@
         {
           "icon": "./assets/icon.png",
           "color": "#3390EC",
-          "sounds": ["./assets/ringtone.wav"]
+          "sounds": [
+            "./assets/ringtone.wav"
+          ]
         }
       ],
       "expo-audio",
