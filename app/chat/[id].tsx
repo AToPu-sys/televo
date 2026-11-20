@@ -33,6 +33,7 @@ import { ASSISTANT_USER_ID } from "../../src/lib/assistant";
 import { setCurrentConversationId } from "../../src/lib/currentChat";
 import { isPeerKeyVerified } from "../../src/lib/e2e";
 import { supabase } from "../../src/lib/supabase";
+import { REPORT_REASONS, reportErrorMessage } from "../../src/lib/reports";
 import { useTheme } from "../../src/hooks/useTheme";
 import { useToast } from "../../src/hooks/useToast";
 import { useTyping } from "../../src/hooks/useTyping";
@@ -934,19 +935,11 @@ export default function ConversationScreen() {
   // message may be deleted before the report is reviewed.
   function handleReportMessage(message: ChatMessage) {
     if (!user?.id) return;
-    const reasons: { key: string; label: string }[] = [
-      { key: "spam", label: "Spam" },
-      { key: "harassment", label: "Harassment or bullying" },
-      { key: "inappropriate", label: "Inappropriate content" },
-      { key: "violence", label: "Violence or threats" },
-      { key: "other", label: "Something else" },
-    ];
-
     Alert.alert(
       "Report message",
       "Tell us what's wrong. We review every report and act on it.",
       [
-        ...reasons.map((reason) => ({
+        ...REPORT_REASONS.map((reason) => ({
           text: reason.label,
           onPress: () => {
             void supabase
@@ -973,7 +966,7 @@ export default function ConversationScreen() {
                 Alert.alert(
                   error ? "Couldn't send report" : "Report sent",
                   error
-                    ? error.message
+                    ? reportErrorMessage(error.message)
                     : "Thanks — this has been sent to us for review. You can also block this person."
                 );
               });

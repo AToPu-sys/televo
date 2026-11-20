@@ -22,6 +22,7 @@ import { useE2ee } from "../src/hooks/useE2ee";
 import { useLastSeen } from "../src/hooks/useLastSeen";
 import { useTheme } from "../src/hooks/useTheme";
 import { cachedMediaUri } from "../src/lib/mediaCache";
+import { REPORT_REASONS, reportErrorMessage } from "../src/lib/reports";
 import { supabase } from "../src/lib/supabase";
 import { spacing } from "../src/theme";
 import type { Database } from "../src/types/database";
@@ -193,6 +194,51 @@ export default function UserProfileScreen() {
     }
   }
 
+  // A report on the whole profile (095): the moderator AI reads the recent
+  // history of the chats the two of you share. Only ever filed by a tap here.
+  function handleReport() {
+    if (!user?.id || !userId || userId === user.id) return;
+    Alert.alert(
+      "Report this person",
+      "Tell us what's wrong. We review your recent chats with them and act on it.",
+      [
+        ...REPORT_REASONS.map((reason) => ({
+          text: reason.label,
+          onPress: () => {
+            void supabase
+              .from("content_reports")
+              .insert({
+                reporter_id: user.id,
+                reported_user_id: userId,
+                message_id: null,
+                conversation_id: conversationId ?? null,
+                reason: reason.key,
+              })
+              .then(({ error }) => {
+                if (error) {
+                  Alert.alert("Couldn't send report", reportErrorMessage(error.message));
+                  return;
+                }
+                Alert.alert(
+                  "Report sent",
+                  blocked
+                    ? "Thanks. We'll review it."
+                    : "Thanks. We'll review it. Do you also want to block this person?",
+                  blocked
+                    ? [{ text: "OK" }]
+                    : [
+                        { text: "Not now", style: "cancel" },
+                        { text: "Block", style: "destructive", onPress: () => void handleToggleBlock() },
+                      ]
+                );
+              });
+          },
+        })),
+        { text: "Cancel", style: "cancel" as const },
+      ]
+    );
+  }
+
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]}>
       <View style={[styles.header, { borderBottomColor: theme.border }]}>
@@ -349,6 +395,9 @@ export default function UserProfileScreen() {
               variant="secondary"
               textColor={!blocked ? theme.danger : undefined}
             />
+            {userId && userId !== user?.id ? (
+              <Button title="Report" onPress={handleReport} variant="ghost" textColor={theme.danger} />
+            ) : null}
           </View>
         </ScrollView>
       )}
@@ -473,7 +522,7 @@ const styles = StyleSheet.create({
   section: { borderTopWidth: StyleSheet.hairlineWidth, paddingTop: spacing.lg, gap: spacing.xs },
   sectionLabel: { fontSize: 12, fontWeight: "600", textTransform: "uppercase", letterSpacing: 0.5 },
   sectionValue: { fontSize: 15, lineHeight: 21 },
-  actions: { marginTop: spacing.md },
+  actions: { marginTop: spacing.md, gap: spacing.sm },
   tabRow: { flexDirection: "row", gap: spacing.lg },
   tab: { paddingBottom: spacing.xs, borderBottomWidth: 2, borderBottomColor: "transparent" },
   tabLabel: { fontSize: 13, fontWeight: "600" },
