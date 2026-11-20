@@ -31,6 +31,7 @@
 import "@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
 import { Reader, type CountryResponse } from "mmdb-lib";
+import { withCors } from "../_shared/cors.ts";
 
 type Payload = { session_id: string };
 
@@ -60,7 +61,7 @@ function getGeoReader(): Promise<Reader<CountryResponse>> {
   return geoReaderPromise;
 }
 
-Deno.serve(async (req) => {
+Deno.serve(withCors(async (req) => {
   const authHeader = req.headers.get("Authorization");
   if (!authHeader) {
     return new Response("unauthorized", { status: 401 });
@@ -144,4 +145,4 @@ Deno.serve(async (req) => {
   }
 
   return new Response("ok", { status: 200 });
-});
+}));

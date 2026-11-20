@@ -1,5 +1,6 @@
 import "@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
+import { withCors } from "../_shared/cors.ts";
 
 /**
  * TURN relays for one signed-in user, from every source that is configured,
@@ -169,7 +170,7 @@ async function cloudflareRelays(): Promise<Relay[]> {
   return relaysByHost("cloudflare", asServers(body?.iceServers));
 }
 
-Deno.serve(async (req) => {
+Deno.serve(withCors(async (req) => {
   const authHeader = req.headers.get("Authorization");
   if (!authHeader) return new Response("unauthorized", { status: 401 });
 
@@ -209,4 +210,4 @@ Deno.serve(async (req) => {
     },
     { headers: { "Cache-Control": "no-store" } }
   );
-});
+}));

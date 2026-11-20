@@ -17,13 +17,14 @@
 import "@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
 import nacl from "npm:tweetnacl@1.0.3";
+import { withCors } from "../_shared/cors.ts";
 
 const b64 = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes));
 const unb64 = (text: string) => Uint8Array.from(atob(text), (c) => c.charCodeAt(0));
 
 type Payload = { request_id: string };
 
-Deno.serve(async (req) => {
+Deno.serve(withCors(async (req) => {
   const authHeader = req.headers.get("Authorization");
   if (!authHeader) {
     return new Response("unauthorized", { status: 401 });
@@ -133,7 +134,7 @@ Deno.serve(async (req) => {
   await admin.removeChannel(channel);
 
   return new Response("ok", { status: 200 });
-});
+}));
 
 // Seals the session to the waiting device's one-time key; requests from builds
 // without a key still get it in the clear (their ids are no longer listable).
