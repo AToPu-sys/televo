@@ -13,6 +13,7 @@ const WEB_SHIMS = {
   "react-native-web/dist/cjs/exports/Alert": path.resolve(__dirname, "src/shims/alert.web.ts"),
   "expo-secure-store": path.resolve(__dirname, "src/shims/secureStore.web.ts"),
   "expo-sharing": path.resolve(__dirname, "src/shims/sharing.web.ts"),
+  "react-native-webrtc": path.resolve(__dirname, "src/shims/webrtc.web.tsx"),
 };
 // Swapped in only for the app's own code: libraries may rely on parts of
 // these modules the shim doesn't cover.

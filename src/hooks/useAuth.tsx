@@ -10,6 +10,7 @@ import {
 } from "react";
 
 import { normalizePhone } from "../lib/phone";
+import { wipeDeviceSecretsOnSignOut } from "../lib/deviceWipe";
 import { wipeLocalMessages } from "../lib/localMessages";
 import { clearMediaCache } from "../lib/mediaCache";
 import { clearOutbox } from "../lib/outbox";
@@ -154,6 +155,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         resetIceServers();
         void wipeSharedSessionKeys();
         void wipeLocalMessages().catch(() => {});
+        void wipeDeviceSecretsOnSignOut().catch(() => {});
         try {
           clearMediaCache();
         } catch {

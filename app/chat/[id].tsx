@@ -468,7 +468,11 @@ export default function ConversationScreen() {
   // enforce_ban_on_message: the old conversation history stays visible, new
   // messages just fail, so this disables the composer the same way blocking
   // does rather than letting the user hit that error.
-  const composerDisabled = isBlocked || !!conversation?.otherIsDeleted;
+  // Secret Chat keys live on the phone that made them; Televo Web neither
+  // holds nor publishes them, so on the web a Secret Chat is read-only and
+  // explains where to open it.
+  const webSecretChat = Platform.OS === "web" && isEncrypted === true;
+  const composerDisabled = isBlocked || !!conversation?.otherIsDeleted || webSecretChat;
 
   function handleBlockToggle() {
     if (!user?.id || !conversation?.otherUserId) return;
@@ -635,7 +639,7 @@ export default function ConversationScreen() {
         icon: "lock-open-outline",
         onPress: handleDisableEncryptionBlocked,
       });
-    } else if (conversation?.kind === "direct" && !isAssistantChat) {
+    } else if (conversation?.kind === "direct" && !isAssistantChat && Platform.OS !== "web") {
       // The explicit opt-in that replaces the old silent auto-encrypt
       // effect — Secret Chat only ever turns on because someone tapped
       // this. Not offered for groups: startEncryptedChat supports it, but
@@ -1060,6 +1064,7 @@ export default function ConversationScreen() {
             >
               <Ionicons name="call-outline" size={23} color={theme.accent} />
             </Pressable>
+            {Platform.OS !== "web" ? (
             <Pressable
               onPress={() => handleCall("video")}
               accessibilityRole="button"
@@ -1069,6 +1074,7 @@ export default function ConversationScreen() {
             >
               <Ionicons name="videocam-outline" size={25} color={theme.accent} />
             </Pressable>
+            ) : null}
           </>
         ) : null}
         {!isAssistantChat ? (
@@ -1118,6 +1124,17 @@ export default function ConversationScreen() {
         {loading ? (
           <View style={styles.center}>
             <ActivityIndicator size="large" color={theme.accent} />
+          </View>
+        ) : webSecretChat ? (
+          <View style={[styles.center, { paddingHorizontal: 32, gap: 12 }]}>
+            <Ionicons name="lock-closed" size={40} color={theme.accent} />
+            <Text style={{ color: theme.text, fontSize: 18, fontWeight: "700", textAlign: "center" }}>
+              This Secret Chat lives on your phone
+            </Text>
+            <Text style={{ color: theme.textSecondary, fontSize: 15, textAlign: "center", lineHeight: 21, maxWidth: 420 }}>
+              Its keys never leave the phone it was started on, so it can't be opened in a browser. Open Televo on
+              your phone to read and reply.
+            </Text>
           </View>
         ) : (
           <View style={styles.flex}>

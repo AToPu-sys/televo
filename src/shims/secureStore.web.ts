@@ -75,7 +75,7 @@ export async function getItemAsync(key: string, _options?: unknown): Promise<str
   const row = await tx<{ iv: Uint8Array; data: ArrayBuffer } | undefined>("readonly", (s) => s.get(storageKey(key)));
   if (!row) return null;
   try {
-    const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: row.iv }, await wrapKey(), row.data);
+    const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: new Uint8Array(row.iv) }, await wrapKey(), row.data);
     return new TextDecoder().decode(plain);
   } catch {
     return null;
@@ -98,4 +98,22 @@ export function setItem(): void {
 }
 export function canUseBiometricAuthentication(): boolean {
   return false;
+}
+
+/** Web only: erase every stored value and the browser key that encrypts
+ * them. Called on sign-out, so a shared or borrowed computer keeps nothing
+ * of the account (session, Secret Chat keys, trusted peer keys). */
+export async function wipeAllAsync(): Promise<void> {
+  try {
+    const d = await db();
+    d.close();
+  } catch {
+    // not opened yet
+  }
+  dbPromise = null;
+  keyPromise = null;
+  await new Promise<void>((resolve) => {
+    const req = indexedDB.deleteDatabase(DB);
+    req.onsuccess = req.onerror = req.onblocked = () => resolve();
+  });
 }

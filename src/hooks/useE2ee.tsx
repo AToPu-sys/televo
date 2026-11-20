@@ -1,3 +1,4 @@
+import { Platform } from "react-native";
 import {
   createContext,
   useCallback,
@@ -196,6 +197,10 @@ export function E2eeProvider({
           // its keys yet, so it retries next time this effect re-runs.
           console.error("[E2eeProvider] failed to read profile keys:", profileError.message);
         } else if (
+          // Televo Web never publishes its keys: Secret Chats stay on the
+          // phone, and a browser overwriting the profile key would break the
+          // phone's Secret Chats and warn every contact on each sign-in.
+          Platform.OS !== "web" &&
           profile &&
           (profile.e2e_public_key !== pair.publicKey ||
             profile.e2e_kyber_public_key !== pair.kyberPublicKey)

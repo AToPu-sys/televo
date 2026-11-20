@@ -3,7 +3,7 @@ import * as Notifications from "expo-notifications";
 import { Stack, useRouter, useSegments } from "expo-router";
 import { StatusBar } from "expo-status-bar";
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { ActivityIndicator, Modal, Pressable, StyleSheet, Text, useColorScheme, View } from "react-native";
+import { ActivityIndicator, Modal, Platform, Pressable, StyleSheet, Text, useColorScheme, View } from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 
@@ -480,8 +480,11 @@ function GlobalCallOverlay() {
   // header has no name/avatar to show yet, which CallOverlay already handles.
   if (state.phase === "idle") return null;
 
+  // Televo Web is voice-only: a video call from a phone is shown (and
+  // answered) as a voice call there, and the camera is never requested.
   const isVideo =
-    (state.phase !== "ended" && "call" in state && state.call.kind === "video") || false;
+    Platform.OS !== "web" &&
+    ((state.phase !== "ended" && "call" in state && state.call.kind === "video") || false);
 
   return (
     <CallOverlay
