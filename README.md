@@ -1,6 +1,6 @@
-# Televo — Expo Messenger
+# Televo Messenger
 
-A messenger built with Expo (React Native) and a Supabase backend, targeting
+A messenger built with React Native and a Supabase backend, targeting
 rough feature parity with Telegram circa 2016: real accounts, real chats
 synced live across devices, voice/video calls, opt-in end-to-end encrypted
 "Secret Chats" with self-destruct timers, message edit/reply/forward,
