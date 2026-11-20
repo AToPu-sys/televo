@@ -48,7 +48,53 @@ const SELF_DESTRUCT_OPTIONS: { label: string; seconds: number | null }[] = [
   { label: "1 week", seconds: 604800 },
 ];
 
-type ChatRow = { type: "message"; message: ChatMessage } | { type: "separator"; dateKey: string; label: string };
+/** A call in this conversation, shown inline in the history like a message. */
+type CallItem = {
+  id: string;
+  callerId: string;
+  kind: "audio" | "video";
+  status: "ringing" | "active" | "ended" | "missed" | "declined";
+  startedAt: string;
+  answeredAt: string | null;
+  endedAt: string | null;
+};
+
+type ChatRow =
+  | { type: "message"; message: ChatMessage }
+  | { type: "call"; call: CallItem }
+  | { type: "separator"; dateKey: string; label: string };
+
+/** "Outgoing video call", "Missed call", "Cancelled call" — what happened,
+ * from the viewer's side — plus the talk time when the call connected. */
+function describeCall(call: CallItem, viewerId: string | undefined): { title: string; detail: string | null; failed: boolean } {
+  const outgoing = call.callerId === viewerId;
+  const video = call.kind === "video";
+  const noun = video ? "video call" : "call";
+  const connected = !!call.answeredAt;
+  let title: string;
+  let failed = false;
+  if (call.status === "ringing" || call.status === "active") {
+    title = outgoing ? `Outgoing ${noun}` : `Incoming ${noun}`;
+  } else if (connected) {
+    title = outgoing ? `Outgoing ${noun}` : `Incoming ${noun}`;
+  } else if (call.status === "declined") {
+    title = `Declined ${noun}`;
+    failed = true;
+  } else if (outgoing) {
+    title = `Cancelled ${noun}`;
+    failed = true;
+  } else {
+    title = `Missed ${noun}`;
+    failed = true;
+  }
+  title = title.charAt(0).toUpperCase() + title.slice(1);
+  let detail: string | null = null;
+  if (connected && call.endedAt) {
+    const secs = Math.max(0, Math.round((new Date(call.endedAt).getTime() - new Date(call.answeredAt!).getTime()) / 1000));
+    detail = `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, "0")}`;
+  }
+  return { title, detail, failed };
+}
 
 function dayKey(iso: string): string {
   const d = new Date(iso);
@@ -75,14 +121,20 @@ function dateSeparatorLabel(iso: string): string {
  * separator placed right after (in array order) the OLDEST message of a day
  * ends up rendered visually ABOVE that message — exactly where a "September
  * 14" divider belongs. */
-function dateSeparatedRows(messages: ChatMessage[]): ChatRow[] {
+function dateSeparatedRows(messages: ChatMessage[], calls: CallItem[] = []): ChatRow[] {
+  // Messages and calls merged newest-first (the list is inverted).
+  const items: { at: string; row: ChatRow }[] = [
+    ...messages.map((message) => ({ at: message.created_at, row: { type: "message", message } as ChatRow })),
+    ...calls.map((call) => ({ at: call.startedAt, row: { type: "call", call } as ChatRow })),
+  ];
+  if (calls.length) items.sort((x, y) => (x.at < y.at ? 1 : x.at > y.at ? -1 : 0));
   const rows: ChatRow[] = [];
-  for (let i = 0; i < messages.length; i++) {
-    const message = messages[i];
-    rows.push({ type: "message", message });
-    const next = messages[i + 1];
-    if (!next || dayKey(next.created_at) !== dayKey(message.created_at)) {
-      rows.push({ type: "separator", dateKey: dayKey(message.created_at), label: dateSeparatorLabel(message.created_at) });
+  for (let i = 0; i < items.length; i++) {
+    const { at, row } = items[i];
+    rows.push(row);
+    const next = items[i + 1];
+    if (!next || dayKey(next.at) !== dayKey(at)) {
+      rows.push({ type: "separator", dateKey: dayKey(at), label: dateSeparatorLabel(at) });
     }
   }
   return rows;
@@ -155,7 +207,40 @@ export default function ConversationScreen() {
   // first message of each day (visually — since the list is inverted, that
   // divider actually sits right AFTER that day's oldest message in `messages`,
   // which is itself newest-first).
-  const rows = useMemo(() => dateSeparatedRows(messages), [messages]);
+  // This conversation's calls, shown inline. Re-read every 10 s while the
+  // chat is open so a call that just ended appears without a reload.
+  const [calls, setCalls] = useState<CallItem[]>([]);
+  useEffect(() => {
+    if (!id) return;
+    let active = true;
+    const load = async () => {
+      const { data } = await supabase
+        .from("calls")
+        .select("id, caller_id, kind, status, started_at, answered_at, ended_at")
+        .eq("conversation_id", id)
+        .order("started_at", { ascending: false })
+        .limit(200);
+      if (!active || !data) return;
+      setCalls(
+        data.map((c) => ({
+          id: c.id,
+          callerId: c.caller_id,
+          kind: c.kind as CallItem["kind"],
+          status: c.status as CallItem["status"],
+          startedAt: c.started_at,
+          answeredAt: c.answered_at,
+          endedAt: c.ended_at,
+        }))
+      );
+    };
+    void load();
+    const timer = setInterval(() => void load(), 10_000);
+    return () => {
+      active = false;
+      clearInterval(timer);
+    };
+  }, [id]);
+  const rows = useMemo(() => dateSeparatedRows(messages, calls), [messages, calls]);
   // The inline separators in `rows` mark day boundaries in the scrollback,
   // but on a chat spanning only one day (the common case) that leaves
   // exactly one separator, sitting above the very oldest message — nothing
@@ -1152,7 +1237,7 @@ export default function ConversationScreen() {
             // the bottom without manual scrolling.
             inverted
             data={rows}
-            keyExtractor={(row) => (row.type === "separator" ? `sep-${row.dateKey}` : row.message.id)}
+            keyExtractor={(row) => (row.type === "separator" ? `sep-${row.dateKey}` : row.type === "call" ? `call-${row.call.id}` : row.message.id)}
             contentContainerStyle={styles.list}
             onViewableItemsChanged={onViewableItemsChanged}
             viewabilityConfig={viewabilityConfig}
@@ -1190,6 +1275,38 @@ export default function ConversationScreen() {
                       </Text>
                     </View>
                   </View>
+                );
+              }
+              if (row.type === "call") {
+                const call = row.call;
+                const own = call.callerId === user?.id;
+                const { title, detail, failed } = describeCall(call, user?.id);
+                const time = new Date(call.startedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+                return (
+                  <Pressable
+                    onPress={() => (canCall ? handleCall(Platform.OS === "web" ? "audio" : call.kind) : undefined)}
+                    accessibilityRole="button"
+                    accessibilityLabel={`${title}${detail ? `, ${detail}` : ""}, ${time}. Call back`}
+                    style={[styles.callRow, own ? styles.callRowOwn : styles.callRowPeer]}
+                  >
+                    <View style={[styles.callBubble, { backgroundColor: own ? theme.accent : theme.surfaceElevated }]}>
+                      <View style={{ flexShrink: 1 }}>
+                        <Text style={[styles.callTitle, { color: own ? "#FFFFFF" : theme.text }]}>{title}</Text>
+                        <View style={styles.callMeta}>
+                          <Ionicons
+                            name={own ? "arrow-up" : "arrow-down"}
+                            size={13}
+                            color={failed ? theme.danger : theme.online}
+                            style={{ transform: [{ rotate: "45deg" }] }}
+                          />
+                          <Text style={[styles.callTime, { color: own ? "rgba(255,255,255,0.8)" : theme.textSecondary }]}>
+                            {detail ? `${time}, ${detail}` : time}
+                          </Text>
+                        </View>
+                      </View>
+                      <Ionicons name={call.kind === "video" ? "videocam-outline" : "call-outline"} size={24} color={own ? "#FFFFFF" : theme.accent} />
+                    </View>
+                  </Pressable>
                 );
               }
               const item = row.message;
@@ -1470,6 +1587,13 @@ export default function ConversationScreen() {
 }
 
 const styles = StyleSheet.create({
+  callRow: { paddingHorizontal: 12, paddingVertical: 3, flexDirection: "row" },
+  callRowOwn: { justifyContent: "flex-end" },
+  callRowPeer: { justifyContent: "flex-start" },
+  callBubble: { flexDirection: "row", alignItems: "center", gap: 14, borderRadius: 18, paddingHorizontal: 14, paddingVertical: 10, maxWidth: "80%" },
+  callTitle: { fontSize: 16, fontWeight: "500" },
+  callMeta: { flexDirection: "row", alignItems: "center", gap: 4, marginTop: 2 },
+  callTime: { fontSize: 12 },
   container: { flex: 1 },
   flex: { flex: 1 },
   keyChangedBanner: {

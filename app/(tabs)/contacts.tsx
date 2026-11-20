@@ -4,8 +4,11 @@ import { useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
-  FlatList,
+  Linking,
+  Platform,
   Pressable,
+  SectionList,
+  Share,
   StyleSheet,
   Text,
   TextInput,
@@ -17,6 +20,7 @@ import { Avatar } from "../../src/components/Avatar";
 import { useAuth } from "../../src/hooks/useAuth";
 import { supabase } from "../../src/lib/supabase";
 import { findOrCreateDirectChat, useContacts, type Contact } from "../../src/hooks/useContacts";
+import { usePhoneContacts, type PhoneContact } from "../../src/hooks/usePhoneContacts";
 import { useTheme } from "../../src/hooks/useTheme";
 import { radius, spacing } from "../../src/theme";
 
@@ -90,6 +94,49 @@ export default function ContactsScreen() {
   // Local matches first; server results only fill in when there are none.
   const results = filtered.length > 0 ? filtered : remoteResults;
 
+  // The phone book: people on Televo get a chat button, everyone else an
+  // Invite button. Read only after the person allows contacts access.
+  const phone = usePhoneContacts(user?.id);
+  type Row =
+    | { kind: "televo"; key: string; contact: Contact; title: string; subtitle: string }
+    | { kind: "invite"; key: string; person: PhoneContact };
+  const sections = useMemo(() => {
+    const term = query.trim().toLowerCase();
+    const matches = (text: string) => !term || text.toLowerCase().includes(term);
+    const seen = new Set<string>();
+    const televo: Row[] = [];
+    for (const c of results) {
+      if (seen.has(c.id)) continue;
+      seen.add(c.id);
+      televo.push({ kind: "televo", key: c.id, contact: c, title: c.displayName, subtitle: `@${c.username}` });
+    }
+    for (const person of phone.contacts) {
+      const t = person.televo;
+      if (!t || seen.has(t.id) || !(matches(person.name) || matches(t.username) || matches(t.displayName))) continue;
+      seen.add(t.id);
+      televo.push({
+        kind: "televo",
+        key: t.id,
+        contact: { id: t.id, displayName: t.displayName, username: t.username, avatarUrl: t.avatarUrl, bio: null },
+        title: person.name,
+        subtitle: `@${t.username}`,
+      });
+    }
+    const invite: Row[] = phone.contacts
+      .filter((p) => !p.televo && (matches(p.name) || matches(p.phone)))
+      .map((p) => ({ kind: "invite", key: `invite-${p.key}`, person: p }));
+    return [
+      { key: "televo", title: "On Televo", data: televo },
+      ...(invite.length ? [{ key: "invite", title: "Invite to Televo", data: invite }] : []),
+    ];
+  }, [results, phone.contacts, query]);
+
+  function invite(person: PhoneContact) {
+    const message = "Join me on Televo, a free private messenger: https://gettelevo.space/get";
+    const url = `sms:${person.phone}${Platform.OS === "ios" ? "&" : "?"}body=${encodeURIComponent(message)}`;
+    Linking.openURL(url).catch(() => void Share.share({ message }));
+  }
+
   async function handleStartChat(contact: Contact) {
     if (!user?.id || startingWith) return;
     setStartingWith(contact.id);
@@ -125,16 +172,26 @@ export default function ContactsScreen() {
             autoCapitalize="none"
           />
         </View>
-        <Pressable
-          onPress={() => router.push("/find-friends" as never)}
-          accessibilityRole="button"
-          style={styles.findFriendsRow}
-        >
-          <Ionicons name="person-add-outline" size={18} color={theme.accent} />
-          <Text style={[styles.findFriendsText, { color: theme.accent }]}>
-            Find friends from your phone contacts
-          </Text>
-        </Pressable>
+        {phone.supported && phone.permission !== "granted" && phone.permission !== "unknown" ? (
+          <View style={[styles.permissionCard, { backgroundColor: theme.surfaceElevated }]}>
+            <Ionicons name="people" size={22} color={theme.accent} />
+            <View style={{ flex: 1, gap: 2 }}>
+              <Text style={[styles.permissionTitle, { color: theme.text }]}>See who's on Televo</Text>
+              <Text style={[styles.permissionBody, { color: theme.textSecondary }]}>
+                {phone.permission === "denied"
+                  ? "Contacts access is off. Turn it on in Settings to find friends and invite the rest."
+                  : "Allow contacts access to find friends already here and invite the rest. Only scrambled numbers are checked."}
+              </Text>
+            </View>
+            <Pressable
+              onPress={() => (phone.permission === "denied" ? Linking.openSettings() : phone.requestAccess())}
+              accessibilityRole="button"
+              style={[styles.permissionButton, { backgroundColor: theme.accent }]}
+            >
+              <Text style={styles.permissionButtonText}>{phone.permission === "denied" ? "Settings" : "Allow"}</Text>
+            </Pressable>
+          </View>
+        ) : null}
       </View>
 
       {loading ? (
@@ -147,9 +204,15 @@ export default function ContactsScreen() {
           <Text style={[styles.emptyBody, { color: theme.textSecondary }]}>{error}</Text>
         </View>
       ) : (
-        <FlatList
-          data={results}
-          keyExtractor={(item) => item.id}
+        <SectionList
+          sections={sections}
+          keyExtractor={(item) => item.key}
+          stickySectionHeadersEnabled={false}
+          renderSectionHeader={({ section }) =>
+            section.data.length ? (
+              <Text style={[styles.sectionHeader, { color: theme.textSecondary }]}>{section.title}</Text>
+            ) : null
+          }
           ItemSeparatorComponent={() => (
             <View style={[styles.separator, { backgroundColor: theme.border }]} />
           )}
@@ -164,40 +227,48 @@ export default function ContactsScreen() {
                   ? "Searching…"
                   : query
                     ? "No one found. A username or phone number has to match exactly."
-                    : "People you've messaged show up here. Use Find friends above to discover people from your phone's contacts."}
+                    : "People you've messaged show up here, along with friends from your phone's contacts."}
               </Text>
             </View>
           }
-          windowSize={9}
-          maxToRenderPerBatch={10}
-          initialNumToRender={12}
-          removeClippedSubviews
-          renderItem={({ item }) => (
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel={`Message ${item.displayName}`}
-              onPress={() => handleStartChat(item)}
-              style={({ pressed }) => [
-                styles.row,
-                { backgroundColor: pressed ? theme.surfaceElevated : "transparent" },
-              ]}
-            >
-              <Avatar name={item.displayName} uri={item.avatarUrl} size={46} />
-              <View style={styles.rowBody}>
-                <Text style={[styles.rowTitle, { color: theme.text }]} numberOfLines={1}>
-                  {item.displayName}
-                </Text>
-                <Text style={[styles.rowSubtitle, { color: theme.textSecondary }]} numberOfLines={1}>
-                  @{item.username}
-                </Text>
+          ListFooterComponent={phone.loading ? <ActivityIndicator style={{ margin: spacing.lg }} color={theme.accent} /> : null}
+          renderItem={({ item }) =>
+            item.kind === "televo" ? (
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel={`Message ${item.title}`}
+                onPress={() => handleStartChat(item.contact)}
+                style={({ pressed }) => [styles.row, { backgroundColor: pressed ? theme.surfaceElevated : "transparent" }]}
+              >
+                <Avatar name={item.contact.displayName} uri={item.contact.avatarUrl} size={46} />
+                <View style={styles.rowBody}>
+                  <Text style={[styles.rowTitle, { color: theme.text }]} numberOfLines={1}>{item.title}</Text>
+                  <Text style={[styles.rowSubtitle, { color: theme.textSecondary }]} numberOfLines={1}>{item.subtitle}</Text>
+                </View>
+                {startingWith === item.contact.id ? (
+                  <ActivityIndicator color={theme.accent} />
+                ) : (
+                  <Ionicons name="chatbubble-outline" size={20} color={theme.accent} />
+                )}
+              </Pressable>
+            ) : (
+              <View style={styles.row}>
+                <Avatar name={item.person.name} uri={null} size={46} />
+                <View style={styles.rowBody}>
+                  <Text style={[styles.rowTitle, { color: theme.text }]} numberOfLines={1}>{item.person.name}</Text>
+                  <Text style={[styles.rowSubtitle, { color: theme.textSecondary }]} numberOfLines={1}>{item.person.phone}</Text>
+                </View>
+                <Pressable
+                  onPress={() => invite(item.person)}
+                  accessibilityRole="button"
+                  accessibilityLabel={`Invite ${item.person.name} to Televo`}
+                  style={[styles.inviteButton, { backgroundColor: theme.online }]}
+                >
+                  <Text style={styles.inviteText}>Invite</Text>
+                </Pressable>
               </View>
-              {startingWith === item.id ? (
-                <ActivityIndicator color={theme.accent} />
-              ) : (
-                <Ionicons name="chatbubble-outline" size={20} color={theme.accent} />
-              )}
-            </Pressable>
-          )}
+            )
+          }
         />
       )}
     </SafeAreaView>
@@ -222,6 +293,21 @@ const styles = StyleSheet.create({
     height: 38,
   },
   searchInput: { flex: 1, fontSize: 16, paddingVertical: 0 },
+  permissionCard: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.md,
+    marginTop: spacing.sm,
+    padding: spacing.md,
+    borderRadius: radius.md,
+  },
+  permissionTitle: { fontSize: 15, fontWeight: "600" },
+  permissionBody: { fontSize: 13, lineHeight: 18 },
+  permissionButton: { paddingHorizontal: 14, paddingVertical: 8, borderRadius: 999 },
+  permissionButtonText: { color: "#FFFFFF", fontWeight: "700", fontSize: 14 },
+  sectionHeader: { fontSize: 13, fontWeight: "600", paddingHorizontal: spacing.lg, paddingTop: spacing.md, paddingBottom: spacing.xs, textTransform: "uppercase", letterSpacing: 0.5 },
+  inviteButton: { paddingHorizontal: 16, paddingVertical: 7, borderRadius: 999 },
+  inviteText: { color: "#FFFFFF", fontWeight: "700", fontSize: 14 },
   findFriendsRow: {
     flexDirection: "row",
     alignItems: "center",
